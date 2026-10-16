@@ -1,5 +1,5 @@
 import { DebugOps } from "./llmdb.js";
-import { NetProxyRule, NetProxyStatus, ProxyOps } from "./netproxy.js";
+import { AssertFlowResult, AssertFlowSpec, NetProxyRule, NetProxyStatus, ProxyOps } from "./netproxy.js";
 import { DEFAULT_STREAM_PORT_BASE, StreamOps } from "./servesim.js";
 import { FleetOps, SimDevice } from "./simslim.js";
 import { Lease, Requirements, Store, Ticket, nextId } from "./store.js";
@@ -795,6 +795,36 @@ export class Orchestrator {
       if (!this.netProxy) return { lease: found, stopped: false };
       const { stopped } = await this.netProxy.stopProxy(leaseId);
       return { lease: found, stopped };
+    });
+  }
+
+  /**
+   * Poll the holding proxy's flow log for matching requests. Only the
+   * holding lease may assert; anything else gets a ProxyBusyError (or the
+   * not-running error) naming the holder.
+   */
+  assertLeaseFlow(leaseId: string, spec: AssertFlowSpec): Promise<{ lease: Lease } & AssertFlowResult> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.netProxy) throw new LeaseError("Network proxy is unavailable: no proxy is configured");
+      const result = await this.netProxy.assertFlow(leaseId, spec);
+      return { lease: found, ...result };
+    });
+  }
+
+  /**
+   * Insert or replace one map rule (map_local/map_remote). Only the holding
+   * lease may map; the rule is validated before the holder check so a bad
+   * file/URL/regex fails without needing a running proxy.
+   */
+  upsertLeaseMapRule(leaseId: string, rule: NetProxyRule): Promise<{ lease: Lease; ruleCount: number }> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.netProxy) throw new LeaseError("Network proxy is unavailable: no proxy is configured");
+      const ruleCount = await this.netProxy.upsertMapRule(leaseId, rule);
+      return { lease: found, ruleCount };
     });
   }
 

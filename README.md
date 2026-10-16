@@ -115,7 +115,7 @@ http://127.0.0.1:3100/mcp
 Orca, Claude Code, TMA, 스크립트 어디서든 `client` 라벨과 함께 쓰면 `sessions_list`에서
 "어떤 세션이 어떤 시뮬레이터에서 실행 중인지" 한눈에 보인다.
 
-## 도구 (50개)
+## 도구 (65개)
 
 | 그룹 | 도구 |
 |---|---|
@@ -127,8 +127,8 @@ Orca, Claude Code, TMA, 스크립트 어디서든 `client` 라벨과 함께 쓰�
 | 앱 생명주기 (Lease 필수) | `app_open_url`, `app_install`, `app_uninstall`, `app_launch`, `app_terminate` |
 | 프로파일링 (Lease 필수) | `profile_trace` |
 | 라이브 스트리밍 (Lease 필수) | `stream_start`, `stream_stop` |
-| 디버깅 (Lease 필수) | `debug_attach`, `debug_break`, `debug_continue`, `debug_bt`, `debug_locals`, `debug_eval`, `debug_step`, `debug_detach` |
-| 네트워크 프록시 (Lease 필수) | `net_proxy_start`, `net_proxy_set_rules`, `net_proxy_stop`, `net_proxy_status` |
+| 디버깅 (Lease 필수) | `debug_attach`, `debug_launch`, `debug_break`, `debug_continue`, `debug_run_until`, `debug_wait`, `debug_interrupt`, `debug_bt`, `debug_threads`, `debug_locals`, `debug_scopes`, `debug_expand`, `debug_eval`, `debug_set_var`, `debug_output`, `debug_step`, `debug_detach`, `debug_sessions`, `debug_doctor`, `symbolicate`(Lease 선택) |
+| 네트워크 프록시 (Lease 필수) | `net_proxy_start`, `net_proxy_set_rules`, `net_proxy_stop`, `net_proxy_status`, `net_assert_flow`, `map_local`, `map_remote` |
 
 주요 동작:
 
@@ -182,25 +182,44 @@ Orca, Claude Code, TMA, 스크립트 어디서든 `client` 라벨과 함께 쓰�
   `stream_start`/`stream_stop` (둘 다 idempotent). 스트림 URL은 Lease의 `streamUrl`에 저장되어
   `pool_status`/`sessions_list`/`lease_list`에 그대로 보인다. `stream_start`는 실행 중인 스트림이
   있으면 기존 URL을 그대로 반환한다.
-- 디버깅: `debug_attach {lease_id, bundle_id|pid}`로 Lease당 1개 llmdb 세션을 열고,
-  `debug_break {file, line}` → `debug_continue {wait_sec?}` → `debug_bt`/`debug_locals`/
-  `debug_eval {expr}`/`debug_step {mode?}`로 중단점·중단·검사를 수행한다. 종료는
-  `debug_detach`(idempotent). 세션 ID는 Lease 레코드에 저장되며, `lease_release`/TTL
-  만료/스윕/외부 종료 감지 시 자동 detach된다(실패해도 해제는 성공). 전제 조건:
-  디버깅 가능한(get-task-allow) 빌드 + 호스트의 1회성 개발자 도구 인증 —
-  스톡 Apple 앱은 attach를 거부한다. llmdb 0.2.0의 `break set`은 `file:line`만
-  받으므로 심볼 브레이크포인트는 미지원이다.
+- 디버깅: `debug_attach {lease_id, bundle_id|pid}`(또는 바이너리 경로로
+  `debug_launch {lease_id, path, args?}`)로 Lease당 1개 llmdb 세션을 열고,
+  `debug_break {file, line, condition?, hit_condition?}`(또는 `list=true`/
+  `delete=<id>`/`exception=[...]`, 호출당 정확히 1개 op) →
+  `debug_continue {wait_sec?}`/`debug_run_until {file, line}`/`debug_wait
+  {timeout?}`/`debug_interrupt` → `debug_bt {depth?, thread?}`/`debug_threads`/
+  `debug_locals`/`debug_scopes {frame?}`/`debug_expand {ref}`/
+  `debug_eval {expr}`/`debug_set_var {target, value}`/`debug_output {clear?}`/
+  `debug_step {mode?}`로 중단점·중단·검사를 수행한다. 종료는
+  `debug_detach`(idempotent), 진단은 `debug_sessions`/`debug_doctor`.
+  `symbolicate {pcs, binary, arch?, load_addr?, lease_id?}`는 atos 기반
+  크래시 심볼리케이션(호스트 로컬, Lease는 선택). 세션 ID는 Lease 레코드에
+  저장되며, `lease_release`/TTL 만료/스윕/외부 종료 감지 시 자동
+  detach된다(실패해도 해제는 성공). 전제 조건: 디버깅 가능한(get-task-allow)
+  빌드 + 호스트의 1회성 개발자 도구 인증 — 스톡 Apple 앱은 attach를 거부한다.
+  llmdb 0.2.0의 `break set`은 `file:line`만 받으므로 심볼 브레이크포인트는
+  미지원이고, `expand`는 식이 아니라 variablesReference 숫자를 받으며,
+  `launch`는 번들 ID가 아니라 바이너리 경로만 받는다.
 - 네트워크 프록시: `net_proxy_start {lease_id, rules?}`로 Lease 시뮬레이터의 HTTPS를
   가로채고(`mitmdump` + 생성된 rewrite addon + 시뮬레이터 키체인에 mitm CA 설치),
   `net_proxy_set_rules {rules}`로 규칙 교체(같은 포트에서 mitmdump만 재시작),
   `net_proxy_stop`(idempotent)으로 종료 + 호스트 프록시 스냅샷 복원,
   `net_proxy_status`로 상태/홀더 확인. 규칙은
-  `match{url_regex?, method?}` → `action{status?, headers?, body?, delay_ms?}`
-  (첫 매칭 우선, 나머지는 업스트림 그대로). **호스트 프록시는 전역**이라 홀더는
-  Lease당 1개 — 다른 Lease가 잡고 있으면 보유 세션을 명시한 에러로 거부된다.
-  `lease_release`/TTL 만료/스윕/외부 종료 감지 시 홀더의 프록시는 자동 종료된다
-  (실패해도 해제는 성공). 규칙 검증은 어떤 호스트 변경보다 먼저 수행되므로,
-  잘못된 규칙은 호스트 네트워크를 건드리지 않고 거부된다.
+  `match{url_regex?, method?}` → `action{status?, headers?, body?, delay_ms?,
+  request?, map_local?, map_remote?}` (첫 매칭 우선). `request{method?, url?,
+  headers?, body?}`는 전달 전 요청 방향 rewrite, `map_local {file}`은 로컬
+  파일 서빙(읽기 실패 시 502), `map_remote {url}`은 업스트림 URL 고정
+  rewrite — `map_local`/`map_remote` 도구는 같은 패턴의 기존 맵을 교체하고
+  아니면 맨 앞에 삽입한다. 모든 요청은 flow 로그(JSONL)에 기록되며,
+  `net_assert_flow {url_regex, method?, min_count?, timeout_sec?}`로
+  홀더가 폴링 단언한다(프록시 미보유 시 깔끔하게 실패).
+  **호스트 프록시는 전역**이라 홀더는 Lease당 1개 — 다른 Lease가 잡고 있으면
+  보유 세션을 명시한 에러로 거부된다. `lease_release`/TTL 만료/스윕/외부 종료
+  감지 시 홀더의 프록시는 자동 종료된다 (실패해도 해제는 성공). 규칙 검증은
+  어떤 호스트 변경보다 먼저 수행되므로, 잘못된 규칙은 호스트 네트워크를
+  건드리지 않고 거부된다. 프로세스 단위 가로채기(`mitmdump --mode
+  local:…`)는 스파이크에서 macOS System Extension 승인 차단으로 미실증되어
+  host 모드만 제공한다.
 
 ## 라이브 스트리밍
 
@@ -261,14 +280,28 @@ llmdb CLI(lldb-dap 래퍼, 세션형 JSON 출력)를 Lease 단위로 감싼 도�
      요구한다. 이 호스트에서는 아직 승인되지 않아 attach가 거부된다.
   3. 서드파티 앱 — 스톡 Apple 앱(설정, Safari 등)은 attach를 거부한다.
      위 이유로 스모크 테스트는 검증 경로만 단언하고 실제 attach는 호출하지 않는다.
-- 흐름: `app_launch`로 앱 실행 → `debug_attach {bundle_id}` →
-  `debug_break {file, line}` → `debug_continue` → `debug_bt`/`debug_locals`/
-  `debug_eval {expr}`/`debug_step {mode=over|in|out}` → `debug_detach`.
+- 흐름: `app_launch`로 앱 실행 → `debug_attach {bundle_id}`(또는
+  `debug_launch {path, args?}`로 직접 실행) → `debug_break {file, line}` →
+  `debug_continue` → `debug_bt`/`debug_locals`/`debug_eval {expr}`/
+  `debug_step {mode=over|in|out}` → `debug_detach`.
 - `bundle_id`(부팅된 시뮬레이터에서 simctl로 해석) 또는 `pid`(호스트 프로세스)
   중 정확히 하나를 지정한다. 둘 다 주거나 둘 다 생략하면 거부된다.
-- Lease당 세션 1개: 재-attach하면 이전 세션을 정리(best-effort)하고 교체한다.
-  `debug_continue {wait_sec}`(기본 60, 최대 600)는 다음 중단까지 블로킹되며,
-  실행 타임아웃은 대기 시간 + 30초 여유로 자동 설정된다.
+- Lease당 세션 1개: 재-attach/재-launch하면 이전 세션을 정리(best-effort)하고
+  교체한다. `debug_continue {wait_sec}`(기본 60, 최대 600)는 다음 중단까지
+  블로킹되며, 실행 타임아웃은 대기 시간 + 30초 여유로 자동 설정된다.
+- 라운드 2: `debug_run_until {file, line, wait_sec?}`(중단점+계속),
+  `debug_wait {timeout?}`(실행 종료까지 블로킹), `debug_interrupt`(실행 중
+  일시정지), `debug_threads` + `debug_bt {thread?}`, `debug_scopes {frame?}`/
+  `debug_expand {ref}`(variablesReference 숫자 — 식이 아님),
+  `debug_set_var {target, value, frame?}`, `debug_output {clear?}`,
+  `debug_sessions`/`debug_doctor`(세션 없이 호출 가능).
+  `debug_break`는 호출당 1개 op: set(`file`+`line`, 선택 `condition`/
+  `hit_condition`) · `list=true` · `delete=<id>` · `exception=[필터…]`
+  (`[]`면 해제). 모든 argv는 llmdb 0.2.0 `--help`와 대조 검증됐다.
+- `symbolicate {pcs, binary, arch?, load_addr?, lease_id?}`: `atos -o` 기반.
+  시뮬레이터를 건드리지 않는 호스트 로컬 읽기 전용이라 `lease_id`는 선택
+  (주면 검증+기록)이며 udid/force 게이트는 없다. `binary`는 사실상 필수
+  (live-pid 모드 미노출).
 - 수동 확인 (디버깅 가능한 앱 + 호스트 인증이 있을 때):
 
 ```sh
@@ -294,10 +327,30 @@ Lease 시뮬레이터의 HTTPS 트래픽을 가로채 응답을 고쳐 쓰는 �
   `-setwebproxystate/-setsecurewebproxystate on`). 종료는 역순: 호스트 스냅샷
   복원 → mitmdump 종료 → addon 삭제.
 - 규칙: `match{url_regex?, method?}` → `action{status?, headers?, body?,
-  delay_ms?}`. 모든 요청은 일단 업스트림으로 나가고, 첫 번째로 매칭된 규칙이
-  응답을 변형한다(status 교체, headers 병합, body 교체 + content-encoding 제거,
-  요청 전달 전 delay). `match` 생략 = 전체 매칭, `rules: []` = 가로채기만 하고
-  고쳐 쓰지 않음(투명 모드). 최대 50개.
+  delay_ms?, request?, map_local?, map_remote?}`. 모든 요청은 일단 flow
+  로그(JSONL, `net_proxy_status`의 `flow_log_path`)에 기록되고, 첫 번째로
+  매칭된 규칙이 요청을 고쳐 쓰고(`request{method?, url?, headers?, body?}`,
+  `map_remote` URL 고정 rewrite) 전달한 뒤 응답을 변형한다(status 교체,
+  headers 병합, body 교체 + content-encoding 제거, 요청 전달 전 delay).
+  `map_local`은 업스트림 없이 로컬 파일을 서빙한다(읽기 실패 시 502).
+  `match` 생략 = 전체 매칭, `rules: []` = 가로채기+로깅만(투명 모드).
+  최대 50개.
+- 라운드 2: `net_assert_flow {url_regex, method?, min_count?(기본 1),
+  timeout_sec?(기본 5, 최대 120)}`는 홀더의 flow 로그를 폴링해 매칭 요청을
+  단언한다(미달이면 실패, 프록시 미보유면 깔끔한 에러).
+  `map_local {url_regex, file}`/`map_remote {url_regex, url}`은 맵 규칙을
+  교체-삽입(upsert: 같은 패턴+같은 종류면 교체, 아니면 맨 앞 삽입 —
+  mitmdump 내장 `--map-local/--map-remote` 옵션 대신 기존 재시작 경로를 재
+  사용하는 addon 확장으로 구현). 맵 규칙은 홀더 검사보다 검증을 먼저
+  수행하므로 잘못된 파일/URL/정규식은 프록시 없이도 거부된다.
+- local 모드 미제공 노트: 프로세스 단위 가로채기(`mitmdump --mode
+  local:MobileSafari` 등, 이름·PID·부정·콤마 리스트 문법 확인)를 스파이크
+  했으나, macOS System Extension(`org.mitmproxy.macos-redirector`)의 사용자
+  수동 승인이 필요해 CI/무인 환경에서 터널이 성립하지 않았다("Control
+  channel connected" 미도달, 트래픽 0). 승인 전까지는 실증 불가이므로
+  `mode: host|local` 분기는 구현하지 않고 host 모드(host `networksetup`
+  전역 토글)만 제공한다. 승인이 갖춰진 호스트에서 재실증되면 addon·flow
+  로그·assert/map 경로는 그대로 local 모드에도 재사용 가능하다.
 - 전제 조건 (2가지가 모두 필요):
   1. `mitmdump` 설치 (`brew install mitmproxy`, 선택 의존성 — 없으면 데몬은
      경고만 남기고 뜨고, `net_proxy_*` 호출 시 설치 힌트와 함께 실패).
@@ -346,5 +399,5 @@ npm run dev     # tsx 핫 실행
 
 구조: `src/index.ts`(HTTP 데몬/세션 map) · `src/server.ts`(MCP 도구 정의) ·
 `src/orchestrator.ts`(acquire/release/dispatch) · `src/store.ts`(JSON 영속화) ·
-`src/simslim.ts` · `src/axe.ts` · `src/servesim.ts` · `src/simlog.ts` · `src/simapps.ts` · `src/xctrace.ts` · `src/netproxy.ts`(mitm 프록시) · `src/extras.ts`(기기 부가 도구) ·
+`src/simslim.ts` · `src/axe.ts` · `src/servesim.ts` · `src/simlog.ts` · `src/simapps.ts` · `src/xctrace.ts` · `src/llmdb.ts`(lldb-dap 래퍼) · `src/symbolicate.ts`(atos 래퍼) · `src/netproxy.ts`(mitm 프록시) · `src/extras.ts`(기기 부가 도구) ·
 `src/exec.ts` · `test/`

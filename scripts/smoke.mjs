@@ -332,6 +332,77 @@ async function main() {
     const dbgDetach = await call(a, "debug_detach", { lease_id: leaseA.json.lease.leaseId });
     expectOk(dbgDetach, "debug_detach idempotent");
     if (dbgDetach.json.stopped !== false) fail("debug_detach with no session should report stopped=false");
+
+    // Round-2 debug tools: same policy (gating + validation only, no session).
+    // debug_sessions/doctor need no session, so they run live when llmdb is
+    // present (read-only daemon queries) and hint at the binary otherwise.
+    for (const tool of ["debug_sessions", "debug_doctor"]) {
+      const res = await call(a, tool, { lease_id: leaseA.json.lease.leaseId });
+      if (haveLlmdb) {
+        expectOk(res, tool);
+      } else if (!res.isError || !/llmdb is not installed|LLMDB_BIN/i.test(JSON.stringify(res.json))) {
+        fail(`${tool} should hint at the missing binary: ${JSON.stringify(res.json)}`);
+      }
+    }
+    for (const [tool, args] of [
+      ["debug_threads", {}],
+      ["debug_scopes", {}],
+      ["debug_expand", { ref: 3 }],
+      ["debug_set_var", { target: "x", value: "1" }],
+      ["debug_output", {}],
+      ["debug_run_until", { file: "a.swift", line: 1 }],
+      ["debug_wait", {}],
+      ["debug_interrupt", {}],
+      ["debug_break", { list: true }],
+      ["debug_break", { delete: 1 }],
+      ["debug_break", { exception: [] }],
+      ["debug_bt", { thread: 2 }],
+    ]) {
+      const res = await call(a, tool, { lease_id: leaseA.json.lease.leaseId, ...args });
+      if (!res.isError || !/no debug session/i.test(JSON.stringify(res.json))) {
+        fail(`${tool} should require an attached session: ${JSON.stringify(res.json)}`);
+      }
+    }
+    // Op dispatch is validated before the session check, so combos fail
+    // deterministically without a session.
+    const dbgCombo = await call(a, "debug_break", {
+      lease_id: leaseA.json.lease.leaseId, file: "a.swift", line: 1, list: true,
+    });
+    if (!dbgCombo.isError || !/exactly one op/i.test(JSON.stringify(dbgCombo.json))) {
+      fail(`debug_break should reject op combos: ${JSON.stringify(dbgCombo.json)}`);
+    }
+    const dbgNoPath = await callRaw(a, "debug_launch", { lease_id: leaseA.json.lease.leaseId });
+    if (!dbgNoPath.isError || !/path/i.test(dbgNoPath.text)) {
+      fail(`debug_launch should require a path: ${dbgNoPath.text.slice(0, 300)}`);
+    }
+    const dbgBadRef = await callRaw(a, "debug_expand", { lease_id: leaseA.json.lease.leaseId, ref: 0 });
+    if (!dbgBadRef.isError || !/ref/i.test(dbgBadRef.text)) {
+      fail(`debug_expand should reject ref 0: ${dbgBadRef.text.slice(0, 300)}`);
+    }
+    // llmdb resolves the launch path before any host auth, so a bogus path
+    // fails fast with the adapter error and no sim interaction.
+    const dbgLaunch = await call(a, "debug_launch", {
+      lease_id: leaseA.json.lease.leaseId, path: "/nonexistent/ci-smoke-debug-app",
+    });
+    if (haveLlmdb) {
+      if (!dbgLaunch.isError) fail("debug_launch of a missing binary should fail");
+    } else if (!dbgLaunch.isError || !/llmdb is not installed|LLMDB_BIN/i.test(JSON.stringify(dbgLaunch.json))) {
+      fail(`debug_launch should hint at the missing binary: ${JSON.stringify(dbgLaunch.json)}`);
+    }
+    // symbolicate is host-local (atos): lease gating + validation only, no
+    // live symbolication in CI.
+    const symGated = await call(a, "symbolicate", { pcs: "0x1000", binary: "/bin/ls", lease_id: "lease_nope" });
+    if (!symGated.isError || !/unknown lease/i.test(JSON.stringify(symGated.json))) {
+      fail(`symbolicate should reject an unknown lease: ${JSON.stringify(symGated.json)}`);
+    }
+    const symNoBin = await call(a, "symbolicate", { pcs: "0x1000", lease_id: leaseA.json.lease.leaseId });
+    if (!symNoBin.isError || !/binary/i.test(JSON.stringify(symNoBin.json))) {
+      fail(`symbolicate should require a binary: ${JSON.stringify(symNoBin.json)}`);
+    }
+    const symBadPc = await call(a, "symbolicate", { pcs: "not-an-address", binary: "/bin/ls" });
+    if (!symBadPc.isError || !/pc/i.test(JSON.stringify(symBadPc.json))) {
+      fail(`symbolicate should reject a bad pc: ${JSON.stringify(symBadPc.json)}`);
+    }
     log("debug_* validation paths ok (no live attach in CI)");
 
     // net_proxy_*: plumbing ONLY — starting the proxy would toggle the CI
@@ -370,6 +441,78 @@ async function main() {
     const proxyStop = await call(a, "net_proxy_stop", { lease_id: leaseA.json.lease.leaseId });
     expectOk(proxyStop, "net_proxy_stop idempotent");
     if (proxyStop.json.stopped !== false) fail("net_proxy_stop with no proxy should report stopped=false");
+
+    // Round-2 proxy tools: same policy (gating + validation only, never a
+    // live interception). net_assert_flow fails cleanly with no proxy;
+    // map_local validates the file before the holder check, so a missing
+    // file fails without needing a running proxy.
+    for (const [tool, args] of [
+      ["net_assert_flow", { url_regex: "example\\.com" }],
+      ["map_local", { url_regex: "example\\.com", file: "/etc/hosts" }],
+      ["map_remote", { url_regex: "example\\.com", url: "https://example.com/" }],
+    ]) {
+      const gated = await call(a, tool, { lease_id: "lease_nope", ...args });
+      if (!gated.isError || !/unknown lease/i.test(JSON.stringify(gated.json))) {
+        fail(`${tool} should reject an unknown lease: ${JSON.stringify(gated.json)}`);
+      }
+    }
+    const assertIdle = await call(a, "net_assert_flow", {
+      lease_id: leaseA.json.lease.leaseId, url_regex: "example\\.com", timeout_sec: 0,
+    });
+    if (!assertIdle.isError || !/no network proxy is running/i.test(JSON.stringify(assertIdle.json))) {
+      fail(`net_assert_flow should fail cleanly with no proxy: ${JSON.stringify(assertIdle.json)}`);
+    }
+    const assertRegex = await callRaw(a, "net_assert_flow", {
+      lease_id: leaseA.json.lease.leaseId, url_regex: "(unclosed",
+    });
+    if (!assertRegex.isError || !/regular expression/i.test(assertRegex.text)) {
+      fail(`net_assert_flow should reject a bad regex: ${assertRegex.text.slice(0, 300)}`);
+    }
+    const mapMissing = await call(a, "map_local", {
+      lease_id: leaseA.json.lease.leaseId, url_regex: "example\\.com", file: "/nonexistent/ci-smoke-map-body.json",
+    });
+    if (!mapMissing.isError || !/map_local.*not found or unreadable/i.test(JSON.stringify(mapMissing.json))) {
+      fail(`map_local should reject a missing file: ${JSON.stringify(mapMissing.json)}`);
+    }
+    const mapIdle = await call(a, "map_local", {
+      lease_id: leaseA.json.lease.leaseId, url_regex: "example\\.com", file: "/etc/hosts",
+    });
+    if (!mapIdle.isError || !/no network proxy is running/i.test(JSON.stringify(mapIdle.json))) {
+      fail(`map_local should fail cleanly with no proxy: ${JSON.stringify(mapIdle.json)}`);
+    }
+    const mapBadUrl = await callRaw(a, "map_remote", {
+      lease_id: leaseA.json.lease.leaseId, url_regex: "example\\.com", url: "ftp://example.com/x",
+    });
+    if (!mapBadUrl.isError || !/absolute http/i.test(mapBadUrl.text)) {
+      fail(`map_remote should reject a non-http URL: ${mapBadUrl.text.slice(0, 300)}`);
+    }
+    const mapRemoteIdle = await call(a, "map_remote", {
+      lease_id: leaseA.json.lease.leaseId, url_regex: "example\\.com", url: "https://example.com/",
+    });
+    if (!mapRemoteIdle.isError || !/no network proxy is running/i.test(JSON.stringify(mapRemoteIdle.json))) {
+      fail(`map_remote should fail cleanly with no proxy: ${JSON.stringify(mapRemoteIdle.json)}`);
+    }
+    // The extended rule schema (request/map fields) must pass zod and reach
+    // the holder check: with no proxy running that surfaces as the
+    // not-running error, never a schema error and never a host change.
+    const proxyExtended = await call(a, "net_proxy_set_rules", {
+      lease_id: leaseA.json.lease.leaseId,
+      rules: [
+        { match: { url_regex: "api\\.example\\.com" }, action: { request: { method: "post", body: "{}" } } },
+        { match: { url_regex: "cdn\\.example\\.com" }, action: { map_local: "/etc/hosts" } },
+        { action: { map_remote: "https://staging.example.com/" } },
+      ],
+    });
+    if (!proxyExtended.isError || !/no network proxy is running/i.test(JSON.stringify(proxyExtended.json))) {
+      fail(`net_proxy_set_rules should accept request/map rules: ${JSON.stringify(proxyExtended.json)}`);
+    }
+    const proxyMapCombo = await callRaw(a, "net_proxy_set_rules", {
+      lease_id: leaseA.json.lease.leaseId,
+      rules: [{ action: { map_local: "/etc/hosts", map_remote: "https://example.com/" } }],
+    });
+    if (!proxyMapCombo.isError || !/mutually exclusive/i.test(proxyMapCombo.text)) {
+      fail(`net_proxy_set_rules should reject map_local+map_remote: ${proxyMapCombo.text.slice(0, 300)}`);
+    }
     log("net_proxy_* plumbing ok (no host proxy changes in CI)");
 
     const actions = await call(a, "lease_actions", { lease_id: leaseA.json.lease.leaseId });

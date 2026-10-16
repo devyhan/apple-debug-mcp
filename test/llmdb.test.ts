@@ -140,6 +140,115 @@ describe("Llmdb wrapper", () => {
     await expect(new Llmdb({ runner: run }).checkAvailable()).resolves.toBe("0.2.0");
     expect(run.calls[0]?.args).toEqual(["--version"]);
   });
+
+  it("launches a binary path with forwarded args and extracts the session id", async () => {
+    const run = stubRunner(() => JSON.stringify({ sessionId: "launch-1", state: "running" }));
+    const lldmdb = new Llmdb({ runner: run });
+    const res = await lldmdb.launch("/tmp/app/DebugApp", ["--flag", "x"]);
+    expect(res.sessionId).toBe("launch-1");
+    expect(run.calls[0]?.args).toEqual(["launch", "/tmp/app/DebugApp", "--flag", "x"]);
+    await lldmdb.launch("/tmp/app/DebugApp");
+    expect(run.calls[1]?.args).toEqual(["launch", "/tmp/app/DebugApp"]);
+    await expect(lldmdb.launch("  ")).rejects.toThrow(/path/);
+  });
+
+  it("rejects launch responses without a sessionId", async () => {
+    const lldmdb = new Llmdb({ runner: stubRunner(() => JSON.stringify({ state: "running" })) });
+    await expect(lldmdb.launch("/bin/true")).rejects.toThrow(/no sessionId/);
+  });
+
+  it("runs doctor and threads with session threading", async () => {
+    const run = stubRunner(() => JSON.stringify({ ok: true }));
+    const lldmdb = new Llmdb({ runner: run });
+    await lldmdb.doctor();
+    expect(run.calls[0]?.args).toEqual(["doctor"]);
+    await lldmdb.threads("sess-1");
+    expect(run.calls[1]?.args).toEqual(["threads", "--session", "sess-1"]);
+    await expect(lldmdb.threads("  ")).rejects.toThrow(/session_id/);
+  });
+
+  it("sets conditional breakpoints and manages break list/delete/exception", async () => {
+    const run = stubRunner(() => JSON.stringify({ ok: true }));
+    const lldmdb = new Llmdb({ runner: run });
+    await lldmdb.breakSet("sess-1", "a.swift", 10, { condition: "n > 100", hitCondition: ">5" });
+    expect(run.calls[0]?.args).toEqual([
+      "break", "set", "a.swift:10", "--condition", "n > 100", "--hit-condition", ">5", "--session", "sess-1",
+    ]);
+    await lldmdb.breakSet("sess-1", "a.swift", 10, { condition: "x" });
+    expect(run.calls[1]?.args).toEqual(["break", "set", "a.swift:10", "--condition", "x", "--session", "sess-1"]);
+    await expect(lldmdb.breakSet("sess-1", "a.swift", 10, { condition: "  " })).rejects.toThrow(/condition/);
+    await expect(lldmdb.breakSet("sess-1", "a.swift", 10, { hitCondition: "" })).rejects.toThrow(/hit_condition/);
+
+    await lldmdb.breakList("sess-1");
+    expect(run.calls[2]?.args).toEqual(["break", "list", "--session", "sess-1"]);
+    await lldmdb.breakDelete("sess-1", 3);
+    expect(run.calls[3]?.args).toEqual(["break", "delete", "3", "--session", "sess-1"]);
+    await expect(lldmdb.breakDelete("sess-1", 0)).rejects.toThrow(/breakpoint id/);
+    await lldmdb.breakException("sess-1", ["swift_throw"]);
+    expect(run.calls[4]?.args).toEqual(["break", "exception", "swift_throw", "--session", "sess-1"]);
+    await lldmdb.breakException("sess-1");
+    expect(run.calls[5]?.args).toEqual(["break", "exception", "--session", "sess-1"]);
+    await expect(lldmdb.breakException("sess-1", ["  "])).rejects.toThrow(/filter/);
+  });
+
+  it("reads backtraces for an explicit thread", async () => {
+    const run = stubRunner(() => JSON.stringify({ frames: [] }));
+    const lldmdb = new Llmdb({ runner: run });
+    await lldmdb.backtrace("sess-1", undefined, 7);
+    expect(run.calls[0]?.args).toEqual(["bt", "--thread", "7", "--session", "sess-1"]);
+    await lldmdb.backtrace("sess-1", 4, 2);
+    expect(run.calls[1]?.args).toEqual(["bt", "--thread", "2", "--depth", "4", "--session", "sess-1"]);
+    await expect(lldmdb.backtrace("sess-1", undefined, 0)).rejects.toThrow(/thread/);
+  });
+
+  it("reads scopes, expands refs, sets vars, and drains output", async () => {
+    const run = stubRunner(() => JSON.stringify({ ok: true }));
+    const lldmdb = new Llmdb({ runner: run });
+    await lldmdb.scopes("sess-1");
+    expect(run.calls[0]?.args).toEqual(["scopes", "--frame", "0", "--session", "sess-1"]);
+    await lldmdb.scopes("sess-1", 3);
+    expect(run.calls[1]?.args).toEqual(["scopes", "--frame", "3", "--session", "sess-1"]);
+    await expect(lldmdb.scopes("sess-1", -1)).rejects.toThrow(/frame/);
+
+    await lldmdb.expand("sess-1", 42);
+    expect(run.calls[2]?.args).toEqual(["expand", "42", "--session", "sess-1"]);
+    await expect(lldmdb.expand("sess-1", 0)).rejects.toThrow(/ref/);
+
+    await lldmdb.setVar("sess-1", "self.count", "42", 1);
+    expect(run.calls[3]?.args).toEqual(["set-var", "self.count", "42", "--frame", "1", "--session", "sess-1"]);
+    await expect(lldmdb.setVar("sess-1", "  ", "1")).rejects.toThrow(/target/);
+    await expect(lldmdb.setVar("sess-1", "x", "")).rejects.toThrow(/value/);
+
+    await lldmdb.output("sess-1");
+    expect(run.calls[4]?.args).toEqual(["output", "--session", "sess-1"]);
+    await lldmdb.output("sess-1", true);
+    expect(run.calls[5]?.args).toEqual(["output", "--clear", "--session", "sess-1"]);
+  });
+
+  it("runs until a location with an outliving exec timeout", async () => {
+    const run = stubRunner(() => JSON.stringify({ state: "stopped" }));
+    const lldmdb = new Llmdb({ runner: run });
+    await lldmdb.runUntil("sess-1", "a.swift", 12, 45);
+    expect(run.calls[0]?.args).toEqual(["run-until", "a.swift:12", "--wait", "45", "--session", "sess-1"]);
+    expect(run.calls[0]?.opts?.timeoutMs).toBe((45 + 30) * 1000);
+    await expect(lldmdb.runUntil("sess-1", "a.swift", 0)).rejects.toThrow(/line/);
+    await expect(lldmdb.runUntil("sess-1", "a.swift", 1, 601)).rejects.toThrow(/wait_sec/);
+  });
+
+  it("waits for stops and interrupts with outliving exec timeouts", async () => {
+    const run = stubRunner(() => JSON.stringify({ state: "stopped" }));
+    const lldmdb = new Llmdb({ runner: run });
+    await lldmdb.wait("sess-1");
+    expect(run.calls[0]?.args).toEqual(["wait", "--timeout", "60", "--session", "sess-1"]);
+    expect(run.calls[0]?.opts?.timeoutMs).toBe((60 + 30) * 1000);
+    await lldmdb.wait("sess-1", 5);
+    expect(run.calls[1]?.args).toEqual(["wait", "--timeout", "5", "--session", "sess-1"]);
+    await expect(lldmdb.wait("sess-1", 0)).rejects.toThrow(/timeout/);
+    await lldmdb.interrupt("sess-1");
+    expect(run.calls[2]?.args).toEqual(["interrupt", "--wait", "10", "--session", "sess-1"]);
+    expect(run.calls[2]?.opts?.timeoutMs).toBe((10 + 30) * 1000);
+    await expect(lldmdb.interrupt("sess-1", 601)).rejects.toThrow(/wait_sec/);
+  });
 });
 
 class FakeFleet implements FleetOps {
@@ -392,5 +501,146 @@ describe("debug_* tools", () => {
     const res = await call(client, "debug_attach", { lease_id: leaseId, pid: 1 });
     expect(res.isError).toBe(true);
     expect(String(res.json.error)).toMatch(/brew install alexmx\/tools\/llmdb/);
+  });
+});
+
+function round2Handler(_bin: string, args: string[]): string {
+  if (args[0] === "launch") return JSON.stringify({ sessionId: "dbg-launch", state: "running" });
+  if (args[0] === "attach") return JSON.stringify({ sessionId: "dbg-9", state: "stopped" });
+  if (args[0] === "sessions") return JSON.stringify([{ sessionId: "dbg-9" }]);
+  if (args[0] === "doctor") return JSON.stringify({ lldbDap: "ok" });
+  if (args[0] === "threads") return JSON.stringify({ threads: [{ id: 1 }] });
+  if (args[0] === "break") return JSON.stringify({ ok: true });
+  return JSON.stringify({ ok: true });
+}
+
+describe("round-2 debug_* tools", () => {
+  it("registers every round-2 tool", async () => {
+    const { client } = await makeDebugClient(stubRunner(round2Handler));
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    for (const name of [
+      "debug_sessions", "debug_launch", "debug_doctor", "debug_threads", "debug_scopes",
+      "debug_expand", "debug_set_var", "debug_output", "debug_run_until", "debug_wait",
+      "debug_interrupt", "symbolicate", "net_assert_flow", "map_local", "map_remote",
+    ]) {
+      expect(names).toContain(name);
+    }
+  });
+
+  it("requires an attached session for the session-bound round-2 verbs", async () => {
+    const { client, leaseId } = await makeDebugClient(stubRunner(round2Handler));
+    for (const [tool, args] of [
+      ["debug_threads", {}],
+      ["debug_scopes", {}],
+      ["debug_expand", { ref: 3 }],
+      ["debug_set_var", { target: "x", value: "1" }],
+      ["debug_output", {}],
+      ["debug_run_until", { file: "a.swift", line: 1 }],
+      ["debug_wait", {}],
+      ["debug_interrupt", {}],
+      ["debug_break", { list: true }],
+      ["debug_break", { delete: 1 }],
+      ["debug_break", { exception: [] }],
+    ] as const) {
+      const res = await call(client, tool, { lease_id: leaseId, ...args });
+      expect(res.isError, tool).toBe(true);
+      expect(String(res.json.error), tool).toMatch(/no debug session/i);
+    }
+  });
+
+  it("dispatches debug_break ops and rejects combos before touching a session", async () => {
+    const run = stubRunner(round2Handler);
+    const { client, leaseId } = await makeDebugClient(run);
+    const combo = await call(client, "debug_break", { lease_id: leaseId, file: "a.swift", line: 1, list: true });
+    expect(combo.isError).toBe(true);
+    expect(String(combo.json.error)).toMatch(/exactly one op/);
+    const none = await call(client, "debug_break", { lease_id: leaseId });
+    expect(none.isError).toBe(true);
+    expect(String(none.json.error)).toMatch(/exactly one op/);
+    expect(run.calls).toHaveLength(0);
+
+    await call(client, "debug_attach", { lease_id: leaseId, pid: 4242 });
+    const list = await call(client, "debug_break", { lease_id: leaseId, list: true });
+    expect(list.json).toMatchObject({ ok: true, op: "list", session_id: "dbg-9" });
+    const del = await call(client, "debug_break", { lease_id: leaseId, delete: 2 });
+    expect(del.json).toMatchObject({ ok: true, op: "delete" });
+    const exc = await call(client, "debug_break", { lease_id: leaseId, exception: ["swift_throw"] });
+    expect(exc.json).toMatchObject({ ok: true, op: "exception" });
+    const clear = await call(client, "debug_break", { lease_id: leaseId, exception: [] });
+    expect(clear.json).toMatchObject({ ok: true, op: "exception" });
+    const set = await call(client, "debug_break", {
+      lease_id: leaseId, file: "a.swift", line: 9, condition: "n > 1", hit_condition: ">2",
+    });
+    expect(set.json).toMatchObject({ ok: true, op: "set" });
+    const half = await call(client, "debug_break", { lease_id: leaseId, file: "a.swift" });
+    expect(half.isError).toBe(true);
+    expect(String(half.json.error)).toMatch(/both file and line/);
+    expect(run.calls.map((c) => c.args)).toContainEqual(["break", "list", "--session", "dbg-9"]);
+    expect(run.calls.map((c) => c.args)).toContainEqual(["break", "delete", "2", "--session", "dbg-9"]);
+    expect(run.calls.map((c) => c.args)).toContainEqual(["break", "exception", "swift_throw", "--session", "dbg-9"]);
+    expect(run.calls.map((c) => c.args)).toContainEqual(["break", "exception", "--session", "dbg-9"]);
+    expect(run.calls.map((c) => c.args)).toContainEqual([
+      "break", "set", "a.swift:9", "--condition", "n > 1", "--hit-condition", ">2", "--session", "dbg-9",
+    ]);
+  });
+
+  it("threads the session through the round-2 verbs and logs actions", async () => {
+    const run = stubRunner(round2Handler);
+    const { client, orch, leaseId } = await makeDebugClient(run);
+    const sessions = await call(client, "debug_sessions", { lease_id: leaseId });
+    expect(sessions.json).toMatchObject({ ok: true });
+    const doctor = await call(client, "debug_doctor", { lease_id: leaseId });
+    expect(doctor.json).toMatchObject({ ok: true });
+    const launch = await call(client, "debug_launch", { lease_id: leaseId, path: "/tmp/DebugApp", args: ["--x"] });
+    expect(launch.json).toMatchObject({ ok: true, session_id: "dbg-launch" });
+    expect(run.calls[2]?.args).toEqual(["launch", "/tmp/DebugApp", "--x"]);
+
+    for (const [tool, args, argv] of [
+      ["debug_threads", {}, ["threads", "--session", "dbg-launch"]],
+      ["debug_scopes", { frame: 2 }, ["scopes", "--frame", "2", "--session", "dbg-launch"]],
+      ["debug_expand", { ref: 5 }, ["expand", "5", "--session", "dbg-launch"]],
+      ["debug_set_var", { target: "x", value: "1" }, ["set-var", "x", "1", "--frame", "0", "--session", "dbg-launch"]],
+      ["debug_output", { clear: true }, ["output", "--clear", "--session", "dbg-launch"]],
+      ["debug_run_until", { file: "a.swift", line: 3 }, ["run-until", "a.swift:3", "--wait", "60", "--session", "dbg-launch"]],
+      ["debug_wait", { timeout: 7 }, ["wait", "--timeout", "7", "--session", "dbg-launch"]],
+      ["debug_interrupt", {}, ["interrupt", "--wait", "10", "--session", "dbg-launch"]],
+      ["debug_bt", { thread: 4, depth: 3 }, ["bt", "--thread", "4", "--depth", "3", "--session", "dbg-launch"]],
+    ] as const) {
+      const res = await call(client, tool, { lease_id: leaseId, ...args });
+      expect(res.isError, tool).toBe(false);
+      expect(res.json).toMatchObject({ ok: true, session_id: "dbg-launch" });
+      expect(run.calls.map((c) => c.args), tool).toContainEqual(argv);
+    }
+    const tools = orch.leaseActions(leaseId).map((a) => a.tool);
+    expect(tools).toContain("debug_launch");
+    expect(tools).toContain("debug_threads");
+    expect(tools).toContain("debug_wait");
+  });
+
+  it("rejects invalid round-2 inputs without spawning llmdb", async () => {
+    const run = stubRunner(round2Handler);
+    const { client, leaseId } = await makeDebugClient(run);
+    const badRef = await call(client, "debug_expand", { lease_id: leaseId, ref: 0 });
+    expect(badRef.isError).toBe(true);
+    const badTimeout = await call(client, "debug_wait", { lease_id: leaseId, timeout: 601 });
+    expect(badTimeout.isError).toBe(true);
+    const badThread = await call(client, "debug_bt", { lease_id: leaseId, thread: -1 });
+    expect(badThread.isError).toBe(true);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("symbolicate validates the lease, pcs, and binary without spawning", async () => {
+    const { client, leaseId } = await makeDebugClient(stubRunner(round2Handler));
+    const gated = await call(client, "symbolicate", { pcs: "0x1000", binary: "/bin/ls", lease_id: "lease_nope" });
+    expect(gated.isError).toBe(true);
+    expect(String(gated.json.error)).toMatch(/unknown lease/i);
+    const noBinary = await call(client, "symbolicate", { pcs: "0x1000", lease_id: leaseId });
+    expect(noBinary.isError).toBe(true);
+    expect(String(noBinary.json.error)).toMatch(/binary/);
+    const badPc = await call(client, "symbolicate", { pcs: "not-an-address", binary: "/bin/ls" });
+    expect(badPc.isError).toBe(true);
+    expect(String(badPc.json.error)).toMatch(/pc/);
+    const empty = await call(client, "symbolicate", { pcs: [], binary: "/bin/ls" });
+    expect(empty.isError).toBe(true);
   });
 });

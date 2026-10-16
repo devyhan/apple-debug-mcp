@@ -22,6 +22,17 @@ export interface NetProxyMatch {
   method?: string;
 }
 
+export interface NetProxyRequestRewrite {
+  /** Replace the upstream request method (uppercased, e.g. "POST"). */
+  method?: string;
+  /** Replace the upstream request URL wholesale. */
+  url?: string;
+  /** Headers merged into the upstream request (replace per-name). */
+  headers?: Record<string, string>;
+  /** Replace the upstream request body (UTF-8). */
+  body?: string;
+}
+
 export interface NetProxyAction {
   /** Override the upstream response status code. */
   status?: number;
@@ -31,6 +42,12 @@ export interface NetProxyAction {
   body?: string;
   /** Delay before forwarding the matched request, in milliseconds. */
   delay_ms?: number;
+  /** Request-direction rewrite, applied in the mitm request() hook before forwarding. */
+  request?: NetProxyRequestRewrite;
+  /** Serve a local file as the response without contacting upstream (map_local). */
+  map_local?: string;
+  /** Rewrite the upstream URL to this fixed URL (map_remote). */
+  map_remote?: string;
 }
 
 export interface NetProxyRule {
@@ -54,6 +71,34 @@ export interface NetProxyStatus {
   udid?: string;
   ruleCount?: number;
   addonPath?: string;
+  flowLogPath?: string;
+}
+
+/** One JSONL row of the proxy flow log (written by the generated addon). */
+export interface FlowRecord {
+  ts: number;
+  method: string;
+  url: string;
+}
+
+export interface AssertFlowSpec {
+  /** Regex matched (search) against the full request URL. */
+  urlRegex: string;
+  /** HTTP method, compared uppercase. Omit to match all methods. */
+  method?: string;
+  /** Succeed once this many matching flows are seen. Default 1. */
+  minCount?: number;
+  /** Poll the flow log up to this many seconds. Default 5. */
+  timeoutSec?: number;
+}
+
+export interface AssertFlowResult {
+  /** Matching flows seen (up to the poll deadline). */
+  count: number;
+  /** Total flows logged for this proxy run. */
+  total: number;
+  /** The most recent matching flows (at most 10, oldest first). */
+  matched: FlowRecord[];
 }
 
 /** Minimal proxy surface the orchestrator needs (implemented by NetProxy, faked in tests). */
@@ -62,6 +107,9 @@ export interface ProxyOps {
   setProxyRules(leaseId: string, rules: NetProxyRule[]): Promise<void>;
   stopProxy(leaseId: string): Promise<{ stopped: boolean }>;
   proxyStatus(): NetProxyStatus;
+  proxyRules(leaseId: string): NetProxyRule[];
+  assertFlow(leaseId: string, spec: AssertFlowSpec): Promise<AssertFlowResult>;
+  upsertMapRule(leaseId: string, rule: NetProxyRule): Promise<number>;
 }
 
 /** Thrown when a non-holder starts/sets/stops while another lease holds the global host proxy. */
@@ -169,13 +217,83 @@ function normalizeMatch(match: unknown, what: string): NetProxyMatch {
   return out;
 }
 
+function normalizeHeaders(headers: unknown, what: string): Record<string, string> {
+  if (typeof headers !== "object" || headers === null || Array.isArray(headers)) {
+    throw new Error(`Invalid ${what} (expected an object of string->string)`);
+  }
+  const clean: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers as Record<string, unknown>)) {
+    if (name.length === 0) throw new Error(`Invalid ${what} (header names must be non-empty)`);
+    if (typeof value !== "string") {
+      throw new Error(`Invalid ${what}[${JSON.stringify(name)}] (expected a string value)`);
+    }
+    clean[name] = value;
+  }
+  return clean;
+}
+
+function normalizeRequestRewrite(request: unknown, what: string): NetProxyRequestRewrite {
+  if (typeof request !== "object" || request === null || Array.isArray(request)) {
+    throw new Error(`Invalid ${what}.action.request (expected {method?, url?, headers?, body?})`);
+  }
+  const { method, url, headers, body } = request as Record<string, unknown>;
+  if (method === undefined && url === undefined && headers === undefined && body === undefined) {
+    throw new Error(`Invalid ${what}.action.request (needs at least one of method|url|headers|body)`);
+  }
+  const out: NetProxyRequestRewrite = {};
+  if (method !== undefined) {
+    if (typeof method !== "string" || method.trim().length === 0) {
+      throw new Error(`Invalid ${what}.action.request.method (expected a non-empty string, e.g. "POST")`);
+    }
+    out.method = method.trim().toUpperCase();
+  }
+  if (url !== undefined) {
+    if (typeof url !== "string" || url.length === 0) {
+      throw new Error(`Invalid ${what}.action.request.url (expected a non-empty string)`);
+    }
+    assertHttpUrl(url, `${what}.action.request.url`);
+    out.url = url;
+  }
+  if (headers !== undefined) out.headers = normalizeHeaders(headers, `${what}.action.request.headers`);
+  if (body !== undefined) {
+    if (typeof body !== "string") throw new Error(`Invalid ${what}.action.request.body (expected a string)`);
+    out.body = body;
+  }
+  return out;
+}
+
+function assertHttpUrl(url: string, what: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`Invalid ${what} ${JSON.stringify(url)} (expected an absolute http(s) URL)`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`Invalid ${what} ${JSON.stringify(url)} (expected an absolute http(s) URL)`);
+  }
+}
+
 function normalizeAction(action: unknown, what: string): NetProxyAction {
   if (typeof action !== "object" || action === null || Array.isArray(action)) {
-    throw new Error(`Invalid ${what}.action (expected {status?, headers?, body?, delay_ms?})`);
+    throw new Error(
+      `Invalid ${what}.action (expected {status?, headers?, body?, delay_ms?, request?, map_local?, map_remote?})`,
+    );
   }
-  const { status, headers, body, delay_ms } = action as Record<string, unknown>;
-  if (status === undefined && headers === undefined && body === undefined && delay_ms === undefined) {
-    throw new Error(`Invalid ${what}.action (needs at least one of status|headers|body|delay_ms)`);
+  const { status, headers, body, delay_ms, request, map_local, map_remote } = action as Record<string, unknown>;
+  if (
+    status === undefined &&
+    headers === undefined &&
+    body === undefined &&
+    delay_ms === undefined &&
+    request === undefined &&
+    map_local === undefined &&
+    map_remote === undefined
+  ) {
+    throw new Error(`Invalid ${what}.action (needs at least one of status|headers|body|delay_ms|request|map_local|map_remote)`);
+  }
+  if (map_local !== undefined && map_remote !== undefined) {
+    throw new Error(`Invalid ${what}.action (map_local and map_remote are mutually exclusive)`);
   }
   const out: NetProxyAction = {};
   if (status !== undefined) {
@@ -184,20 +302,7 @@ function normalizeAction(action: unknown, what: string): NetProxyAction {
     }
     out.status = status as number;
   }
-  if (headers !== undefined) {
-    if (typeof headers !== "object" || headers === null || Array.isArray(headers)) {
-      throw new Error(`Invalid ${what}.action.headers (expected an object of string->string)`);
-    }
-    const clean: Record<string, string> = {};
-    for (const [name, value] of Object.entries(headers as Record<string, unknown>)) {
-      if (name.length === 0) throw new Error(`Invalid ${what}.action.headers (header names must be non-empty)`);
-      if (typeof value !== "string") {
-        throw new Error(`Invalid ${what}.action.headers[${JSON.stringify(name)}] (expected a string value)`);
-      }
-      clean[name] = value;
-    }
-    out.headers = clean;
-  }
+  if (headers !== undefined) out.headers = normalizeHeaders(headers, `${what}.action.headers`);
   if (body !== undefined) {
     if (typeof body !== "string") throw new Error(`Invalid ${what}.action.body (expected a string)`);
     out.body = body;
@@ -208,6 +313,28 @@ function normalizeAction(action: unknown, what: string): NetProxyAction {
     }
     out.delay_ms = delay_ms as number;
   }
+  if (request !== undefined) out.request = normalizeRequestRewrite(request, what);
+  if (map_local !== undefined) {
+    if (typeof map_local !== "string" || map_local.length === 0) {
+      throw new Error(`Invalid ${what}.action.map_local (expected a non-empty file path)`);
+    }
+    try {
+      if (!fs.statSync(map_local).isFile()) {
+        throw new Error(`Invalid ${what}.action.map_local ${JSON.stringify(map_local)} (not a regular file)`);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith(`Invalid ${what}.action.map_local`)) throw err;
+      throw new Error(`Invalid ${what}.action.map_local ${JSON.stringify(map_local)} (file not found or unreadable)`);
+    }
+    out.map_local = map_local;
+  }
+  if (map_remote !== undefined) {
+    if (typeof map_remote !== "string" || map_remote.length === 0) {
+      throw new Error(`Invalid ${what}.action.map_remote (expected a non-empty string)`);
+    }
+    assertHttpUrl(map_remote, `${what}.action.map_remote`);
+    out.map_remote = map_remote;
+  }
   return out;
 }
 
@@ -215,23 +342,43 @@ function normalizeAction(action: unknown, what: string): NetProxyAction {
  * Generate the mitmdump addon for normalized rules. The rules are embedded as
  * a doubly-encoded JSON string literal (valid Python: JSON escapes are a
  * subset of Python string escapes), so rule bodies need no Python escaping.
- * Semantics: every request still goes upstream; the first matching rule
- * mutates the response (status/headers/body) and may delay the request.
+ * Semantics: every request is appended to the flow log; the first matching
+ * rule may rewrite the request (method/url/headers/body, map_remote), serve a
+ * local file instead of upstream (map_local), delay the request, and mutate
+ * the response (status/headers/body).
  */
-export function buildAddon(rules: NetProxyRule[]): string {
+export function buildAddon(rules: NetProxyRule[], opts: { flowLogPath?: string } = {}): string {
   const embedded = JSON.stringify(JSON.stringify(rules));
+  const flowLog = opts.flowLogPath !== undefined ? JSON.stringify(opts.flowLogPath) : "None";
   return `# Generated by sim-orchestration-mcp NetProxy - do not edit.
-"""Per-lease response-rewrite rules (first match wins per request).
+"""Per-lease rewrite rules (first match wins per request).
 
-Every request still goes upstream; the matched rule mutates the response
-(status/headers/body) and may delay the request. Regenerated on every
-net_proxy_start / net_proxy_set_rules.
+Every request is appended to the flow log; the matched rule may rewrite the
+request, serve a local file (map_local), delay, and mutate the response.
+Regenerated on every net_proxy_start / net_proxy_set_rules / map_*.
 """
 import json
 import re
 import time
 
+from mitmproxy import http
+
 RULES = json.loads(${embedded})
+FLOW_LOG = ${flowLog}
+
+
+def _log(flow):
+    if not FLOW_LOG:
+        return
+    try:
+        with open(FLOW_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": time.time(),
+                "method": flow.request.method,
+                "url": flow.request.pretty_url,
+            }) + "\\n")
+    except OSError:
+        pass
 
 
 def _match(rule, flow):
@@ -257,12 +404,35 @@ def _find(flow):
 
 
 def request(flow):
+    _log(flow)
     rule = _find(flow)
     if rule is None:
         return
-    delay = (rule.get("action") or {}).get("delay_ms")
+    action = rule.get("action") or {}
+    delay = action.get("delay_ms")
     if delay:
         time.sleep(delay / 1000.0)
+    req = action.get("request") or {}
+    if req.get("method"):
+        flow.request.method = req["method"]
+    if req.get("url"):
+        flow.request.url = req["url"]
+    for k, v in (req.get("headers") or {}).items():
+        flow.request.headers[k] = v
+    if req.get("body") is not None:
+        body = req["body"].encode("utf-8")
+        flow.request.content = body
+        flow.request.headers.pop("content-encoding", None)
+        flow.request.headers["content-length"] = str(len(body))
+    if action.get("map_remote"):
+        flow.request.url = action["map_remote"]
+    if action.get("map_local"):
+        try:
+            with open(action["map_local"], "rb") as f:
+                content = f.read()
+            flow.response = http.Response.make(200, content)
+        except OSError as e:
+            flow.response = http.Response.make(502, ("map_local failed: %s" % e).encode("utf-8"))
 
 
 def response(flow):
@@ -281,6 +451,40 @@ def response(flow):
         resp.headers.pop("content-encoding", None)
         resp.headers["content-length"] = str(len(body))
 `;
+}
+
+/** Parse flow-log JSONL, skipping malformed rows (a partial last line while mitmdump writes). */
+export function parseFlowLog(text: string): FlowRecord[] {
+  const out: FlowRecord[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const row = JSON.parse(trimmed) as Record<string, unknown>;
+      if (typeof row["method"] === "string" && typeof row["url"] === "string") {
+        out.push({ ts: typeof row["ts"] === "number" ? row["ts"] : 0, method: row["method"], url: row["url"] });
+      }
+    } catch {
+      // Skip torn writes.
+    }
+  }
+  return out;
+}
+
+/** Identity of a map rule for replace-in-place: url_regex + map kind (or null for non-map rules). */
+function mapKey(rule: NetProxyRule): string | null {
+  const kind = rule.action.map_local !== undefined ? "local" : rule.action.map_remote !== undefined ? "remote" : null;
+  if (kind === null) return null;
+  return `${kind}:${rule.match?.url_regex ?? ""}:${rule.match?.method ?? ""}`;
+}
+
+/** Read + parse the flow log; a missing file (proxy just started) reads as empty. */
+function readFlowLog(flowLogPath: string): FlowRecord[] {
+  try {
+    return parseFlowLog(fs.readFileSync(flowLogPath, "utf8"));
+  } catch {
+    return [];
+  }
 }
 
 /** Injectable mitmdump child handle (node:child_process ChildProcess satisfies this). */
@@ -392,8 +596,12 @@ interface ActiveProxy {
   rules: NetProxyRule[];
   snapshot: ServiceProxySnapshot[];
   addonPath: string;
+  flowLogPath: string;
   child: MitmChild;
 }
+
+/** Upper bound for net_assert_flow polling (keeps the tool call bounded). */
+export const MAX_ASSERT_FLOW_SEC = 120;
 
 /**
  * Lease-scoped HTTPS interception for one simulator, on the proven mechanism:
@@ -463,6 +671,7 @@ export class NetProxy implements ProxyOps {
       udid: active.udid,
       ruleCount: active.rules.length,
       addonPath: active.addonPath,
+      flowLogPath: active.flowLogPath,
     };
   }
 
@@ -490,7 +699,9 @@ export class NetProxy implements ProxyOps {
     });
     fs.mkdirSync(this.workDir, { recursive: true });
     const addonPath = path.join(this.workDir, `addon-${port}.py`);
-    fs.writeFileSync(addonPath, buildAddon(normalized));
+    const flowLogPath = path.join(this.workDir, `flow-${port}.jsonl`);
+    fs.writeFileSync(addonPath, buildAddon(normalized, { flowLogPath }));
+    fs.writeFileSync(flowLogPath, "");
     const child = this.spawnFn(this.bin, ["-p", String(port), "-s", addonPath], {});
     let spawnError: Error | null = null;
     child.once("error", (err) => {
@@ -527,6 +738,7 @@ export class NetProxy implements ProxyOps {
       rules: normalized,
       snapshot,
       addonPath,
+      flowLogPath,
       child,
     };
     return { port, pid: child.pid };
@@ -539,11 +751,97 @@ export class NetProxy implements ProxyOps {
    * rather than stranding it against a dead port.
    */
   async setProxyRules(leaseId: string, rules: NetProxyRule[]): Promise<void> {
+    const active = this.requireHolder(leaseId, "set rules");
+    const normalized = normalizeRules(rules);
+    await this.applyRules(active, normalized, "Proxy rules update failed");
+  }
+
+  /** Current rules of the running proxy (a copy). Only the holding lease may read them. */
+  proxyRules(leaseId: string): NetProxyRule[] {
+    const active = this.requireHolder(leaseId, "read rules");
+    return structuredClone(active.rules);
+  }
+
+  /**
+   * Insert or replace one map rule (map_local/map_remote action). The rule is
+   * validated before the holder check so a bad file/URL/regex fails without
+   * needing a running proxy. A prior map rule with the same url_regex and the
+   * same map kind is replaced in place; otherwise the rule is prepended (first
+   * match wins, so maps take precedence). Returns the new rule count.
+   */
+  async upsertMapRule(leaseId: string, rule: NetProxyRule): Promise<number> {
+    const [normalized] = normalizeRules([rule]);
+    const action = normalized!.action;
+    if (action.map_local === undefined && action.map_remote === undefined) {
+      throw new Error("Invalid map rule (action needs map_local or map_remote)");
+    }
+    const active = this.requireHolder(leaseId, "set map rule");
+    const key = mapKey(normalized!);
+    const next = active.rules.filter((r) => mapKey(r) !== key);
+    next.unshift(normalized!);
+    if (next.length > MAX_PROXY_RULES) {
+      throw new Error(`Too many rules (${next.length}; max ${MAX_PROXY_RULES})`);
+    }
+    await this.applyRules(active, next, "Proxy map update failed");
+    return next.length;
+  }
+
+  /**
+   * Poll the proxy flow log for requests matching urlRegex (+method). Fails
+   * cleanly when the lease holds no running proxy. Returns the counts; the
+   * caller decides pass/fail against minCount.
+   */
+  async assertFlow(leaseId: string, spec: AssertFlowSpec): Promise<AssertFlowResult> {
+    const active = this.requireHolder(leaseId, "assert flow");
+    if (typeof spec.urlRegex !== "string" || spec.urlRegex.length === 0) {
+      throw new Error("Invalid url_regex (expected a non-empty string)");
+    }
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(spec.urlRegex);
+    } catch {
+      throw new Error(`Invalid url_regex ${JSON.stringify(spec.urlRegex)} (not a valid regular expression)`);
+    }
+    const method = spec.method !== undefined ? spec.method.trim().toUpperCase() : undefined;
+    if (method !== undefined && method.length === 0) {
+      throw new Error('Invalid method (expected a non-empty string, e.g. "GET")');
+    }
+    const minCount = spec.minCount ?? 1;
+    if (!Number.isInteger(minCount) || minCount < 1) {
+      throw new Error(`Invalid min_count ${String(spec.minCount)} (expected a positive integer)`);
+    }
+    const timeoutSec = spec.timeoutSec ?? 5;
+    if (!Number.isFinite(timeoutSec) || timeoutSec < 0 || timeoutSec > MAX_ASSERT_FLOW_SEC) {
+      throw new Error(`Invalid timeout_sec ${String(spec.timeoutSec)} (expected a number in 0..${MAX_ASSERT_FLOW_SEC})`);
+    }
+    const deadline = Date.now() + timeoutSec * 1000;
+    for (;;) {
+      const flows = readFlowLog(active.flowLogPath);
+      const matched = flows.filter(
+        (f) => (method === undefined || f.method === method) && pattern.test(f.url),
+      );
+      if (matched.length >= minCount || Date.now() >= deadline) {
+        return { count: matched.length, total: flows.length, matched: matched.slice(-10) };
+      }
+      await sleep(250);
+    }
+  }
+
+  private requireHolder(leaseId: string, action: string): ActiveProxy {
     const active = this.active;
     if (!active) throw new Error("No network proxy is running; call net_proxy_start first.");
-    if (active.leaseId !== leaseId) throw new ProxyBusyError(active, "set rules");
-    const normalized = normalizeRules(rules);
-    fs.writeFileSync(active.addonPath, buildAddon(normalized));
+    if (active.leaseId !== leaseId) throw new ProxyBusyError(active, action);
+    return active;
+  }
+
+  /**
+   * Regenerate the addon and restart mitmdump on the same port (the host
+   * proxy stays on, the flow log keeps appending). When the restart fails,
+   * the proxy is stopped and the host proxy restored rather than stranding
+   * it against a dead port.
+   */
+  private async applyRules(active: ActiveProxy, normalized: NetProxyRule[], failurePrefix: string): Promise<void> {
+    fs.writeFileSync(active.addonPath, buildAddon(normalized, { flowLogPath: active.flowLogPath }));
     await stopChildQuiet(active.child);
     const child = this.spawnFn(this.bin, ["-p", String(active.port), "-s", active.addonPath], {});
     let spawnError: Error | null = null;
@@ -562,7 +860,7 @@ export class NetProxy implements ProxyOps {
       await this.restoreSnapshot(active.snapshot);
       this.active = null;
       throw new Error(
-        `Proxy rules update failed and the proxy was stopped (host proxy restored): ${mitmError(err)}. ` +
+        `${failurePrefix} and the proxy was stopped (host proxy restored): ${mitmError(err)}. ` +
           `Call net_proxy_start to resume.`,
       );
     }
@@ -597,10 +895,12 @@ export class NetProxy implements ProxyOps {
     this.active = null;
     await this.restoreSnapshot(active.snapshot);
     await stopChildQuiet(active.child);
-    try {
-      fs.unlinkSync(active.addonPath);
-    } catch {
-      // Best-effort.
+    for (const generated of [active.addonPath, active.flowLogPath]) {
+      try {
+        fs.unlinkSync(generated);
+      } catch {
+        // Best-effort.
+      }
     }
   }
 

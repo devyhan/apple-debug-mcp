@@ -20,6 +20,7 @@ import {
   buildAddon,
   makeTcpWaitReady,
   normalizeRules,
+  parseFlowLog,
   parseProxyState,
   parseServicesList,
 } from "../src/netproxy.js";
@@ -171,6 +172,64 @@ describe("normalizeRules", () => {
     expect(() => normalizeRules([{ action: { headers: { X: 7 } } }])).toThrow(/string value/);
     expect(() => normalizeRules([{ action: { body: 7 } }])).toThrow(/body/);
   });
+
+  it("accepts request-direction rewrites and uppercases the method", () => {
+    expect(
+      normalizeRules([
+        {
+          match: { url_regex: "api\\.example\\.com" },
+          action: { request: { method: "post", url: "https://api.example.com/v2", headers: { "X-A": "b" }, body: "{}" } },
+        },
+      ]),
+    ).toEqual([
+      {
+        match: { url_regex: "api\\.example\\.com" },
+        action: {
+          request: { method: "POST", url: "https://api.example.com/v2", headers: { "X-A": "b" }, body: "{}" },
+        },
+      },
+    ]);
+  });
+
+  it("rejects malformed request rewrites", () => {
+    expect(() => normalizeRules([{ action: { request: {} } }])).toThrow(/request.*at least one of/);
+    expect(() => normalizeRules([{ action: { request: [] } }])).toThrow(/request/);
+    expect(() => normalizeRules([{ action: { request: { method: "" } } }])).toThrow(/request\.method/);
+    expect(() => normalizeRules([{ action: { request: { url: "not-a-url" } } }])).toThrow(/request\.url/);
+    expect(() => normalizeRules([{ action: { request: { url: "ftp://x/y" } } }])).toThrow(/http\(s\)/);
+    expect(() => normalizeRules([{ action: { request: { headers: { "": "v" } } } }])).toThrow(/non-empty/);
+    expect(() => normalizeRules([{ action: { request: { body: 7 } } }])).toThrow(/request\.body/);
+  });
+
+  it("accepts map_local for an existing regular file and rejects the rest", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-map-"));
+    const file = path.join(dir, "body.json");
+    fs.writeFileSync(file, "{}");
+    expect(normalizeRules([{ match: { url_regex: "x" }, action: { map_local: file } }])).toEqual([
+      { match: { url_regex: "x" }, action: { map_local: file } },
+    ]);
+    expect(() => normalizeRules([{ action: { map_local: "" } }])).toThrow(/map_local/);
+    expect(() => normalizeRules([{ action: { map_local: path.join(dir, "missing.json") } }])).toThrow(/not found or unreadable/);
+    expect(() => normalizeRules([{ action: { map_local: dir } }])).toThrow(/not a regular file/);
+  });
+
+  it("accepts map_remote for absolute http(s) URLs and rejects the rest", () => {
+    expect(normalizeRules([{ action: { map_remote: "https://staging.example.com/api" } }])).toEqual([
+      { action: { map_remote: "https://staging.example.com/api" } },
+    ]);
+    expect(() => normalizeRules([{ action: { map_remote: "" } }])).toThrow(/map_remote/);
+    expect(() => normalizeRules([{ action: { map_remote: "not-a-url" } }])).toThrow(/http\(s\)/);
+    expect(() => normalizeRules([{ action: { map_remote: "ftp://x/y" } }])).toThrow(/http\(s\)/);
+  });
+
+  it("rejects map_local and map_remote on the same rule", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-map-"));
+    const file = path.join(dir, "body.json");
+    fs.writeFileSync(file, "{}");
+    expect(() =>
+      normalizeRules([{ action: { map_local: file, map_remote: "https://example.com" } }]),
+    ).toThrow(/mutually exclusive/);
+  });
 });
 
 describe("buildAddon", () => {
@@ -201,6 +260,61 @@ describe("buildAddon", () => {
     // First match wins: _find returns the first matching rule.
     expect(addon).toContain("return rule");
     expect(addon).toContain("example");
+  });
+
+  it("logs every request to the flow log and rewrites requests before forwarding", () => {
+    const addon = buildAddon([], { flowLogPath: "/tmp/flow-1.jsonl" });
+    expect(addon).toContain('FLOW_LOG = "/tmp/flow-1.jsonl"');
+    expect(addon).toContain("_log(flow)");
+    expect(addon).toContain('"method": flow.request.method');
+    expect(addon).toContain("flow.request.method = req[");
+    expect(addon).toContain("flow.request.url = req[");
+    expect(addon).toContain("flow.request.headers[k] = v");
+    expect(addon).toContain("flow.request.content = body");
+    const bare = buildAddon([]);
+    expect(bare).toContain("FLOW_LOG = None");
+  });
+
+  it("serves map_local files and rewrites map_remote URLs in the request hook", () => {
+    const addon = buildAddon([]);
+    expect(addon).toContain("from mitmproxy import http");
+    expect(addon).toContain('flow.request.url = action["map_remote"]');
+    expect(addon).toContain('open(action["map_local"], "rb")');
+    expect(addon).toContain("http.Response.make(200, content)");
+    expect(addon).toContain("http.Response.make(502,");
+  });
+
+  it("round-trips request/map rules through the double encoding", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-map-"));
+    const file = path.join(dir, "body.json");
+    fs.writeFileSync(file, "{}");
+    const rules = normalizeRules([
+      { match: { url_regex: "a" }, action: { request: { method: "put", body: "x" }, delay_ms: 1 } },
+      { match: { url_regex: "b" }, action: { map_local: file } },
+      { action: { map_remote: "https://staging.example.com/" } },
+    ]);
+    const addon = buildAddon(rules, { flowLogPath: "/tmp/f.jsonl" });
+    const match = /RULES = json\.loads\((.*)\)\n/.exec(addon);
+    const decoded = JSON.parse(JSON.parse(match![1]!) as string) as NetProxyRule[];
+    expect(decoded).toEqual(rules);
+  });
+});
+
+describe("parseFlowLog", () => {
+  it("parses JSONL rows and skips torn or malformed lines", () => {
+    const text = [
+      '{"ts": 1.5, "method": "GET", "url": "https://example.com/a"}',
+      '{"ts": 2.5, "method": "POST", "url": "https://example.com/b"}',
+      "",
+      '{"ts": 3.5, "method": "GET", "url": "https://example.com/c',
+      "not json",
+      '{"method": "GET"}',
+    ].join("\n");
+    expect(parseFlowLog(text)).toEqual([
+      { ts: 1.5, method: "GET", url: "https://example.com/a" },
+      { ts: 2.5, method: "POST", url: "https://example.com/b" },
+    ]);
+    expect(parseFlowLog("")).toEqual([]);
   });
 });
 
@@ -345,6 +459,123 @@ describe("NetProxy lifecycle (stubbed)", () => {
     await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, []);
     await expect(proxy.setProxyRules("lease_2", [])).rejects.toThrow(ProxyBusyError);
     await expect(proxy.setProxyRules("lease_2", [])).rejects.toThrow(/sess-1/);
+  });
+
+  it("creates an empty flow log on start and reports its path in status", async () => {
+    const { proxy } = makeProxy();
+    await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, []);
+    const status = proxy.proxyStatus();
+    expect(status.flowLogPath).toMatch(/flow-\d+\.jsonl$/);
+    expect(fs.readFileSync(status.flowLogPath!, "utf8")).toBe("");
+    expect(fs.readFileSync(status.addonPath!, "utf8")).toContain(`FLOW_LOG = ${JSON.stringify(status.flowLogPath)}`);
+    await proxy.stopProxy("lease_1");
+    expect(fs.existsSync(status.flowLogPath!)).toBe(false);
+    expect(fs.existsSync(status.addonPath!)).toBe(false);
+  });
+
+  it("reads rules only for the holder and returns a copy", async () => {
+    const { proxy } = makeProxy();
+    expect(() => proxy.proxyRules("lease_1")).toThrow(/no network proxy is running/i);
+    await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, RULES);
+    expect(() => proxy.proxyRules("lease_2")).toThrow(ProxyBusyError);
+    const rules = proxy.proxyRules("lease_1");
+    expect(rules).toEqual([{ match: { url_regex: "example\\.com", method: "GET" }, action: RULES[0]!.action }]);
+    rules.push({ action: { delay_ms: 1 } });
+    expect(proxy.proxyRules("lease_1")).toHaveLength(1);
+  });
+
+  it("upserts map rules: prepend, replace-in-place, validation before holder check", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-map-"));
+    const fileA = path.join(dir, "a.json");
+    const fileB = path.join(dir, "b.json");
+    fs.writeFileSync(fileA, "{}");
+    fs.writeFileSync(fileB, "{}");
+    const { proxy, spawns } = makeProxy();
+    // Invalid rules fail even with no proxy running (validation runs first).
+    await expect(
+      proxy.upsertMapRule("lease_1", { match: { url_regex: "x" }, action: { map_local: path.join(dir, "nope.json") } }),
+    ).rejects.toThrow(/not found or unreadable/);
+    await expect(proxy.upsertMapRule("lease_1", { action: { delay_ms: 1 } })).rejects.toThrow(/map_local or map_remote/);
+    await expect(
+      proxy.upsertMapRule("lease_1", { match: { url_regex: "x" }, action: { map_local: fileA } }),
+    ).rejects.toThrow(/no network proxy is running/i);
+
+    await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, RULES);
+    await expect(
+      proxy.upsertMapRule("lease_2", { match: { url_regex: "x" }, action: { map_local: fileA } }),
+    ).rejects.toThrow(ProxyBusyError);
+
+    await expect(
+      proxy.upsertMapRule("lease_1", { match: { url_regex: "cdn\\.example\\.com" }, action: { map_local: fileA } }),
+    ).resolves.toBe(2);
+    expect(spawns).toHaveLength(2); // child restarted on the same port
+    let rules = proxy.proxyRules("lease_1");
+    expect(rules[0]).toEqual({ match: { url_regex: "cdn\\.example\\.com" }, action: { map_local: fileA } });
+    expect(rules).toHaveLength(2);
+
+    // Same pattern + same kind replaces in place (no growth); other kinds prepend.
+    await expect(
+      proxy.upsertMapRule("lease_1", { match: { url_regex: "cdn\\.example\\.com" }, action: { map_local: fileB } }),
+    ).resolves.toBe(2);
+    rules = proxy.proxyRules("lease_1");
+    expect(rules[0]?.action).toEqual({ map_local: fileB });
+    await expect(
+      proxy.upsertMapRule("lease_1", {
+        match: { url_regex: "cdn\\.example\\.com" },
+        action: { map_remote: "https://staging.example.com/" },
+      }),
+    ).resolves.toBe(3);
+    expect(proxy.proxyRules("lease_1")[0]?.action).toEqual({ map_remote: "https://staging.example.com/" });
+  });
+
+  it("refuses map upserts past the rule cap", async () => {
+    const { proxy } = makeProxy();
+    await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, []);
+    await proxy.setProxyRules("lease_1", new Array(50).fill({ action: { delay_ms: 1 } }));
+    await expect(
+      proxy.upsertMapRule("lease_1", { match: { url_regex: "x" }, action: { map_remote: "https://example.com/" } }),
+    ).rejects.toThrow(/too many rules/i);
+  });
+
+  it("asserts flows from the flow log with method filtering and min_count", async () => {
+    const { proxy } = makeProxy();
+    await expect(proxy.assertFlow("lease_1", { urlRegex: "x" })).rejects.toThrow(/no network proxy is running/i);
+    await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, []);
+    await expect(proxy.assertFlow("lease_2", { urlRegex: "x" })).rejects.toThrow(ProxyBusyError);
+    await expect(proxy.assertFlow("lease_1", { urlRegex: "(unclosed" })).rejects.toThrow(/regular expression/);
+    await expect(proxy.assertFlow("lease_1", { urlRegex: "x", minCount: 0 })).rejects.toThrow(/min_count/);
+    await expect(proxy.assertFlow("lease_1", { urlRegex: "x", timeoutSec: 121 })).rejects.toThrow(/timeout_sec/);
+
+    const flowLogPath = proxy.proxyStatus().flowLogPath!;
+    fs.writeFileSync(
+      flowLogPath,
+      [
+        JSON.stringify({ ts: 1, method: "GET", url: "https://example.com/a" }),
+        JSON.stringify({ ts: 2, method: "POST", url: "https://example.com/b" }),
+        JSON.stringify({ ts: 3, method: "GET", url: "https://other.test/c" }),
+      ].join("\n") + "\n",
+    );
+    await expect(proxy.assertFlow("lease_1", { urlRegex: "example\\.com", timeoutSec: 0 })).resolves.toMatchObject({
+      count: 2,
+      total: 3,
+    });
+    const post = await proxy.assertFlow("lease_1", { urlRegex: "example\\.com", method: "post", timeoutSec: 0 });
+    expect(post.count).toBe(1);
+    expect(post.matched).toEqual([{ ts: 2, method: "POST", url: "https://example.com/b" }]);
+    await expect(
+      proxy.assertFlow("lease_1", { urlRegex: "missing\\.test", minCount: 2, timeoutSec: 0 }),
+    ).resolves.toMatchObject({ count: 0, total: 3 });
+  });
+
+  it("assertFlow polls until a late flow arrives", async () => {
+    const { proxy } = makeProxy();
+    await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, []);
+    const flowLogPath = proxy.proxyStatus().flowLogPath!;
+    setTimeout(() => {
+      fs.appendFileSync(flowLogPath, JSON.stringify({ ts: 1, method: "GET", url: "https://late.test/x" }) + "\n");
+    }, 100);
+    const res = await proxy.assertFlow("lease_1", { urlRegex: "late\\.test", timeoutSec: 5 });
+    expect(res).toMatchObject({ count: 1, total: 1 });
   });
 
   it("restores the snapshot on stop, including an originally-on corporate proxy", async () => {
@@ -527,6 +758,29 @@ class FakeProxy implements ProxyOps {
       ruleCount: this.rules.length,
     };
   }
+
+  proxyRules(leaseId: string): NetProxyRule[] {
+    if (!this.holder) throw new Error("No network proxy is running; call net_proxy_start first.");
+    if (this.holder.leaseId !== leaseId) throw new ProxyBusyError({ ...this.holder, port: 3240 }, "read rules");
+    return structuredClone(this.rules);
+  }
+
+  async assertFlow(
+    leaseId: string,
+    spec: { urlRegex: string; method?: string; minCount?: number; timeoutSec?: number },
+  ): Promise<{ count: number; total: number; matched: { ts: number; method: string; url: string }[] }> {
+    if (!this.holder) throw new Error("No network proxy is running; call net_proxy_start first.");
+    if (this.holder.leaseId !== leaseId) throw new ProxyBusyError({ ...this.holder, port: 3240 }, "assert flow");
+    void spec;
+    return { count: 0, total: 0, matched: [] };
+  }
+
+  async upsertMapRule(leaseId: string, rule: NetProxyRule): Promise<number> {
+    if (!this.holder) throw new Error("No network proxy is running; call net_proxy_start first.");
+    if (this.holder.leaseId !== leaseId) throw new ProxyBusyError({ ...this.holder, port: 3240 }, "set map rule");
+    this.rules.unshift(rule);
+    return this.rules.length;
+  }
 }
 
 function tmpState(): string {
@@ -582,6 +836,26 @@ describe("orchestrator proxy binding", () => {
     await expect(bare.orch.setLeaseProxyRules(bare.a.leaseId, [])).rejects.toThrow(/no proxy is configured/);
     await expect(bare.orch.stopLeaseProxy(bare.a.leaseId)).resolves.toMatchObject({ stopped: false });
     await expect(bare.orch.leaseProxyStatus(bare.a.leaseId)).resolves.toMatchObject({ running: false });
+  });
+
+  it("binds assertFlow and upsertMapRule with lease + holder gating", async () => {
+    const fake = new FakeProxy();
+    const { orch, a, b } = await twoLeases(fake);
+    await expect(orch.assertLeaseFlow("lease_nope", { urlRegex: "x" })).rejects.toThrow(/unknown lease/i);
+    await expect(orch.upsertLeaseMapRule("lease_nope", { action: { delay_ms: 1 } })).rejects.toThrow(/unknown lease/i);
+    const bare = await twoLeases();
+    await expect(bare.orch.assertLeaseFlow(bare.a.leaseId, { urlRegex: "x" })).rejects.toThrow(/no proxy is configured/);
+    await expect(bare.orch.upsertLeaseMapRule(bare.a.leaseId, { action: { delay_ms: 1 } })).rejects.toThrow(
+      /no proxy is configured/,
+    );
+
+    await orch.startLeaseProxy(a.leaseId, []);
+    await expect(orch.assertLeaseFlow(b.leaseId, { urlRegex: "x" })).rejects.toThrow(/sess-a/);
+    await expect(orch.upsertLeaseMapRule(b.leaseId, { action: { delay_ms: 1 } })).rejects.toThrow(/sess-a/);
+    await expect(orch.assertLeaseFlow(a.leaseId, { urlRegex: "x" })).resolves.toMatchObject({ count: 0, total: 0 });
+    const rule = { match: { url_regex: "x" }, action: { map_remote: "https://example.com/" } };
+    await expect(orch.upsertLeaseMapRule(a.leaseId, rule)).resolves.toMatchObject({ ruleCount: 1 });
+    expect(fake.rules[0]).toEqual(rule);
   });
 
   it("stops the holder's proxy on release but leaves other holders running", async () => {
@@ -781,5 +1055,144 @@ describe("net_proxy_* tools", () => {
     expect(emptyAction.text).toMatch(/at least one/);
 
     expect(fake.holder).toBeNull();
+  });
+});
+
+/** MCP client wired to a REAL NetProxy with every side effect stubbed (runner/spawn/ready). */
+async function makeStubbedProxyClient() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-netproxy-mcp-"));
+  const caPem = path.join(dir, "mitmproxy-ca-cert.pem");
+  fs.writeFileSync(caPem, "fake-ca");
+  const bodyFile = path.join(dir, "body.json");
+  fs.writeFileSync(bodyFile, '{"mock":true}');
+  const workDir = path.join(dir, "work");
+  const run = stubRunner(proxyHandler({ sudoFails: false }));
+  const children: StubChild[] = [];
+  const spawns: { bin: string; args: string[] }[] = [];
+  const spawnFn = (bin: string, args: string[]): MitmChild => {
+    const child = new StubChild(4242 + children.length);
+    children.push(child);
+    spawns.push({ bin, args });
+    return child as unknown as MitmChild;
+  };
+  const proxy = new NetProxy({ runner: run, spawnFn, caPemPath: caPem, workDir, portBase: 46700, waitReady: immediateReady });
+  const orch = new Orchestrator(new FakeFleet([sim("U1"), sim("U2")]), Store.load(tmpState()), {
+    defaultTtlMs: 60_000,
+    proxy,
+  });
+  const noop: Runner = async () => ({ stdout: "", stderr: "" });
+  const server = new McpServer({ name: "test", version: "0" });
+  registerDeviceExtras(server, {
+    orchestrator: orch,
+    serveSim: new ServeSim({ runner: noop }),
+    simLog: new SimLog({ runner: async () => ({ stdout: "", truncated: false, timedOut: false }) }),
+    simApps: new SimApps({ runner: noop }),
+    xctrace: new XCTrace({ runner: noop }),
+    lldmdb: new Llmdb({ runner: noop }),
+  });
+  const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverT);
+  const client = new Client({ name: "test", version: "0" });
+  await client.connect(clientT);
+  const a = await orch.acquire({ sessionId: "sess-a", client: "t", autoBoot: false });
+  const b = await orch.acquire({ sessionId: "sess-b", client: "t", autoBoot: false });
+  if (!a.ok || a.queued || !b.ok || b.queued) throw new Error("expected two leases");
+  return { client, orch, proxy, spawns, dir, bodyFile, a: a.lease, b: b.lease };
+}
+
+describe("net_assert_flow / map_* tools (stubbed real proxy)", () => {
+  it("gates on a valid lease and fails cleanly with no running proxy", async () => {
+    const { client, a } = await makeStubbedProxyClient();
+    for (const [tool, args] of [
+      ["net_assert_flow", { url_regex: "x" }],
+      ["map_local", { url_regex: "x", file: "/tmp/x" }],
+      ["map_remote", { url_regex: "x", url: "https://example.com/" }],
+    ] as const) {
+      const gated = await call(client, tool, { lease_id: "lease_nope", ...args });
+      expect(gated.isError, tool).toBe(true);
+      expect(JSON.stringify(gated.json), tool).toMatch(/unknown lease/i);
+    }
+    const idle = await call(client, "net_assert_flow", { lease_id: a.leaseId, url_regex: "x", timeout_sec: 0 });
+    expect(idle.isError).toBe(true);
+    expect(JSON.stringify(idle.json)).toMatch(/no network proxy is running/i);
+  });
+
+  it("validates map inputs at the schema layer", async () => {
+    const { client, a } = await makeStubbedProxyClient();
+    const badRegex = await callRaw(client, "map_local", { lease_id: a.leaseId, url_regex: "(unclosed", file: "/tmp/x" });
+    expect(badRegex.isError).toBe(true);
+    expect(badRegex.text).toMatch(/regular expression/);
+    const badUrl = await callRaw(client, "map_remote", { lease_id: a.leaseId, url_regex: "x", url: "ftp://x/y" });
+    expect(badUrl.isError).toBe(true);
+    expect(badUrl.text).toMatch(/absolute http/);
+    const badAssert = await callRaw(client, "net_assert_flow", { lease_id: a.leaseId, url_regex: "(unclosed" });
+    expect(badAssert.isError).toBe(true);
+    expect(badAssert.text).toMatch(/regular expression/);
+  });
+
+  it("validates the map file before the holder check (no proxy needed)", async () => {
+    const { client, a } = await makeStubbedProxyClient();
+    const missing = await call(client, "map_local", {
+      lease_id: a.leaseId,
+      url_regex: "cdn\\.example\\.com",
+      file: "/nonexistent/mcp-map-body.json",
+    });
+    expect(missing.isError).toBe(true);
+    expect(JSON.stringify(missing.json)).toMatch(/map_local.*not found or unreadable/);
+  });
+
+  it("round-trips start -> map -> assert -> stop and logs actions", async () => {
+    const { client, orch, proxy, spawns, bodyFile, a, b } = await makeStubbedProxyClient();
+    const start = await call(client, "net_proxy_start", { lease_id: a.leaseId, rules: [] });
+    expect(start.json).toMatchObject({ ok: true, rule_count: 0 });
+
+    const status = await call(client, "net_proxy_status", { lease_id: a.leaseId });
+    const flowLogPath = status.json.flow_log_path as string;
+    expect(typeof flowLogPath).toBe("string");
+
+    // A non-holder can view status but cannot map or assert.
+    const conflictMap = await call(client, "map_local", { lease_id: b.leaseId, url_regex: "x", file: bodyFile });
+    expect(conflictMap.isError).toBe(true);
+    expect(JSON.stringify(conflictMap.json)).toMatch(/sess-a/);
+    const conflictAssert = await call(client, "net_assert_flow", { lease_id: b.leaseId, url_regex: "x", timeout_sec: 0 });
+    expect(conflictAssert.isError).toBe(true);
+    expect(JSON.stringify(conflictAssert.json)).toMatch(/sess-a/);
+
+    const map = await call(client, "map_local", { lease_id: a.leaseId, url_regex: "cdn\\.example\\.com", file: bodyFile });
+    expect(map.json).toMatchObject({ ok: true, rule_count: 1 });
+    expect(spawns).toHaveLength(2); // map upsert restarts the child on the same port
+    const remote = await call(client, "map_remote", {
+      lease_id: a.leaseId,
+      url_regex: "api\\.example\\.com",
+      url: "https://staging.example.com/api",
+    });
+    expect(remote.json).toMatchObject({ ok: true, rule_count: 2 });
+    expect(proxy.proxyRules(a.leaseId)[0]?.action).toEqual({ map_remote: "https://staging.example.com/api" });
+
+    fs.appendFileSync(
+      flowLogPath,
+      [
+        JSON.stringify({ ts: 1, method: "GET", url: "https://cdn.example.com/app.js" }),
+        JSON.stringify({ ts: 2, method: "GET", url: "https://cdn.example.com/style.css" }),
+        JSON.stringify({ ts: 3, method: "POST", url: "https://api.example.com/submit" }),
+      ].join("\n") + "\n",
+    );
+    const hit = await call(client, "net_assert_flow", { lease_id: a.leaseId, url_regex: "cdn\\.example\\.com" });
+    expect(hit.json).toMatchObject({ ok: true, count: 2, total: 3 });
+    const miss = await call(client, "net_assert_flow", {
+      lease_id: a.leaseId,
+      url_regex: "cdn\\.example\\.com",
+      min_count: 5,
+      timeout_sec: 0,
+    });
+    expect(miss.isError).toBe(true);
+    expect(JSON.stringify(miss.json)).toMatch(/saw 2 matching flow\(s\).*needed 5/);
+
+    const stop = await call(client, "net_proxy_stop", { lease_id: a.leaseId });
+    expect(stop.json).toMatchObject({ ok: true, stopped: true });
+    expect(fs.existsSync(flowLogPath)).toBe(false);
+
+    const tools = orch.leaseActions(a.leaseId).map((e) => e.tool);
+    expect(tools).toEqual(["net_proxy_start", "map_local", "map_remote", "net_assert_flow", "net_proxy_stop"]);
   });
 });

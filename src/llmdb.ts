@@ -71,6 +71,46 @@ function assertStepMode(mode: string): asserts mode is StepMode {
   }
 }
 
+function assertThread(thread: number): void {
+  if (!Number.isInteger(thread) || thread <= 0) {
+    throw new Error(`Invalid thread ${String(thread)} (expected a positive integer thread id)`);
+  }
+}
+
+function assertRef(ref: number): void {
+  if (!Number.isInteger(ref) || ref <= 0) {
+    throw new Error(`Invalid ref ${String(ref)} (expected a non-zero variablesReference integer)`);
+  }
+}
+
+function assertTarget(target: string): void {
+  if (target.trim().length === 0) throw new Error("Invalid target (expected a non-empty string)");
+}
+
+function assertValue(value: string): void {
+  if (value.length === 0) throw new Error("Invalid value (expected a non-empty string)");
+}
+
+function assertBreakId(id: number): void {
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error(`Invalid breakpoint id ${String(id)} (expected a positive integer)`);
+  }
+}
+
+function assertFilter(filter: string): void {
+  if (filter.trim().length === 0) throw new Error("Invalid exception filter (expected a non-empty string)");
+}
+
+function assertPath(path: string): void {
+  if (path.trim().length === 0) throw new Error("Invalid path (expected a non-empty string)");
+}
+
+function assertTimeoutSec(timeoutSec: number): void {
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > MAX_CONTINUE_WAIT_SEC) {
+    throw new Error(`Invalid timeout ${String(timeoutSec)} (expected a number in (0, ${MAX_CONTINUE_WAIT_SEC}])`);
+  }
+}
+
 /**
  * Thin wrapper over the llmdb CLI (lldb-dap sessions for macOS / Simulator
  * processes). Argv shapes follow `llmdb --help` + per-verb help of llmdb
@@ -122,14 +162,96 @@ export class Llmdb implements DebugOps {
     return { sessionId: response["sessionId"] as string, response };
   }
 
-  /** Set a source breakpoint at file:line. llmdb 0.2.0 has no symbol breakpoints. */
-  async breakSet(sessionId: string, file: string, line: number): Promise<unknown> {
+  /**
+   * Launch a binary (or .app bundle) under lldb-dap; returns the new session
+   * id plus the raw launch response. llmdb 0.2.0 takes a filesystem path only
+   * (no bundle-id form — use app_launch + attach for sim apps by bundle id).
+   */
+  async launch(path: string, args: string[] = []): Promise<AttachResult> {
+    assertPath(path);
+    for (const arg of args) {
+      if (typeof arg !== "string") throw new Error("Invalid args (expected an array of strings)");
+    }
+    const { stdout } = await this.run(this.bin, ["launch", path, ...args], { timeoutMs: this.execTimeoutMs });
+    const response = parseJson<Record<string, unknown>>(stdout, "llmdb launch");
+    if (typeof response["sessionId"] !== "string" || (response["sessionId"] as string).length === 0) {
+      throw new Error(`llmdb launch returned no sessionId\n${stdout.slice(0, 500)}`);
+    }
+    return { sessionId: response["sessionId"] as string, response };
+  }
+
+  /** Diagnose the local llmdb environment (lldb-dap, socket dir, daemon). */
+  async doctor(): Promise<unknown> {
+    const { stdout } = await this.run(this.bin, ["doctor"], { timeoutMs: this.execTimeoutMs });
+    return parseJson<unknown>(stdout, "llmdb doctor");
+  }
+
+  /** List threads in a stopped session. */
+  async threads(sessionId: string): Promise<unknown> {
     assertSessionId(sessionId);
-    assertFileLine(file, line);
-    const { stdout } = await this.run(this.bin, ["break", "set", `${file}:${line}`, "--session", sessionId], {
+    const { stdout } = await this.run(this.bin, ["threads", "--session", sessionId], {
       timeoutMs: this.execTimeoutMs,
     });
+    return parseJson<unknown>(stdout, "llmdb threads");
+  }
+
+  /**
+   * Set a source breakpoint at file:line. llmdb 0.2.0 has no symbol
+   * breakpoints. Optional condition (fire only when the expression is true)
+   * and hitCondition (fire on a hit-count match, e.g. ">5" or "3").
+   */
+  async breakSet(
+    sessionId: string,
+    file: string,
+    line: number,
+    opts: { condition?: string; hitCondition?: string } = {},
+  ): Promise<unknown> {
+    assertSessionId(sessionId);
+    assertFileLine(file, line);
+    const args = ["break", "set", `${file}:${line}`];
+    if (opts.condition !== undefined) {
+      if (opts.condition.trim().length === 0) throw new Error("Invalid condition (expected a non-empty string)");
+      args.push("--condition", opts.condition);
+    }
+    if (opts.hitCondition !== undefined) {
+      if (opts.hitCondition.trim().length === 0) throw new Error("Invalid hit_condition (expected a non-empty string)");
+      args.push("--hit-condition", opts.hitCondition);
+    }
+    args.push("--session", sessionId);
+    const { stdout } = await this.run(this.bin, args, { timeoutMs: this.execTimeoutMs });
     return parseJson<unknown>(stdout, "llmdb break set");
+  }
+
+  /** List breakpoints in a session. */
+  async breakList(sessionId: string): Promise<unknown> {
+    assertSessionId(sessionId);
+    const { stdout } = await this.run(this.bin, ["break", "list", "--session", sessionId], {
+      timeoutMs: this.execTimeoutMs,
+    });
+    return parseJson<unknown>(stdout, "llmdb break list");
+  }
+
+  /** Delete a breakpoint by id; returns the remaining breakpoints. */
+  async breakDelete(sessionId: string, id: number): Promise<unknown> {
+    assertSessionId(sessionId);
+    assertBreakId(id);
+    const { stdout } = await this.run(this.bin, ["break", "delete", String(id), "--session", sessionId], {
+      timeoutMs: this.execTimeoutMs,
+    });
+    return parseJson<unknown>(stdout, "llmdb break delete");
+  }
+
+  /**
+   * Stop on thrown exceptions. Pass filter ids to enable (e.g. swift_throw);
+   * an empty list clears and reports what is available.
+   */
+  async breakException(sessionId: string, filters: string[] = []): Promise<unknown> {
+    assertSessionId(sessionId);
+    for (const filter of filters) assertFilter(filter);
+    const { stdout } = await this.run(this.bin, ["break", "exception", ...filters, "--session", sessionId], {
+      timeoutMs: this.execTimeoutMs,
+    });
+    return parseJson<unknown>(stdout, "llmdb break exception");
   }
 
   /**
@@ -148,10 +270,17 @@ export class Llmdb implements DebugOps {
     return parseJson<unknown>(stdout, "llmdb continue");
   }
 
-  /** Structured backtrace for the stopped thread, optionally depth-capped. */
-  async backtrace(sessionId: string, depth?: number): Promise<unknown> {
+  /**
+   * Structured backtrace, optionally depth-capped and/or for an explicit
+   * thread id (default: the stopped thread; see threads() for ids).
+   */
+  async backtrace(sessionId: string, depth?: number, thread?: number): Promise<unknown> {
     assertSessionId(sessionId);
     const args = ["bt"];
+    if (thread !== undefined) {
+      assertThread(thread);
+      args.push("--thread", String(thread));
+    }
     if (depth !== undefined) {
       assertDepth(depth);
       args.push("--depth", String(depth));
@@ -159,6 +288,104 @@ export class Llmdb implements DebugOps {
     args.push("--session", sessionId);
     const { stdout } = await this.run(this.bin, args, { timeoutMs: this.execTimeoutMs });
     return parseJson<unknown>(stdout, "llmdb bt");
+  }
+
+  /** List a frame's variable scopes (Locals, Globals, Registers); expand a ref to read it. */
+  async scopes(sessionId: string, frame = 0): Promise<unknown> {
+    assertSessionId(sessionId);
+    assertFrame(frame);
+    const { stdout } = await this.run(this.bin, ["scopes", "--frame", String(frame), "--session", sessionId], {
+      timeoutMs: this.execTimeoutMs,
+    });
+    return parseJson<unknown>(stdout, "llmdb scopes");
+  }
+
+  /**
+   * Expand a structured value into its children by variablesReference (the
+   * non-zero ref from a locals/scopes/expand entry). Takes a ref, not an
+   * expression — use eval() to evaluate expressions.
+   */
+  async expand(sessionId: string, ref: number): Promise<unknown> {
+    assertSessionId(sessionId);
+    assertRef(ref);
+    const { stdout } = await this.run(this.bin, ["expand", String(ref), "--session", sessionId], {
+      timeoutMs: this.execTimeoutMs,
+    });
+    return parseJson<unknown>(stdout, "llmdb expand");
+  }
+
+  /**
+   * Assign a new value to a variable during a stop. Target is a local name or
+   * an expression like `self.count` / `arr[0]`; value is in the target's
+   * language (e.g. 42, true, "hi").
+   */
+  async setVar(sessionId: string, target: string, value: string, frame = 0): Promise<unknown> {
+    assertSessionId(sessionId);
+    assertTarget(target);
+    assertValue(value);
+    assertFrame(frame);
+    const { stdout } = await this.run(
+      this.bin,
+      ["set-var", target, value, "--frame", String(frame), "--session", sessionId],
+      { timeoutMs: this.execTimeoutMs },
+    );
+    return parseJson<unknown>(stdout, "llmdb set-var");
+  }
+
+  /**
+   * Print the target's captured stdout/stderr/console output. clear drains
+   * the buffer so the next call returns only newer output.
+   */
+  async output(sessionId: string, clear = false): Promise<unknown> {
+    assertSessionId(sessionId);
+    const args = ["output"];
+    if (clear) args.push("--clear");
+    args.push("--session", sessionId);
+    const { stdout } = await this.run(this.bin, args, { timeoutMs: this.execTimeoutMs });
+    return parseJson<unknown>(stdout, "llmdb output");
+  }
+
+  /**
+   * Set a breakpoint at file:line and continue; returns when it hits (or the
+   * target terminates). The exec timeout adds grace on top of waitSec.
+   */
+  async runUntil(sessionId: string, file: string, line: number, waitSec = 60): Promise<unknown> {
+    assertSessionId(sessionId);
+    assertFileLine(file, line);
+    assertWaitSec(waitSec);
+    const { stdout } = await this.run(
+      this.bin,
+      ["run-until", `${file}:${line}`, "--wait", String(waitSec), "--session", sessionId],
+      { timeoutMs: (waitSec + 30) * 1000 },
+    );
+    return parseJson<unknown>(stdout, "llmdb run-until");
+  }
+
+  /**
+   * Block until the session leaves `running` (stops or terminates). Pairs
+   * with fire-and-forget continues. The exec timeout adds grace on top.
+   */
+  async wait(sessionId: string, timeoutSec = 60): Promise<unknown> {
+    assertSessionId(sessionId);
+    assertTimeoutSec(timeoutSec);
+    const { stdout } = await this.run(
+      this.bin,
+      ["wait", "--timeout", String(timeoutSec), "--session", sessionId],
+      { timeoutMs: (timeoutSec + 30) * 1000 },
+    );
+    return parseJson<unknown>(stdout, "llmdb wait");
+  }
+
+  /** Pause a running session; returns once stopped (llmdb default wait 10s). */
+  async interrupt(sessionId: string, waitSec = 10): Promise<unknown> {
+    assertSessionId(sessionId);
+    assertWaitSec(waitSec);
+    const { stdout } = await this.run(
+      this.bin,
+      ["interrupt", "--wait", String(waitSec), "--session", sessionId],
+      { timeoutMs: (waitSec + 30) * 1000 },
+    );
+    return parseJson<unknown>(stdout, "llmdb interrupt");
   }
 
   /** Typed locals for a stack frame (default frame 0, the top frame). */

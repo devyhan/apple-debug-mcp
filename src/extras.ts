@@ -4,10 +4,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { ExecError } from "./exec.js";
 import { Llmdb, MAX_CONTINUE_WAIT_SEC, STEP_MODES } from "./llmdb.js";
-import { MAX_PROXY_RULES } from "./netproxy.js";
+import { MAX_ASSERT_FLOW_SEC, MAX_PROXY_RULES } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import { SimApps } from "./simapps.js";
 import { Lease } from "./store.js";
+import { Symbolicator } from "./symbolicate.js";
 import { CA_DEBUG_OPTIONS, CAMERA_MIRROR_MODES, CAMERA_SOURCES, ORIENTATIONS, ServeSim } from "./servesim.js";
 import { MAX_STREAM_SEC, SimLog } from "./simlog.js";
 import { MAX_TRACE_SEC, XCTrace } from "./xctrace.js";
@@ -19,6 +20,7 @@ export interface ExtrasDeps {
   simApps: SimApps;
   xctrace: XCTrace;
   lldmdb: Llmdb;
+  symbolicator?: Symbolicator;
 }
 
 type ToolResult = {
@@ -90,11 +92,41 @@ const netProxyMatchSchema = z.object({
   method: z.string().min(1).optional().describe('HTTP method, e.g. "GET". Compared uppercase; omit to match all methods.'),
 });
 
+const netProxyRequestSchema = z
+  .object({
+    method: z.string().min(1).optional().describe("Replace the upstream request method. Compared uppercase."),
+    url: z.string().min(1).optional().describe("Replace the upstream request URL wholesale (absolute http(s) URL)."),
+    headers: z.record(z.string()).optional().describe("Headers merged into the upstream request (replace per-name)."),
+    body: z.string().optional().describe("Replace the upstream request body (UTF-8)."),
+  })
+  .refine(
+    (r) => r.method !== undefined || r.url !== undefined || r.headers !== undefined || r.body !== undefined,
+    "request needs at least one of method|url|headers|body",
+  );
+
 const netProxyActionSchema = z.object({
   status: z.number().int().min(100).max(599).optional().describe("Override the upstream response status code."),
   headers: z.record(z.string()).optional().describe("Headers merged into the upstream response (replace per-name)."),
   body: z.string().optional().describe("Replace the upstream response body (UTF-8). Upstream content-encoding is dropped."),
   delay_ms: z.number().int().min(0).max(60000).optional().describe("Delay before forwarding the matched request, in milliseconds."),
+  request: netProxyRequestSchema.optional().describe("Request-direction rewrite, applied before forwarding upstream."),
+  map_local: z.string().min(1).optional().describe("Serve this local file as the response without contacting upstream."),
+  map_remote: z
+    .string()
+    .min(1)
+    .refine(
+      (s) => {
+        try {
+          const u = new URL(s);
+          return u.protocol === "http:" || u.protocol === "https:";
+        } catch {
+          return false;
+        }
+      },
+      "map_remote must be an absolute http(s) URL",
+    )
+    .optional()
+    .describe("Rewrite the upstream URL to this fixed URL."),
 });
 
 const netProxyRuleSchema = z
@@ -107,8 +139,15 @@ const netProxyRuleSchema = z
       r.action.status !== undefined ||
       r.action.headers !== undefined ||
       r.action.body !== undefined ||
-      r.action.delay_ms !== undefined,
-    "action needs at least one of status|headers|body|delay_ms",
+      r.action.delay_ms !== undefined ||
+      r.action.request !== undefined ||
+      r.action.map_local !== undefined ||
+      r.action.map_remote !== undefined,
+    "action needs at least one of status|headers|body|delay_ms|request|map_local|map_remote",
+  )
+  .refine(
+    (r) => r.action.map_local === undefined || r.action.map_remote === undefined,
+    "map_local and map_remote are mutually exclusive",
   );
 
 const netProxyRulesSchema = z
@@ -120,13 +159,16 @@ const netProxyRulesSchema = z
  * Phase-1 device extras: serve-sim one-shots (rotate, CoreAnimation debug
  * flags, memory warnings), synthetic camera (start/switch/mirror/status/stop),
  * unified-log capture, app lifecycle (openurl/install/uninstall/launch/
- * terminate), xctrace profiling, llmdb debugging (attach/break/continue/bt/
- * locals/eval/step/detach, all lease-gated), mitm network proxying
- * (net_proxy_start/set_rules/stop/status, all lease-gated), and the per-lease
- * action log.
+ * terminate), xctrace profiling, llmdb debugging (attach/launch/break/
+ * continue/run-until/wait/interrupt/bt/threads/locals/scopes/expand/eval/
+ * set-var/output/step/detach/sessions/doctor, all lease-gated), atos crash
+ * symbolication (optional lease), mitm network proxying (net_proxy_start/
+ * set_rules/stop/status/assert_flow/map_local/map_remote, all lease-gated),
+ * and the per-lease action log.
  */
 export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void {
   const { orchestrator: orch, serveSim, simLog, simApps, xctrace, lldmdb } = deps;
+  const symbolicator = deps.symbolicator ?? new Symbolicator();
 
   /** Leases carry at most one llmdb session; every debug verb except attach/detach needs it. */
   function requireDebugSession(lease: Lease): string {
@@ -605,20 +647,70 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_break",
     {
-      description: "Set a source breakpoint at file:line in your lease's debug session.",
+      description:
+        "Manage breakpoints in your lease's debug session. Exactly one op per call: set (file+line, with optional condition/hit_condition), list (list=true), delete (delete=<id>), or exception filters (exception=[...], [] clears).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
-        file: z.string().min(1).describe("Source file path, e.g. ./Sources/App/main.swift."),
-        line: z.number().int().positive().describe("1-based line number."),
+        file: z.string().min(1).optional().describe("Source file path for set, e.g. ./Sources/App/main.swift."),
+        line: z.number().int().positive().optional().describe("1-based line number for set."),
+        list: z.boolean().optional().describe("List breakpoints in the session."),
+        delete: z.number().int().positive().optional().describe("Delete the breakpoint with this id."),
+        exception: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("Stop on thrown exceptions: filter ids to enable (e.g. [\"swift_throw\"]), [] to clear."),
+        condition: z.string().min(1).optional().describe("Set only: fire only when this expression is true, e.g. n > 100."),
+        hit_condition: z.string().min(1).optional().describe("Set only: fire on a hit-count match, e.g. >5 or 3."),
       },
     },
-    async ({ lease_id, file, line }) => {
+    async ({ lease_id, file, line, list, delete: del, exception, condition, hit_condition }) => {
       try {
+        const ops = [
+          list === true ? "list" : null,
+          del !== undefined ? "delete" : null,
+          exception !== undefined ? "exception" : null,
+          file !== undefined || line !== undefined || condition !== undefined || hit_condition !== undefined
+            ? "set"
+            : null,
+        ].filter((op): op is string => op !== null);
+        if (ops.length === 0) {
+          return fail("debug_break needs exactly one op: set (file+line), list=true, delete=<id>, or exception=[...].");
+        }
+        if (ops.length > 1) {
+          return fail(`debug_break takes exactly one op per call (got ${ops.join("+")}).`);
+        }
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await lldmdb.breakSet(sessionId, file, line);
-        await orch.logAction(lease_id, "debug_break", `break ${file}:${line}`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        const op = ops[0]!;
+        if (op === "list") {
+          const result = await lldmdb.breakList(sessionId);
+          await orch.logAction(lease_id, "debug_break", "break list");
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+        }
+        if (op === "delete") {
+          const result = await lldmdb.breakDelete(sessionId, del as number);
+          await orch.logAction(lease_id, "debug_break", `break delete ${del}`);
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+        }
+        if (op === "exception") {
+          const result = await lldmdb.breakException(sessionId, exception as string[]);
+          const summary = (exception as string[]).length === 0 ? "break exception (clear)" : `break exception ${(exception as string[]).join(",")}`;
+          await orch.logAction(lease_id, "debug_break", summary.slice(0, 160));
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+        }
+        if (file === undefined || line === undefined) {
+          return fail("debug_break set needs both file and line.");
+        }
+        const result = await lldmdb.breakSet(sessionId, file, line, {
+          ...(condition !== undefined ? { condition } : {}),
+          ...(hit_condition !== undefined ? { hitCondition: hit_condition } : {}),
+        });
+        const extras = [
+          condition !== undefined ? ` if ${condition}` : "",
+          hit_condition !== undefined ? ` hit ${hit_condition}` : "",
+        ].join("");
+        await orch.logAction(lease_id, "debug_break", `break ${file}:${line}${extras}`.slice(0, 160));
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -650,18 +742,23 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_bt",
     {
-      description: "Structured backtrace for the stopped thread in your lease's debug session.",
+      description: "Structured backtrace for the stopped thread (or an explicit thread id) in your lease's debug session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         depth: z.number().int().positive().optional().describe("Maximum stack depth. Default full stack."),
+        thread: z.number().int().positive().optional().describe("Thread id (see debug_threads). Default the stopped thread."),
       },
     },
-    async ({ lease_id, depth }) => {
+    async ({ lease_id, depth, thread }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await lldmdb.backtrace(sessionId, depth);
-        await orch.logAction(lease_id, "debug_bt", depth !== undefined ? `bt (depth ${depth})` : "bt");
+        const result = await lldmdb.backtrace(sessionId, depth, thread);
+        const qualifiers = [
+          thread !== undefined ? `thread ${thread}` : "",
+          depth !== undefined ? `depth ${depth}` : "",
+        ].filter((s) => s.length > 0);
+        await orch.logAction(lease_id, "debug_bt", qualifiers.length > 0 ? `bt (${qualifiers.join(", ")})` : "bt");
         return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
       } catch (err) {
         return fail(lldmdbError(err));
@@ -769,6 +866,294 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   );
 
   server.registerTool(
+    "debug_sessions",
+    {
+      description: "List active llmdb debug sessions across all agents on this host's daemon.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+      },
+    },
+    async ({ lease_id }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const result = await lldmdb.sessions();
+        await orch.logAction(lease_id, "debug_sessions", "sessions");
+        return ok({ lease_id, udid: lease.udid, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_launch",
+    {
+      description:
+        "Launch a binary (or .app bundle) under the debugger for your lease (one session per lease; re-launching replaces it). Takes a filesystem path — llmdb has no bundle-id launch, so use app_launch + debug_attach for sim apps by bundle id.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        path: z.string().min(1).describe("Path to the binary (or .app bundle) to debug."),
+        args: z.array(z.string()).optional().describe("Argv forwarded to the binary."),
+      },
+    },
+    async ({ lease_id, path: target, args }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const { sessionId, response } = await lldmdb.launch(target, args ?? []);
+        const replaced = await orch.setDebugSession(lease_id, sessionId);
+        if (replaced && replaced !== sessionId) {
+          try {
+            await lldmdb.stop(replaced);
+          } catch {
+            // The replaced session is already gone; the new launch wins regardless.
+          }
+        }
+        await orch.logAction(lease_id, "debug_launch", `launch ${path.basename(target)} (session ${sessionId})`.slice(0, 160));
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result: response });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_doctor",
+    {
+      description: "Diagnose the local llmdb environment (lldb-dap, socket dir, daemon reachability).",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+      },
+    },
+    async ({ lease_id }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const result = await lldmdb.doctor();
+        await orch.logAction(lease_id, "debug_doctor", "doctor");
+        return ok({ lease_id, udid: lease.udid, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_threads",
+    {
+      description: "List threads in your lease's stopped debug session.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+      },
+    },
+    async ({ lease_id }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const sessionId = requireDebugSession(lease);
+        const result = await lldmdb.threads(sessionId);
+        await orch.logAction(lease_id, "debug_threads", "threads");
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_scopes",
+    {
+      description: "List a frame's variable scopes (Locals, Globals, Registers) in your lease's debug session; expand a ref to read it.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        frame: z.number().int().min(0).optional().describe("Frame index. Default 0 (top frame)."),
+      },
+    },
+    async ({ lease_id, frame }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const sessionId = requireDebugSession(lease);
+        const result = await lldmdb.scopes(sessionId, frame ?? 0);
+        await orch.logAction(lease_id, "debug_scopes", `scopes (frame ${frame ?? 0})`);
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_expand",
+    {
+      description:
+        "Expand a structured value into its children by variablesReference (the non-zero ref from a debug_locals/debug_scopes entry). Takes a ref, not an expression — use debug_eval for expressions.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        ref: z.number().int().positive().describe("variablesReference to expand (must be non-zero)."),
+      },
+    },
+    async ({ lease_id, ref }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const sessionId = requireDebugSession(lease);
+        const result = await lldmdb.expand(sessionId, ref);
+        await orch.logAction(lease_id, "debug_expand", `expand ref ${ref}`);
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_set_var",
+    {
+      description: "Assign a new value to a variable during a stop in your lease's debug session.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        target: z.string().min(1).describe("Assignable target: a local name, or an expression like self.count or arr[0]."),
+        value: z.string().min(1).describe('New value, in the target\'s language (e.g. 42, true, "hi").'),
+        frame: z.number().int().min(0).optional().describe("Frame index. Default 0 (top frame)."),
+      },
+    },
+    async ({ lease_id, target, value, frame }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const sessionId = requireDebugSession(lease);
+        const result = await lldmdb.setVar(sessionId, target, value, frame ?? 0);
+        await orch.logAction(lease_id, "debug_set_var", `set ${target} = ${value.slice(0, 60)}`);
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_output",
+    {
+      description: "Print the debug target's captured stdout/stderr/console output.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        clear: z.boolean().optional().describe("Drain the buffer so the next call returns only newer output. Default false."),
+      },
+    },
+    async ({ lease_id, clear }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const sessionId = requireDebugSession(lease);
+        const result = await lldmdb.output(sessionId, clear ?? false);
+        await orch.logAction(lease_id, "debug_output", clear === true ? "output (clear)" : "output");
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_run_until",
+    {
+      description: "Set a breakpoint at file:line and continue; returns when it hits (or the target terminates).",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        file: z.string().min(1).describe("Source file path, e.g. ./Sources/App/main.swift."),
+        line: z.number().int().positive().describe("1-based line number."),
+        wait_sec: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Block up to this many seconds. Default 60, max 600."),
+      },
+    },
+    async ({ lease_id, file, line, wait_sec }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const sessionId = requireDebugSession(lease);
+        const result = await lldmdb.runUntil(sessionId, file, line, wait_sec ?? 60);
+        await orch.logAction(lease_id, "debug_run_until", `run-until ${file}:${line}`.slice(0, 160));
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_wait",
+    {
+      description: "Block until your lease's debug session leaves `running` (stops or terminates).",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        timeout: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Timeout in seconds. Default 60, max 600."),
+      },
+    },
+    async ({ lease_id, timeout }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const sessionId = requireDebugSession(lease);
+        const result = await lldmdb.wait(sessionId, timeout ?? 60);
+        await orch.logAction(lease_id, "debug_wait", `wait (timeout ${timeout ?? 60}s)`);
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "debug_interrupt",
+    {
+      description: "Pause your lease's running debug session; returns once stopped.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+      },
+    },
+    async ({ lease_id }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const sessionId = requireDebugSession(lease);
+        const result = await lldmdb.interrupt(sessionId);
+        await orch.logAction(lease_id, "debug_interrupt", "interrupt");
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+      } catch (err) {
+        return fail(lldmdbError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "symbolicate",
+    {
+      description:
+        "Symbolicate hex addresses against a Mach-O binary via atos (host-local, read-only; touches no simulator). lease_id is optional — when given, the lease is validated and the call is logged against it.",
+      inputSchema: {
+        pcs: z
+          .union([z.string().min(1), z.array(z.string().min(1)).min(1).max(100)])
+          .describe('Program counters to symbolicate: one hex address or an array (max 100), e.g. "0x100234567".'),
+        binary: z.string().min(1).optional().describe("Mach-O binary (or dSYM) the addresses belong to. Required for atos."),
+        arch: z.string().min(1).optional().describe('Slice for universal binaries, e.g. "arm64".'),
+        load_addr: z.string().min(1).optional().describe('Image load address for ASLR\'d addresses, e.g. "0x100000000".'),
+        lease_id: z.string().optional().describe("Your active lease id (validates + logs when given)."),
+      },
+    },
+    async ({ pcs, binary, arch, load_addr, lease_id }) => {
+      try {
+        let udid: string | undefined;
+        if (lease_id !== undefined) {
+          const lease = await orch.resolveLease(lease_id);
+          udid = lease.udid;
+        }
+        const addresses = Array.isArray(pcs) ? pcs : [pcs];
+        const result = await symbolicator.symbolicate(addresses, {
+          ...(binary !== undefined ? { binary } : {}),
+          ...(arch !== undefined ? { arch } : {}),
+          ...(load_addr !== undefined ? { loadAddr: load_addr } : {}),
+        });
+        if (lease_id !== undefined) {
+          await orch.logAction(lease_id, "symbolicate", `symbolicate ${addresses.length} pc(s) ${path.basename(result.binary)}`.slice(0, 160));
+        }
+        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), ...result });
+      } catch (err) {
+        return fail((err as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
     "lease_actions",
     {
       description: "Show the recent one-line action history recorded against a lease (ui_* calls, serve-sim ops, app ops, traces).",
@@ -864,7 +1249,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ lease_id }) => {
       try {
-        const { lease, running, port, pid, leaseId, sessionId, udid, ruleCount, addonPath } =
+        const { lease, running, port, pid, leaseId, sessionId, udid, ruleCount, addonPath, flowLogPath } =
           await orch.leaseProxyStatus(lease_id);
         return ok({
           lease_id,
@@ -877,7 +1262,157 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           ...(udid !== undefined ? { holder_udid: udid } : {}),
           ...(ruleCount !== undefined ? { rule_count: ruleCount } : {}),
           ...(addonPath !== undefined ? { addon_path: addonPath } : {}),
+          ...(flowLogPath !== undefined ? { flow_log_path: flowLogPath } : {}),
         });
+      } catch (err) {
+        return fail(netProxyError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "net_assert_flow",
+    {
+      description:
+        "Poll your holding proxy's flow log until min_count matching requests are seen (or the timeout elapses). Fails cleanly when the lease holds no running proxy.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id (must hold the proxy)."),
+        url_regex: z
+          .string()
+          .min(1)
+          .refine(
+            (s) => {
+              try {
+                void new RegExp(s);
+                return true;
+              } catch {
+                return false;
+              }
+            },
+            "url_regex must be a valid regular expression",
+          )
+          .describe("Regex matched (search) against the full request URL."),
+        method: z.string().min(1).optional().describe('HTTP method, e.g. "GET". Compared uppercase; omit to match all methods.'),
+        min_count: z.number().int().positive().optional().describe("Succeed once this many matching flows are seen. Default 1."),
+        timeout_sec: z
+          .number()
+          .min(0)
+          .max(MAX_ASSERT_FLOW_SEC)
+          .optional()
+          .describe("Poll up to this many seconds. Default 5, max 120."),
+      },
+    },
+    async ({ lease_id, url_regex, method, min_count, timeout_sec }) => {
+      try {
+        const { lease, count, total, matched } = await orch.assertLeaseFlow(lease_id, {
+          urlRegex: url_regex,
+          ...(method !== undefined ? { method } : {}),
+          ...(min_count !== undefined ? { minCount: min_count } : {}),
+          ...(timeout_sec !== undefined ? { timeoutSec: timeout_sec } : {}),
+        });
+        const needed = min_count ?? 1;
+        if (count < needed) {
+          return fail(
+            `net_assert_flow: saw ${count} matching flow(s) for ${JSON.stringify(url_regex)} ` +
+              `(needed ${needed}) out of ${total} total within ${timeout_sec ?? 5}s.`,
+          );
+        }
+        await orch.logAction(lease_id, "net_assert_flow", `assert ${JSON.stringify(url_regex)}: ${count}/${total}`.slice(0, 160));
+        return ok({ lease_id, udid: lease.udid, count, total, matched });
+      } catch (err) {
+        return fail(netProxyError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "map_local",
+    {
+      description:
+        "Serve a local file as the response for requests matching url_regex, without contacting upstream (missing-file reads at serve time return 502). Replaces a prior map_local for the same pattern; otherwise prepended (first match wins). Only the holding lease may map.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id (must hold the proxy)."),
+        url_regex: z
+          .string()
+          .min(1)
+          .refine(
+            (s) => {
+              try {
+                void new RegExp(s);
+                return true;
+              } catch {
+                return false;
+              }
+            },
+            "url_regex must be a valid regular expression",
+          )
+          .describe("Regex matched (search) against the full request URL."),
+        file: z.string().min(1).describe("Local file served as the response body (must exist and be a regular file)."),
+      },
+    },
+    async ({ lease_id, url_regex, file }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const { ruleCount } = await orch.upsertLeaseMapRule(lease_id, {
+          match: { url_regex },
+          action: { map_local: file },
+        });
+        await orch.logAction(lease_id, "map_local", `${JSON.stringify(url_regex)} -> ${path.basename(file)}`.slice(0, 160));
+        return ok({ lease_id, udid: lease.udid, url_regex, file, rule_count: ruleCount });
+      } catch (err) {
+        return fail(netProxyError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "map_remote",
+    {
+      description:
+        "Rewrite the upstream URL to a fixed URL for requests matching url_regex. Replaces a prior map_remote for the same pattern; otherwise prepended (first match wins). Only the holding lease may map.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id (must hold the proxy)."),
+        url_regex: z
+          .string()
+          .min(1)
+          .refine(
+            (s) => {
+              try {
+                void new RegExp(s);
+                return true;
+              } catch {
+                return false;
+              }
+            },
+            "url_regex must be a valid regular expression",
+          )
+          .describe("Regex matched (search) against the full request URL."),
+        url: z
+          .string()
+          .min(1)
+          .refine(
+            (s) => {
+              try {
+                const u = new URL(s);
+                return u.protocol === "http:" || u.protocol === "https:";
+              } catch {
+                return false;
+              }
+            },
+            "url must be an absolute http(s) URL",
+          )
+          .describe("Fixed upstream URL the matched requests are rewritten to."),
+      },
+    },
+    async ({ lease_id, url_regex, url }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const { ruleCount } = await orch.upsertLeaseMapRule(lease_id, {
+          match: { url_regex },
+          action: { map_remote: url },
+        });
+        await orch.logAction(lease_id, "map_remote", `${JSON.stringify(url_regex)} -> ${url}`.slice(0, 160));
+        return ok({ lease_id, udid: lease.udid, url_regex, url, rule_count: ruleCount });
       } catch (err) {
         return fail(netProxyError(err));
       }
