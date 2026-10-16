@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  schedule:
+    # Weekly drift check against latest simslim/axe/Xcode (Monday 02:23 UTC).
+    - cron: "23 2 * * 1"
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: typecheck + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  smoke-macos:
+    name: macOS simulator smoke
+    # macOS minutes cost ~10x Linux: run on main pushes, the weekly schedule,
+    # manual dispatch, or PRs explicitly labeled `run-smoke`.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-smoke')
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Select newest Xcode
+        run: |
+          ls /Applications | grep -i xcode || true
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST/Contents/Developer"; fi
+          xcode-select -p
+          xcodebuild -version
+          xcrun simctl list runtimes
+      - name: Install simslim and axe
+        run: |
+          brew install mobai-app/tap/simslim
+          brew install cameroncooke/axe/axe
+          simslim version
+          axe --version
+      - name: Install serve-sim
+        run: npm install -g serve-sim
+      - name: Smoke test (real simulator)
+        run: npm run smoke

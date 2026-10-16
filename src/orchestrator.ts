@@ -1,0 +1,841 @@
+import { DebugOps } from "./llmdb.js";
+import { NetProxyRule, NetProxyStatus, ProxyOps } from "./netproxy.js";
+import { DEFAULT_STREAM_PORT_BASE, StreamOps } from "./servesim.js";
+import { FleetOps, SimDevice } from "./simslim.js";
+import { Lease, Requirements, Store, Ticket, nextId } from "./store.js";
+
+export class LeaseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LeaseError";
+  }
+}
+
+/** Tiny async mutex: serializes acquire/release/dispatch so two callers never grab one sim. */
+class Mutex {
+  private tail: Promise<unknown> = Promise.resolve();
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    const task = this.tail.then(fn);
+    this.tail = task.catch(() => undefined);
+    return task;
+  }
+}
+
+export interface AcquireInput {
+  sessionId: string;
+  client?: string;
+  task?: string;
+  requirements?: Requirements;
+  queue?: boolean;
+  autoBoot?: boolean;
+  slim?: boolean;
+  slimExcept?: string;
+  ttlMs?: number;
+  /** Start a live MJPEG stream for the lease (opt-in, default false). */
+  stream?: boolean;
+}
+
+export type AcquireResult =
+  | { ok: true; queued: false; lease: Lease; warnings?: string[] }
+  | { ok: true; queued: true; ticket: Ticket; position: number; note?: string }
+  | { ok: false; reason: string };
+
+export interface DispatchAssignment {
+  ticketId: string;
+  sessionId: string;
+  leaseId: string;
+  udid: string;
+  /** Stream URL when the ticket asked for one and it started. */
+  streamUrl?: string;
+  /** Why the requested stream did not start (lease is still valid). */
+  streamError?: string;
+}
+
+export interface ReleaseResult {
+  released: string;
+  expiredSwept: string[];
+  dispatched: DispatchAssignment[];
+}
+
+export interface PoolSimulator extends SimDevice {
+  slim: boolean | null;
+  slimDetail: { managedDisabled: number; managedTotal: number } | null;
+  ramBytes: number | null;
+  lease: Pick<Lease, "leaseId" | "sessionId" | "client" | "task" | "streamUrl" | "streamPort"> | null;
+}
+
+function matches(dev: SimDevice, req: Requirements): boolean {
+  if (req.udid && dev.udid !== req.udid) return false;
+  if (req.device && !dev.name.toLowerCase().includes(req.device.toLowerCase())) return false;
+  if (req.osVersion && !(dev.osVersion ?? "").startsWith(req.osVersion)) return false;
+  if (req.platform && (dev.platform ?? "").toLowerCase() !== req.platform.toLowerCase()) return false;
+  return true;
+}
+
+function isBooted(d: SimDevice): boolean {
+  return d.state.toLowerCase() === "booted";
+}
+
+function isExpired(lease: Lease, now: number): boolean {
+  return now - lease.lastHeartbeat > lease.ttlMs;
+}
+
+const ASSIGNED_RETENTION_MS = 60 * 60 * 1000;
+
+export interface LeaseAction {
+  t: number;
+  tool: string;
+  summary: string;
+}
+
+const MAX_ACTIONS_PER_LEASE = 100;
+
+export class Orchestrator {
+  private readonly fleet: FleetOps;
+  private readonly store: Store;
+  private readonly mutex = new Mutex();
+  private readonly defaultTtlMs: number;
+  private readonly maxSims: number;
+  private readonly streamer?: StreamOps;
+  private readonly streamPortBase: number;
+  private readonly debugger?: DebugOps;
+  private readonly netProxy?: ProxyOps;
+  private readonly actions = new Map<string, LeaseAction[]>();
+
+  constructor(
+    fleet: FleetOps,
+    store: Store,
+    opts: {
+      defaultTtlMs: number;
+      maxSims?: number;
+      streamer?: StreamOps;
+      streamPortBase?: number;
+      debugger?: DebugOps;
+      proxy?: ProxyOps;
+    },
+  ) {
+    this.fleet = fleet;
+    this.store = store;
+    this.defaultTtlMs = opts.defaultTtlMs;
+    this.maxSims = opts.maxSims ?? 0;
+    this.streamer = opts.streamer;
+    this.streamPortBase = opts.streamPortBase ?? DEFAULT_STREAM_PORT_BASE;
+    this.debugger = opts.debugger;
+    this.netProxy = opts.proxy;
+  }
+
+  // ---------- state views (read-only, never mutate) ----------
+
+  async poolStatus(): Promise<{
+    simulators: PoolSimulator[];
+    counts: { total: number; booted: number; leased: number; free: number };
+    queue: { waiting: number };
+  }> {
+    const [devices, leases, tickets] = await Promise.all([
+      this.fleet.list(),
+      this.store.read((s) => s.leases),
+      this.store.read((s) => s.tickets.filter((t) => t.status === "waiting")),
+    ]);
+    const byUdid = new Map(leases.map((l) => [l.udid, l]));
+    const now = Date.now();
+
+    const slimEntries = await Promise.all(
+      devices.map(async (d) => {
+        if (!isBooted(d)) return [d.udid, null] as const;
+        try {
+          return [d.udid, await this.fleet.slimStatus(d.udid)] as const;
+        } catch {
+          return [d.udid, null] as const;
+        }
+      }),
+    );
+    const slimByUdid = new Map(slimEntries);
+
+    const simulators: PoolSimulator[] = devices.map((d) => {
+      const lease = byUdid.get(d.udid);
+      const slimStatus = slimByUdid.get(d.udid) ?? null;
+      return {
+        ...d,
+        slim: slimStatus?.slim ?? null,
+        slimDetail: slimStatus
+          ? { managedDisabled: slimStatus.managedDisabled, managedTotal: slimStatus.managedTotal }
+          : null,
+        ramBytes: null, // reserved: fill via `simslim top --json` if per-sim RAM is needed
+        lease: lease && !isExpired(lease, now)
+          ? {
+            leaseId: lease.leaseId,
+            sessionId: lease.sessionId,
+            client: lease.client,
+            task: lease.task,
+            streamUrl: lease.streamUrl,
+            streamPort: lease.streamPort,
+          }
+          : null,
+      };
+    });
+    const booted = devices.filter(isBooted).length;
+    const leased = simulators.filter((s) => s.lease !== null).length;
+    return {
+      simulators,
+      counts: { total: devices.length, booted, leased, free: booted - leased },
+      queue: { waiting: tickets.length },
+    };
+  }
+
+  async leasesList(): Promise<{ leases: (Lease & { expired: boolean })[] }> {
+    const now = Date.now();
+    const leases = await this.store.read((s) => s.leases);
+    return { leases: leases.map((l) => ({ ...l, expired: isExpired(l, now) })) };
+  }
+
+  async sessionsList(): Promise<{
+    sessions: {
+      sessionId: string;
+      clients: string[];
+      leases: Lease[];
+      tickets: Ticket[];
+    }[];
+  }> {
+    const [leases, tickets] = await Promise.all([
+      this.store.read((s) => s.leases),
+      this.store.read((s) => s.tickets),
+    ]);
+    const groups = new Map<string, { clients: Set<string>; leases: Lease[]; tickets: Ticket[] }>();
+    const group = (sessionId: string) => {
+      let g = groups.get(sessionId);
+      if (!g) {
+        g = { clients: new Set(), leases: [], tickets: [] };
+        groups.set(sessionId, g);
+      }
+      return g;
+    };
+    for (const l of leases) {
+      const g = group(l.sessionId);
+      g.clients.add(l.client);
+      g.leases.push(l);
+    }
+    for (const t of tickets) {
+      const g = group(t.sessionId);
+      g.clients.add(t.client);
+      g.tickets.push(t);
+    }
+    return {
+      sessions: [...groups.entries()].map(([sessionId, g]) => ({
+        sessionId,
+        clients: [...g.clients],
+        leases: g.leases,
+        tickets: g.tickets,
+      })),
+    };
+  }
+
+  async queueStatus(ticketId?: string): Promise<{
+    waiting: (Ticket & { position: number })[];
+    ticket?: Ticket & { position: number | null };
+  }> {
+    const tickets = await this.store.read((s) =>
+      s.tickets.filter((t) => t.status === "waiting").sort((a, b) => a.createdAt - b.createdAt),
+    );
+    const waiting = tickets.map((t, i) => ({ ...t, position: i + 1 }));
+    if (!ticketId) return { waiting };
+    const found = await this.store.read((s) => s.tickets.find((t) => t.ticketId === ticketId));
+    if (!found) throw new LeaseError(`Unknown ticket ${ticketId}`);
+    const position = found.status === "waiting"
+      ? waiting.find((w) => w.ticketId === ticketId)?.position ?? null
+      : null;
+    return { waiting, ticket: { ...found, position } };
+  }
+
+  // ---------- acquire / release / dispatch ----------
+
+  acquire(input: AcquireInput): Promise<AcquireResult> {
+    return this.mutex.run(async () => {
+      if (!input.sessionId) return { ok: false, reason: "sessionId is required" };
+      const req = input.requirements ?? {};
+      const queue = input.queue ?? true;
+      const autoBoot = input.autoBoot ?? true;
+      const slim = input.slim ?? true;
+      const client = input.client?.trim() || "unknown";
+
+      const expiredSwept = await this.sweepLocked();
+      const warnings = expiredSwept.map((id) => `Swept expired lease ${id}`);
+
+      const devices = await this.fleet.list();
+      const leases = await this.store.read((s) => s.leases);
+      const held = new Set(leases.map((l) => l.udid));
+
+      // 1) Free booted sim, deterministic order.
+      const free = devices
+        .filter((d) => isBooted(d) && !held.has(d.udid) && matches(d, req))
+        .sort((a, b) => a.udid.localeCompare(b.udid));
+      if (free.length > 0) {
+        const target = free[0]!;
+        if (slim) {
+          const warn = await this.trySlim(target.udid, input.slimExcept);
+          if (warn) warnings.push(warn);
+        }
+        const lease = await this.createLease(target.udid, input, client);
+        await this.maybeStartStream(lease, input.stream === true, warnings);
+        return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
+      }
+
+      // 2) Boot a matching shutdown sim.
+      if (autoBoot) {
+        const bootedCount = devices.filter(isBooted).length;
+        if (this.maxSims > 0 && bootedCount >= this.maxSims) {
+          // Fall through to queue: at capacity.
+        } else {
+          const bootable = devices
+            .filter((d) => !isBooted(d) && !held.has(d.udid) && matches(d, req))
+            .sort((a, b) => a.udid.localeCompare(b.udid));
+          if (bootable.length > 0) {
+            const target = bootable[0]!;
+            try {
+              await this.fleet.boot(target.udid);
+            } catch (err) {
+              const reason = `Boot of ${target.udid} failed: ${(err as Error).message}`;
+              if (!queue) return { ok: false, reason };
+              const { ticket, position } = await this.createTicket(input, client, req, autoBoot, slim);
+              return { ok: true, queued: true, ticket, position, note: reason };
+            }
+            if (slim) {
+              const warn = await this.trySlim(target.udid, input.slimExcept);
+              if (warn) warnings.push(warn);
+            }
+            const lease = await this.createLease(target.udid, input, client);
+            await this.maybeStartStream(lease, input.stream === true, warnings);
+            return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
+          }
+        }
+      }
+
+      // 3) Queue.
+      if (!queue) return { ok: false, reason: "No matching simulator is free and queue=false" };
+      const { ticket, position } = await this.createTicket(input, client, req, autoBoot, slim);
+      return { ok: true, queued: true, ticket, position };
+    });
+  }
+
+  release(leaseId: string, sessionId: string, opts: { force?: boolean } = {}): Promise<ReleaseResult> {
+    return this.mutex.run(async () => {
+      const expiredSwept = await this.sweepLocked();
+      const removed = await this.store.mutate((s) => {
+        const idx = s.leases.findIndex((l) => l.leaseId === leaseId);
+        if (idx === -1) throw new LeaseError(`Unknown lease ${leaseId}`);
+        const lease = s.leases[idx]!;
+        if (!opts.force && lease.sessionId !== sessionId) {
+          throw new LeaseError(`Lease ${leaseId} is held by session ${lease.sessionId}, not ${sessionId}`);
+        }
+        s.leases.splice(idx, 1);
+        return { value: lease, dirty: true };
+      });
+      // Stop BEFORE dispatch: a waiter reusing this sim may start its own stream.
+      await this.stopStreamQuiet(removed.udid);
+      await this.stopDebugQuiet(removed.debugSessionId);
+      await this.stopProxyQuiet(removed.leaseId);
+      const dispatched = await this.dispatchLocked();
+      this.actions.delete(leaseId);
+      return { released: leaseId, expiredSwept, dispatched };
+    });
+  }
+
+  cancelTicket(ticketId: string, sessionId: string): Promise<{ cancelled: string }> {
+    return this.mutex.run(async () => {
+      await this.store.mutate((s) => {
+        const idx = s.tickets.findIndex((t) => t.ticketId === ticketId);
+        if (idx === -1) throw new LeaseError(`Unknown ticket ${ticketId}`);
+        const ticket = s.tickets[idx]!;
+        if (ticket.sessionId !== sessionId) {
+          throw new LeaseError(`Ticket ${ticketId} belongs to session ${ticket.sessionId}, not ${sessionId}`);
+        }
+        if (ticket.status !== "waiting") {
+          throw new LeaseError(`Ticket ${ticketId} is already ${ticket.status}`);
+        }
+        s.tickets.splice(idx, 1);
+        return { value: undefined, dirty: true };
+      });
+      return { cancelled: ticketId };
+    });
+  }
+
+  heartbeat(leaseId: string, sessionId: string): Promise<Lease> {
+    return this.mutex.run(async () =>
+      this.store.mutate((s) => {
+        const lease = s.leases.find((l) => l.leaseId === leaseId);
+        if (!lease) throw new LeaseError(`Unknown lease ${leaseId}`);
+        if (lease.sessionId !== sessionId) {
+          throw new LeaseError(`Lease ${leaseId} is held by session ${lease.sessionId}, not ${sessionId}`);
+        }
+        lease.lastHeartbeat = Date.now();
+        return { value: { ...lease }, dirty: true };
+      }),
+    );
+  }
+
+  /** Drop expired leases, prune old assignments, then auto-dispatch the queue. */
+  sweepStale(): Promise<{ swept: string[]; dispatched: DispatchAssignment[] }> {
+    return this.mutex.run(async () => {
+      const swept = await this.sweepLocked();
+      const dispatched = await this.dispatchLocked();
+      return { swept, dispatched };
+    });
+  }
+
+  /**
+   * Validate a lease for gated operations. Releases it (and dispatches) when it
+   * expired or its simulator is no longer booted, then throws.
+   */
+  async resolveLease(leaseId: string): Promise<Lease> {
+    const lease = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+    if (!lease) throw new LeaseError(`Unknown lease ${leaseId}`);
+    if (isExpired(lease, Date.now())) {
+      await this.mutex.run(async () => {
+        await this.store.mutate((s) => {
+          s.leases = s.leases.filter((l) => l.leaseId !== leaseId);
+          return { value: undefined, dirty: true };
+        });
+        await this.stopStreamQuiet(lease.udid);
+        await this.stopDebugQuiet(lease.debugSessionId);
+        await this.stopProxyQuiet(leaseId);
+        await this.dispatchLocked();
+      });
+      this.actions.delete(leaseId);
+      throw new LeaseError(`Lease ${leaseId} expired and was released`);
+    }
+    const devices = await this.fleet.list();
+    const dev = devices.find((d) => d.udid === lease.udid);
+    if (!dev || !isBooted(dev)) {
+      await this.mutex.run(async () => {
+        await this.store.mutate((s) => {
+          s.leases = s.leases.filter((l) => l.leaseId !== leaseId);
+          return { value: undefined, dirty: true };
+        });
+        await this.stopStreamQuiet(lease.udid);
+        await this.stopDebugQuiet(lease.debugSessionId);
+        await this.stopProxyQuiet(leaseId);
+        await this.dispatchLocked();
+      });
+      this.actions.delete(leaseId);
+      throw new LeaseError(`Simulator ${lease.udid} is no longer booted; lease ${leaseId} was released`);
+    }
+    return lease;
+  }
+
+  leaseForUdid(udid: string): Promise<Lease | null> {
+    return this.store.read((s) => s.leases.find((l) => l.udid === udid) ?? null);
+  }
+
+  // ---------- per-lease action ring (in-memory, last 100) ----------
+
+  /** Append a one-line action summary; no-op when the lease is unknown. */
+  async logAction(leaseId: string, tool: string, summary: string): Promise<void> {
+    const known = await this.store.read((s) => s.leases.some((l) => l.leaseId === leaseId));
+    if (!known) return;
+    let ring = this.actions.get(leaseId);
+    if (!ring) {
+      ring = [];
+      this.actions.set(leaseId, ring);
+    }
+    ring.push({ t: Date.now(), tool, summary });
+    if (ring.length > MAX_ACTIONS_PER_LEASE) ring.splice(0, ring.length - MAX_ACTIONS_PER_LEASE);
+  }
+
+  /** Newest-last action history for a lease (empty when unknown), capped at `limit`. */
+  leaseActions(leaseId: string, limit?: number): LeaseAction[] {
+    const ring = this.actions.get(leaseId) ?? [];
+    if (limit === undefined) return [...ring];
+    return ring.slice(Math.max(0, ring.length - Math.max(1, Math.floor(limit))));
+  }
+
+  // ---------- internals (caller must hold the mutex) ----------
+
+  private async sweepLocked(): Promise<string[]> {
+    const now = Date.now();
+    const sweptUdids: string[] = [];
+    const sweptDebugSessions: (string | undefined)[] = [];
+    const sweptLeaseIds: string[] = [];
+    const swept = await this.store.mutate((s) => {
+      const ids: string[] = [];
+      s.leases = s.leases.filter((l) => {
+        if (isExpired(l, now)) {
+          ids.push(l.leaseId);
+          sweptUdids.push(l.udid);
+          sweptDebugSessions.push(l.debugSessionId);
+          sweptLeaseIds.push(l.leaseId);
+          return false;
+        }
+        return true;
+      });
+      s.tickets = s.tickets.filter(
+        (t) => t.status === "waiting" || now - t.createdAt < ASSIGNED_RETENTION_MS,
+      );
+      for (const id of ids) this.actions.delete(id);
+      return { value: ids, dirty: ids.length > 0 };
+    });
+    // Callers dispatch after sweeping, so stopping here never kills a new lease's stream.
+    for (const udid of sweptUdids) await this.stopStreamQuiet(udid);
+    for (const sessionId of sweptDebugSessions) await this.stopDebugQuiet(sessionId);
+    for (const leaseId of sweptLeaseIds) await this.stopProxyQuiet(leaseId);
+    return swept;
+  }
+
+  /**
+   * Assign waiting tickets (oldest first) to free matching sims, booting when
+   * the ticket allows it. Runs after every release/sweep so freed capacity is
+   * handed to the queue automatically.
+   */
+  private async dispatchLocked(): Promise<DispatchAssignment[]> {
+    const assigned: DispatchAssignment[] = [];
+    const waiting = await this.store.read((s) =>
+      s.tickets.filter((t) => t.status === "waiting").sort((a, b) => a.createdAt - b.createdAt),
+    );
+    if (waiting.length === 0) return assigned;
+
+    const devices = await this.fleet.list();
+    const leases = await this.store.read((s) => s.leases);
+    const held = new Set(leases.map((l) => l.udid));
+    const bootedUdids = new Set(devices.filter(isBooted).map((d) => d.udid));
+    let bootedCount = bootedUdids.size;
+
+    for (const ticket of waiting) {
+      const free = devices
+        .filter((d) => bootedUdids.has(d.udid) && !held.has(d.udid) && matches(d, ticket.requirements))
+        .sort((a, b) => a.udid.localeCompare(b.udid));
+      let target = free[0];
+
+      if (!target && ticket.autoBoot && (this.maxSims === 0 || bootedCount < this.maxSims)) {
+        const bootable = devices
+          .filter((d) => !bootedUdids.has(d.udid) && !held.has(d.udid) && matches(d, ticket.requirements))
+          .sort((a, b) => a.udid.localeCompare(b.udid));
+        const candidate = bootable[0];
+        if (candidate) {
+          try {
+            await this.fleet.boot(candidate.udid);
+          } catch {
+            break; // Likely systemic; leave the rest waiting for the next trigger.
+          }
+          bootedUdids.add(candidate.udid);
+          bootedCount += 1;
+          if (ticket.slim) await this.trySlim(candidate.udid);
+          target = candidate;
+        }
+      }
+
+      if (!target) continue;
+      held.add(target.udid);
+      const leaseId = await this.store.mutate((s) => {
+        s.seq += 1;
+        const lease: Lease = {
+          leaseId: nextId("lease", s.seq),
+          udid: target.udid,
+          sessionId: ticket.sessionId,
+          client: ticket.client,
+          task: ticket.task,
+          createdAt: Date.now(),
+          lastHeartbeat: Date.now(),
+          ttlMs: this.defaultTtlMs,
+        };
+        s.leases.push(lease);
+        const rec = s.tickets.find((t) => t.ticketId === ticket.ticketId);
+        if (rec) {
+          rec.status = "assigned";
+          rec.assignedLeaseId = lease.leaseId;
+          rec.assignedUdid = target.udid;
+        }
+        return { value: lease.leaseId, dirty: true };
+      });
+      const assignment: DispatchAssignment = {
+        ticketId: ticket.ticketId,
+        sessionId: ticket.sessionId,
+        leaseId,
+        udid: target.udid,
+      };
+      if (ticket.stream === true) await this.startDispatchedStream(leaseId, target.udid, assignment);
+      assigned.push(assignment);
+    }
+    return assigned;
+  }
+
+  private async createLease(udid: string, input: AcquireInput, client: string): Promise<Lease> {
+    return this.store.mutate((s) => {
+      s.seq += 1;
+      const lease: Lease = {
+        leaseId: nextId("lease", s.seq),
+        udid,
+        sessionId: input.sessionId,
+        client,
+        task: input.task,
+        createdAt: Date.now(),
+        lastHeartbeat: Date.now(),
+        ttlMs: input.ttlMs ?? this.defaultTtlMs,
+      };
+      s.leases.push(lease);
+      return { value: { ...lease }, dirty: true };
+    });
+  }
+
+  private async createTicket(
+    input: AcquireInput,
+    client: string,
+    req: Requirements,
+    autoBoot: boolean,
+    slim: boolean,
+  ): Promise<{ ticket: Ticket; position: number }> {
+    return this.store.mutate((s) => {
+      s.seq += 1;
+      const ticket: Ticket = {
+        ticketId: nextId("ticket", s.seq),
+        sessionId: input.sessionId,
+        client,
+        task: input.task,
+        requirements: req,
+        autoBoot,
+        slim,
+        createdAt: Date.now(),
+        status: "waiting",
+        ...(input.stream === true ? { stream: true as const } : {}),
+      };
+      s.tickets.push(ticket);
+      const position = s.tickets.filter((t) => t.status === "waiting").length;
+      return { value: { ticket: { ...ticket }, position }, dirty: true };
+    });
+  }
+
+  // ---------- per-lease live streams ----------
+
+  /**
+   * Start (or reuse) the live stream for a lease and persist its URL on the
+   * lease record. Idempotent: a running stream's URL is returned as-is.
+   */
+  startLeaseStream(leaseId: string): Promise<{ lease: Lease; url: string; port: number }> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.streamer) throw new LeaseError("Live streaming is unavailable: no streamer is configured");
+      const { url, port } = await this.streamer.startStream(found.udid, { portBase: this.streamPortBase });
+      const lease = await this.store.mutate((s) => {
+        const rec = s.leases.find((l) => l.leaseId === leaseId);
+        if (!rec) throw new LeaseError(`Unknown lease ${leaseId}`);
+        rec.streamUrl = url;
+        rec.streamPort = port;
+        return { value: { ...rec }, dirty: true };
+      });
+      return { lease, url, port };
+    });
+  }
+
+  /**
+   * Stop the live stream for a lease and clear its URL. Idempotent: stopping
+   * twice (or with no stream running) succeeds, reporting stopped=false.
+   */
+  stopLeaseStream(leaseId: string): Promise<{ lease: Lease; stopped: boolean }> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      const hadStream = found.streamUrl !== undefined;
+      if (this.streamer) await this.streamer.stopStream(found.udid);
+      const lease = await this.store.mutate((s) => {
+        const rec = s.leases.find((l) => l.leaseId === leaseId);
+        if (!rec) throw new LeaseError(`Unknown lease ${leaseId}`);
+        delete rec.streamUrl;
+        delete rec.streamPort;
+        return { value: { ...rec }, dirty: true };
+      });
+      return { lease, stopped: hadStream };
+    });
+  }
+
+  /** Start the requested stream for a fresh acquire; failures become warnings, never errors. */
+  private async maybeStartStream(lease: Lease, wantStream: boolean, warnings: string[]): Promise<void> {
+    if (!wantStream) return;
+    if (!this.streamer) {
+      warnings.push("Stream requested but no streamer is configured; continuing without a live stream");
+      return;
+    }
+    try {
+      const { url, port } = await this.streamer.startStream(lease.udid, { portBase: this.streamPortBase });
+      lease.streamUrl = url;
+      lease.streamPort = port;
+      await this.store.mutate((s) => {
+        const rec = s.leases.find((l) => l.leaseId === lease.leaseId);
+        if (rec) {
+          rec.streamUrl = url;
+          rec.streamPort = port;
+        }
+        return { value: undefined, dirty: true };
+      });
+    } catch (err) {
+      warnings.push(`Live stream failed to start, continuing without one: ${(err as Error).message}`);
+    }
+  }
+
+  /** Start the requested stream for a dispatched ticket; failures land on the assignment. */
+  private async startDispatchedStream(
+    leaseId: string,
+    udid: string,
+    assignment: DispatchAssignment,
+  ): Promise<void> {
+    if (!this.streamer) {
+      assignment.streamError = "no streamer is configured";
+      return;
+    }
+    try {
+      const { url, port } = await this.streamer.startStream(udid, { portBase: this.streamPortBase });
+      assignment.streamUrl = url;
+      await this.store.mutate((s) => {
+        const rec = s.leases.find((l) => l.leaseId === leaseId);
+        if (rec) {
+          rec.streamUrl = url;
+          rec.streamPort = port;
+        }
+        return { value: undefined, dirty: true };
+      });
+    } catch (err) {
+      assignment.streamError = (err as Error).message;
+    }
+  }
+
+  /** Best-effort stream teardown for release/sweep/expire paths; never throws. */
+  private async stopStreamQuiet(udid: string): Promise<void> {
+    if (!this.streamer) return;
+    try {
+      await this.streamer.stopStream(udid);
+    } catch (err) {
+      console.error(`[orchestrator] Failed to stop stream for ${udid}: ${(err as Error).message}`);
+    }
+  }
+
+  // ---------- per-lease debug sessions ----------
+
+  /**
+   * Record an llmdb session id against a lease (one session per lease; a
+   * re-attach replaces the previous id). Returns the replaced id, if any, so
+   * the caller can best-effort stop it.
+   */
+  setDebugSession(leaseId: string, sessionId: string): Promise<string | null> {
+    return this.mutex.run(async () =>
+      this.store.mutate((s) => {
+        const rec = s.leases.find((l) => l.leaseId === leaseId);
+        if (!rec) throw new LeaseError(`Unknown lease ${leaseId}`);
+        const previous = rec.debugSessionId ?? null;
+        rec.debugSessionId = sessionId;
+        return { value: previous, dirty: true };
+      }),
+    );
+  }
+
+  /**
+   * Clear the recorded debug session for a lease. Returns the cleared id, if
+   * any. Bookkeeping only — the caller stops the llmdb session itself.
+   */
+  clearDebugSession(leaseId: string): Promise<string | null> {
+    return this.mutex.run(async () =>
+      this.store.mutate((s) => {
+        const rec = s.leases.find((l) => l.leaseId === leaseId);
+        if (!rec) throw new LeaseError(`Unknown lease ${leaseId}`);
+        const previous = rec.debugSessionId ?? null;
+        delete rec.debugSessionId;
+        return { value: previous, dirty: previous !== null };
+      }),
+    );
+  }
+
+  /** Best-effort debug detach for release/sweep/expire paths; never throws. */
+  private async stopDebugQuiet(sessionId: string | undefined): Promise<void> {
+    if (!sessionId || !this.debugger) return;
+    try {
+      await this.debugger.stop(sessionId);
+    } catch (err) {
+      console.error(`[orchestrator] Failed to stop debug session ${sessionId}: ${(err as Error).message}`);
+    }
+  }
+
+  // ---------- per-lease network proxy (mitm; the host proxy is global) ----------
+
+  /**
+   * Start HTTPS interception for a lease: install the mitm CA in the leased
+   * sim, start mitmdump on a scanned port, and point the host proxy at it.
+   * Idempotent for the holding lease; a different lease gets a ProxyBusyError
+   * naming the holding session (one holder at a time — the host proxy is global).
+   */
+  startLeaseProxy(leaseId: string, rules: NetProxyRule[]): Promise<{ lease: Lease; port: number; pid?: number }> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.netProxy) throw new LeaseError("Network proxy is unavailable: no proxy is configured");
+      const { port, pid } = await this.netProxy.startProxy(found.udid, { leaseId, sessionId: found.sessionId }, rules);
+      return { lease: found, port, pid };
+    });
+  }
+
+  /**
+   * Replace the rewrite rules of the running proxy. Only the holding lease
+   * may set rules; anything else gets a ProxyBusyError naming the holder.
+   */
+  setLeaseProxyRules(leaseId: string, rules: NetProxyRule[]): Promise<{ lease: Lease }> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.netProxy) throw new LeaseError("Network proxy is unavailable: no proxy is configured");
+      await this.netProxy.setProxyRules(leaseId, rules);
+      return { lease: found };
+    });
+  }
+
+  /**
+   * Stop the proxy and restore the host proxy snapshot. Idempotent: stopping
+   * twice (or with no proxy running) succeeds, reporting stopped=false.
+   * Only the holding lease may stop — anything else gets a ProxyBusyError
+   * naming the holder.
+   */
+  stopLeaseProxy(leaseId: string): Promise<{ lease: Lease; stopped: boolean }> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.netProxy) return { lease: found, stopped: false };
+      const { stopped } = await this.netProxy.stopProxy(leaseId);
+      return { lease: found, stopped };
+    });
+  }
+
+  /** Global proxy state (any valid lease may view it), including the holder when running. */
+  leaseProxyStatus(leaseId: string): Promise<{ lease: Lease } & NetProxyStatus> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      const status = this.netProxy?.proxyStatus() ?? { running: false as const };
+      return { lease: found, ...status };
+    });
+  }
+
+  /**
+   * Best-effort proxy teardown for release/sweep/expire paths; never throws
+   * (and never fails the release). Only the holder's own teardown stops the
+   * proxy — other leases' releases leave it running.
+   */
+  private async stopProxyQuiet(leaseId: string): Promise<void> {
+    if (!this.netProxy) return;
+    const status = this.netProxy.proxyStatus();
+    if (!status.running || status.leaseId !== leaseId) return;
+    try {
+      await this.netProxy.stopProxy(leaseId);
+    } catch (err) {
+      console.error(`[orchestrator] Failed to stop network proxy for ${leaseId}: ${(err as Error).message}`);
+    }
+  }
+
+  /** Best-effort slim; returns a warning string instead of throwing on failure. */
+  private async trySlim(udid: string, except?: string): Promise<string | null> {
+    try {
+      const status = await this.fleet.slimStatus(udid);
+      // Only a stock sim (nothing disabled) is auto-slimmed. A partially
+      // slimmed sim keeps its custom profile: re-slimming could disable
+      // daemons its owner deliberately kept (e.g. --except store for push).
+      if (!status || status.managedDisabled > 0) return null;
+      await this.fleet.slimNoReboot(udid, except ? { except } : undefined);
+      return null;
+    } catch (err) {
+      return `Slimming ${udid} failed, continuing stock: ${(err as Error).message}`;
+    }
+  }
+}
