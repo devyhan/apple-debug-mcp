@@ -44,22 +44,78 @@ npm start
 
 반드시 **하나의 공유 데몬**으로 띄워야 한다. 세션마다 stdio 프로세스를 띄우면 풀/큐가 공유되지 않는다.
 
-### 상시 데몬으로 설치 (macOS launchd)
+### 설치 (Install)
 
 ```sh
-# ~/Library/LaunchAgents/com.sim-orchestration-mcp.plist 등록 후
-launchctl load ~/Library/LaunchAgents/com.sim-orchestration-mcp.plist
-curl http://127.0.0.1:3100/health   # {"ok":true,...}
+npm install
+npm run build
+npm install -g .   # 권장: launchd plist가 가리키는 안정 경로 (~/.npm-global/bin)
+sim-orchestration-mcp doctor            # 읽기 전용 점검 (실패마다 정확한 fix 명령 출력)
+sim-orchestration-mcp launchd create    # plist 작성 + load
+sim-orchestration-mcp install --client all   # Claude Code/Codex/Muse에 URL 등록
+curl http://127.0.0.1:3100/health       # {"ok":true,"version":"...","gitSha":"...",...}
 tail -f ~/.sim-orchestration-mcp/daemon.log
 ```
 
-plist는 node 절대경로 + `PATH`(homebrew/npm-global 포함) + `SIM_MCP_PORT=3100`을 지정하고
-`KeepAlive`로 유지한다. 재시작: `launchctl unload/load` 동일 파일.
+기본값(고정):
 
-### 클라이언트 등록 (모든 세션 공유)
+- 데몬 경로: npm-global bin(`~/.npm-global/bin/sim-orchestration-mcp`) 우선,
+  없으면 현재 체크아웃의 `dist/index.js`로 폴백(경고 출력).
+- 로그: `~/.sim-orchestration-mcp/daemon.log` 하나로 stdout/stderr 통합.
+- 버전 단일 출처: `package.json` — `/health`, MCP 핸드셰이크(`serverInfo`),
+  `pool_status`의 `server` 필드가 모두 같은 값을 보고한다. `gitSha`는
+  git 체크아웃에서만 포함된다.
+- `install`은 user scope에만 쓴다. 프로젝트 scope에 쓰면 세션마다 다른 데몬을
+  가리킬 수 있어 풀이 쪼개지기 때문이다. 공유 데몬 1개가 전제다.
+- CLI는 레지스트리(npm)에 핑하지 않는다. 버전 확인은 로컬 `package.json`이
+  유일한 출처이며, 네트워크 체크는 이번 라운드에서 의도적으로 제외했다.
+
+### 업그레이드 (Upgrade)
 
 ```sh
-# Claude Code (user scope = 전 세션)
+git pull
+npm install
+npm run build
+npm install -g .   # launchd plist가 npm-global을 가리키는 경우
+sim-orchestration-mcp launchd restart        # Lease 보유 중이면 거부 → --force로 강제
+sim-orchestration-mcp launchd status         # loaded + /health + version 확인
+```
+
+`launchd create`를 다시 실행하면 기존 plist의 포트/환경을 유지한 채 재생성한다.
+직접 손댄 plist는 diff를 보여주고 `--force` 없이 덮어쓰지 않는다.
+
+### 재시작 (Restart)
+
+```sh
+sim-orchestration-mcp launchd restart        # unload + load
+sim-orchestration-mcp launchd restart --force  # Lease 보유 중에도 강제
+```
+
+재시작은 활성 Lease가 없을 때만 수행된다. 진행 중 시뮬레이터 작업이 있으면
+거부 메시지와 함께 종료되므로 `--force`는 정말 필요할 때만 쓴다.
+포트 충돌로 데몬이 뜨지 않으면 종료 코드 `10`(포트 사용 중),
+이미 실행 중이면 `11`로 구분된다(일반 실패 `1`과 다름).
+
+### 제거 (Uninstall)
+
+```sh
+sim-orchestration-mcp install --client all --remove  # 클라이언트 설정에서 제거
+sim-orchestration-mcp launchd remove                 # unload + plist 삭제
+npm uninstall -g sim-orchestration-mcp               # npm-global 설치 시
+```
+
+편집된 클라이언트 설정은 수정 전 `<config>.bak-sim-mcp`으로 백업된다
+(최초 1회만 생성, 이후 덮어쓰지 않음).
+
+### 클라이언트 등록 상세 (모든 세션 공유)
+
+`install`이 쓰는 항목은 Streamable-HTTP URL뿐이다. 형식은 각 클라이언트의 실제
+설정에서 확인한 것이다(2026-10-16, macOS):
+
+```sh
+# Claude Code (user scope = 전 세션): ~/.claude.json → mcpServers
+#   "sim-orchestration-mcp": { "type": "http", "url": "http://127.0.0.1:3100/mcp" }
+# 수동 등록도 가능:
 claude mcp add -s user --transport http sim-orchestration-mcp http://127.0.0.1:3100/mcp
 ```
 
@@ -71,8 +127,15 @@ url = "http://127.0.0.1:3100/mcp"
 
 ```json
 // Muse: ~/.config/muse/settings.json → mcpServers
-"sim-orchestration": { "type": "streamable-http", "url": "http://127.0.0.1:3100/mcp", "mode": "optional" }
+"sim-orchestration": { "type": "streamable-http", "url": "http://127.0.0.1:3100/mcp" }
 ```
+
+```sh
+sim-orchestration-mcp install --client codex,muse --dry-run  # 변경 미리보기
+sim-orchestration-mcp install --client all --status          # 등록 상태만 확인
+```
+
+미지원 클라이언트 이름은 "Unsupported" 오류로 끝나며 파일을 절대 건드리지 않는다.
 
 ### 환경 변수
 
@@ -384,7 +447,7 @@ Lease 시뮬레이터의 HTTPS 트래픽을 가로채 응답을 고쳐 쓰는 �
 ## 개발
 
 ```sh
-npm test        # 단위 테스트 (orchestrator/래퍼/store)
+npm test        # 단위 테스트 (orchestrator/래퍼/store/CLI·launchd·doctor·install)
 npm run typecheck
 npm run smoke   # 실제 시뮬레이터 E2E (데몬 기동→부팅→큐→분배→종료)
 npm run dev     # tsx 핫 실행
@@ -400,4 +463,5 @@ npm run dev     # tsx 핫 실행
 구조: `src/index.ts`(HTTP 데몬/세션 map) · `src/server.ts`(MCP 도구 정의) ·
 `src/orchestrator.ts`(acquire/release/dispatch) · `src/store.ts`(JSON 영속화) ·
 `src/simslim.ts` · `src/axe.ts` · `src/servesim.ts` · `src/simlog.ts` · `src/simapps.ts` · `src/xctrace.ts` · `src/llmdb.ts`(lldb-dap 래퍼) · `src/symbolicate.ts`(atos 래퍼) · `src/netproxy.ts`(mitm 프록시) · `src/extras.ts`(기기 부가 도구) ·
-`src/exec.ts` · `test/`
+`src/exec.ts` · `src/cli.ts`(서브커맨드) · `src/version.ts`(단일 버전 출처) ·
+`src/singleton.ts`(lockfile/EADDRINUSE) · `src/launchd.ts` · `src/doctor.ts` · `src/install.ts` · `test/`

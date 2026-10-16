@@ -10,6 +10,7 @@ import { ServeSim } from "./servesim.js";
 import { SimApps } from "./simapps.js";
 import { SimLog } from "./simlog.js";
 import { Simslim } from "./simslim.js";
+import { getServerInfo, getVersion } from "./version.js";
 import { XCTrace } from "./xctrace.js";
 
 export interface ServerDeps {
@@ -57,7 +58,7 @@ function truncate(text: string, maxChars: number): { text: string; truncated: bo
 
 export function createMcpServer(deps: ServerDeps): McpServer {
   const { orchestrator: orch, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir } = deps;
-  const server = new McpServer({ name: "sim-orchestration-mcp", version: "0.1.0" });
+  const server = new McpServer({ name: "sim-orchestration-mcp", version: getVersion() });
 
   // ---------------- pool state ----------------
 
@@ -70,7 +71,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
     async () => {
       try {
-        return ok(await orch.poolStatus());
+        return ok({ server: getServerInfo(), ...(await orch.poolStatus()) });
       } catch (err) {
         return fail((err as Error).message);
       }

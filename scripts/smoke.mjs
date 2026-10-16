@@ -1,7 +1,7 @@
 // Committed CI smoke test: boots a real simulator through the daemon and
 // exercises acquire → queue → ui ops → release → auto-dispatch → shutdown.
 // Run from the repo root after `npm run build`: `node scripts/smoke.mjs`.
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, execSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -111,17 +111,74 @@ async function fetchStreamHead(url) {
   return { status, contentType };
 }
 
+function runCli(args, extraEnv = {}) {
+  const entry = path.join(ROOT, "dist", "index.js");
+  try {
+    const stdout = execFileSync(process.execPath, [entry, ...args], {
+      cwd: ROOT,
+      env: { ...process.env, SIM_MCP_PORT: PORT, ...extraEnv },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { exitCode: 0, stdout };
+  } catch (err) {
+    return { exitCode: err.status ?? 1, stdout: `${err.stdout ?? ""}${err.stderr ?? ""}` };
+  }
+}
+
+function assertCliValidation() {
+  // Validation-only CLI surface. `doctor` and `launchd status` are read-only
+  // and safe here; `launchd create|remove|restart` are FORBIDDEN in smoke
+  // (they mutate the host's launchd job and could disturb a running daemon).
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+
+  const ver = runCli(["version"]);
+  if (ver.exitCode !== 0 || ver.stdout.trim() !== pkg.version) {
+    fail(`version mismatch: cli=${JSON.stringify(ver.stdout.trim())} package=${pkg.version}`);
+  }
+  log(`CLI version ok (${pkg.version})`);
+
+  // doctor exit code depends on host state (CI has no launchd plist), so
+  // assert on the read-only check output, not the exit code.
+  const doc = runCli(["doctor"]);
+  for (const needle of ["[ok  ] simslim", "[ok  ] axe", `daemon :${PORT}`, "doctor:"]) {
+    if (!doc.stdout.includes(needle)) fail(`doctor output missing ${JSON.stringify(needle)}:\n${doc.stdout}`);
+  }
+  log("CLI doctor ok (simslim/axe probes + daemon check present)");
+
+  const st = runCli(["launchd", "status"]);
+  for (const needle of ["plist:", "loaded:", "/health: reachable"]) {
+    if (!st.stdout.includes(needle)) fail(`launchd status missing ${JSON.stringify(needle)}:\n${st.stdout}`);
+  }
+  if (!st.stdout.includes(pkg.version)) fail(`launchd status missing version ${pkg.version}:\n${st.stdout}`);
+  log("CLI launchd status ok");
+}
+
 async function main() {
   const daemon = startDaemon();
   try {
     await waitForHealth();
     log("daemon healthy");
 
+    // /health carries the package.json version (single source of truth).
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+    const health = await (await fetch(`http://127.0.0.1:${PORT}/health`)).json();
+    if (health.version !== pkg.version) {
+      fail(`/health version ${JSON.stringify(health.version)} !== package.json ${pkg.version}`);
+    }
+    log(`/health version ok (${health.version})`);
+
+    assertCliValidation();
+
     const a = await connect("smoke-a");
     const b = await connect("smoke-b");
 
     const pool = await call(a, "pool_status", {});
     expectOk(pool, "pool_status");
+    if (pool.json.server?.version !== pkg.version) {
+      fail(`pool_status server.version ${JSON.stringify(pool.json.server)} !== package.json ${pkg.version}`);
+    }
+    log(`pool_status server version ok (${pool.json.server.version})`);
     const target = pool.json.simulators
       .filter((s) => s.name.toLowerCase().includes(DEVICE_SUBSTR))
       .sort((x, y) => Number(x.state === "Booted") - Number(y.state === "Booted"))[0];

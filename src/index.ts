@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Axe } from "./axe.js";
+import { isCliCommand, runCli } from "./cli.js";
 import { loadConfig } from "./config.js";
 import { Llmdb } from "./llmdb.js";
 import { NetProxy } from "./netproxy.js";
@@ -12,10 +13,26 @@ import { ServeSim } from "./servesim.js";
 import { SimApps } from "./simapps.js";
 import { SimLog } from "./simlog.js";
 import { Simslim } from "./simslim.js";
+import {
+  EXIT_ALREADY_RUNNING,
+  EXIT_PORT_IN_USE,
+  alreadyRunningMessage,
+  checkNotRunning,
+  isAddrInUse,
+  lockFilePath,
+  portInUseMessage,
+  removeLock,
+  writeLock,
+} from "./singleton.js";
 import { Store } from "./store.js";
+import { getServerInfo } from "./version.js";
 import { XCTrace } from "./xctrace.js";
 
 async function main(): Promise<void> {
+  const cliArgs = process.argv.slice(2);
+  if (isCliCommand(cliArgs)) {
+    process.exit(await runCli(cliArgs));
+  }
   const config = loadConfig();
   const simslim = new Simslim({
     bin: config.simslimBin,
@@ -130,7 +147,12 @@ async function main(): Promise<void> {
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(
-            JSON.stringify({ ok: true, uptimeMs: Date.now() - startedAt, mcpSessions: sessions.size }),
+            JSON.stringify({
+              ok: true,
+              ...getServerInfo(),
+              uptimeMs: Date.now() - startedAt,
+              mcpSessions: sessions.size,
+            }),
           );
           return;
         }
@@ -185,11 +207,31 @@ async function main(): Promise<void> {
   }, config.sweepIntervalMs);
   sweepTimer.unref();
 
+  // Singleton guard: a live lockfile means another daemon owns this state dir.
+  // Never start a second daemon against the same state file (leases would split).
+  const lockPath = lockFilePath(config.stateFile);
+  const existing = checkNotRunning(lockPath);
+  if (existing.running) {
+    console.error(alreadyRunningMessage(existing.pid!));
+    process.exit(EXIT_ALREADY_RUNNING);
+  }
+
+  // A second daemon on the same port (different state file) fails at bind time.
+  httpServer.on("error", (err: unknown) => {
+    if (isAddrInUse(err)) {
+      console.error(portInUseMessage(config.port));
+      process.exit(EXIT_PORT_IN_USE);
+    }
+    console.error(`[sim-mcp] http server error: ${(err as Error)?.message ?? err}`);
+  });
+
   await new Promise<void>((resolve) => httpServer.listen(config.port, config.host, resolve));
+  writeLock(lockPath, { pid: process.pid, port: config.port, startedAt: new Date().toISOString() });
   console.log(`[sim-mcp] listening on http://${config.host}:${config.port}/mcp (state: ${config.stateFile})`);
 
   const shutdown = () => {
     clearInterval(sweepTimer);
+    removeLock(lockPath);
     // Never strands the host proxy on: forceStop is best-effort and never throws.
     void (async () => {
       await netProxy.forceStop();
