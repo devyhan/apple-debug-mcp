@@ -34,22 +34,30 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
 
-      # The guard against a runner that silently matches fewer files than it
-      # should: the suite is 20 files and 289 tests, so anything below 20
-      # files or 250 tests means something stopped being discovered.
-      - name: Assert the full suite ran
+      # The suite runs ONCE, here: an earlier shape ran `npm test` and then
+      # re-ran vitest inside the guard, so a flaky test could pass the first
+      # run and fail the second. The exit code is captured explicitly because
+      # `out=$(...)` under the runner's `set -e` would otherwise die silently
+      # on a test failure. The suite is 20 files and 289 tests, so anything
+      # below 20 files or 250 tests means something stopped being discovered.
+      - name: Run tests and assert the full suite ran
         shell: bash
         run: |
+          set +e
           out=$(npx vitest run 2>&1)
+          code=$?
+          set -e
           echo "$out" | tail -n 8
           clean=$(echo "$out" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g')
           files=$(echo "$clean" | grep -E 'Test Files' | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -n1 || true)
           count=$(echo "$clean" | grep -E '^\s*Tests ' | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -n1 || true)
           echo "test files passed: ${files:-?}"
           echo "tests passed: ${count:-?}"
+          if [ "$code" -ne 0 ]; then
+            echo "::error::vitest exited $code"
+            exit 1
+          fi
           if [ "${files:-0}" -lt 20 ]; then
             echo "::error::Only ${files:-0} test files passed; the suite should be 20."
             exit 1
@@ -60,6 +68,8 @@ jobs:
             echo "failure here."
             exit 1
           fi
+
+      - run: npm run build
 
   package:
     name: Package installs and runs

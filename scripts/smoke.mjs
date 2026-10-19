@@ -47,6 +47,7 @@ function startDaemon() {
   });
   child.stdout.on("data", (d) => process.stdout.write(`[daemon] ${d}`));
   child.stderr.on("data", (d) => process.stderr.write(`[daemon] ${d}`));
+  child.on("exit", (code, signal) => process.stdout.write(`[daemon] exited code=${code} signal=${signal}\n`));
   return child;
 }
 
@@ -60,10 +61,21 @@ async function stopDaemon(child) {
   if (child.exitCode === null) child.kill("SIGKILL");
 }
 
-async function connect(name) {
-  const client = new Client({ name, version: "0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(BASE)));
-  return client;
+async function connect(name, attempts = 5) {
+  let last;
+  for (let i = 1; i <= attempts; i++) {
+    const client = new Client({ name, version: "0" });
+    try {
+      await client.connect(new StreamableHTTPClientTransport(new URL(BASE)));
+      if (i > 1) log(`${name} connected on attempt ${i}`);
+      return client;
+    } catch (err) {
+      last = err;
+      try { await client.close(); } catch { /* never connected */ }
+      await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+  fail(`${name} connect failed after ${attempts} attempts: ${last?.message ?? last}`);
 }
 
 async function call(client, tool, args) {
