@@ -21,7 +21,7 @@ apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
 - **Lease ownership gates** — each lease holds one simulator and only its holder may drive UI, apps, debugging, or the proxy through it
 - **Wait queue with auto-dispatch** — when no simulator matches, callers get a ticket; releases, TTL expiry, and external-shutdown detection hand the next match to the first fitting ticket (FIFO)
 - **Optional dependencies degrade gracefully** — serve-sim, llmdb, and mitmdump are probed at boot; the daemon starts without them and only the tools that need them fail, with install hints
-- **Operator-safe CLI** — `doctor` is read-only, `launchd restart` refuses while leases are held, hand-edited plists are never overwritten silently, and the legacy install is never unloaded automatically
+- **Operator-safe CLI** — `doctor` is read-only, `launchd restart` refuses while leases are held, hand-edited plists are never overwritten silently
 - **Single version source** — `package.json` feeds `/health`, the MCP handshake (`serverInfo`), and the `server` field of `pool_status` alike
 
 ## Prerequisites
@@ -166,24 +166,6 @@ apple-debug-mcp launchd remove                 # unload + delete the plist
 npm uninstall -g apple-debug-mcp               # when installed via npm-global
 ```
 
-## Migrate from sim-orchestration-mcp
-
-The pre-rename install used the launchd label `com.sim-orchestration-mcp`, the state dir `~/.sim-orchestration-mcp`, and the client keys `sim-orchestration-mcp` / `sim-orchestration`. Migration is three parts: the state dir and client keys move automatically, the live launchd job needs two commands by hand because this tool never unloads another daemon on its own.
-
-1. Stop and delete the legacy launchd job (exact commands — `launchd create` refuses until this is done, and `--force` never bypasses it):
-
-```
-launchctl unload ~/Library/LaunchAgents/com.sim-orchestration-mcp.plist
-rm ~/Library/LaunchAgents/com.sim-orchestration-mcp.plist
-```
-
-If the plist file is already gone but the job is still loaded, use `launchctl remove com.sim-orchestration-mcp` instead of the `unload` line.
-
-2. Run anything once: the first start of the new daemon or CLI moves `~/.sim-orchestration-mcp` to `~/.apple-debug-mcp` (logged, idempotent; it never merges into an existing new dir).
-3. Re-run install: `apple-debug-mcp install --client all` adds the uniform `apple-debug` entry and removes the legacy keys from each client's config in the same write.
-
-Then proceed with [Install](#install) step 5 (`launchd create`).
-
 ## Tools
 
 65 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
@@ -279,7 +261,6 @@ Common failures:
 
 - `/health` unreachable but the plist is loaded: the daemon crashed at boot — the log shows why (missing `simslim`/`axe` is the usual cause).
 - Port conflict: the daemon exits `10` when the port is taken, `11` when another daemon holds the lockfile (generic failures exit `1`). Restart via `apple-debug-mcp launchd restart`, never by launching a second daemon.
-- `launchd create` refuses with a legacy `com.sim-orchestration-mcp` install: follow [Migrate from sim-orchestration-mcp](#migrate-from-sim-orchestration-mcp) — it never unloads the old job for you.
 - `launchd restart` refuses with active leases: wait for release or re-run with `--force` (drops in-flight work).
 - Hand-edited plist: `create`/`remove` show a diff and refuse without `--force`.
 - `install` reports "already installed" on the second run — that is the idempotent success path, not an error.
@@ -304,7 +285,7 @@ Normal shutdown (SIGINT/SIGTERM), `lease_release`, TTL expiry, sweeps, and exter
 - **sudo is narrow and explicit.** Host proxy control needs passwordless sudo for exactly four `networksetup` subcommands — `-setwebproxy`, `-setsecurewebproxy`, `-setwebproxystate`, `-setsecurewebproxystate` — always as `sudo -n` (never interactive). Reads (`-listallnetworkservices`, `-getwebproxy`/`-getsecurewebproxy`) need no sudo. Nothing is checked or changed at daemon boot, because every `-set*` mutates host state; `net_proxy_start` fails with a sudoers-setup hint when authorization is missing.
 - **Rules validate before any host change.** A bad rule is rejected without touching host networking.
 - **Host-wide proxy warning.** While the proxy is on, all host web traffic (including other apps' background traffic) flows through mitmdump, and intranet sites on a private CA may break until stop/restore. Keep it on only as long as the test needs. The mitm CA stays in the simulator keychain after stop (harmless without the proxy; full removal is `xcrun simctl keychain <udid> reset`).
-- **No silent destructive actions.** `doctor` is read-only (no `--fix`); restart refuses under active leases; hand-edited plists need `--force`; the legacy launchd job is never auto-unloaded; local-only mode exists because process-scoped interception (`mitmdump --mode local:…`) needs a manually approved macOS System Extension and is unverifiable in unattended environments, so only host mode ships.
+- **No silent destructive actions.** `doctor` is read-only (no `--fix`); restart refuses under active leases; hand-edited plists need `--force`; local-only mode exists because process-scoped interception (`mitmdump --mode local:…`) needs a manually approved macOS System Extension and is unverifiable in unattended environments, so only host mode ships.
 - **Localhost only by default.** The daemon binds `127.0.0.1:3100`; the MCP endpoint has no authentication, so do not rebind it to a shared interface.
 
 ## What this is not
