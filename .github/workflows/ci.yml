@@ -159,5 +159,23 @@ jobs:
           axe --version
       - name: Install serve-sim
         run: npm install -g serve-sim
+      # A cold simulator boot takes longer than the MCP request timeout, so a
+      # Shutdown target makes lease_acquire fail with -32001. Pre-boot one
+      # matching device here (same filter as smoke.mjs SMOKE_DEVICE_SUBSTR);
+      # the smoke test prefers Booted devices and picks this one up.
+      - name: Pre-boot simulator
+        run: |
+          UDID=$(xcrun simctl list devices available -j | node -e '
+            let data = "";
+            process.stdin.on("data", (c) => (data += c)).on("end", () => {
+              const substr = (process.env.SMOKE_DEVICE_SUBSTR ?? "iphone").toLowerCase();
+              const devices = Object.values(JSON.parse(data).devices ?? {}).flat();
+              const match = devices.find((d) => d.isAvailable !== false && d.name.toLowerCase().includes(substr));
+              if (!match) { console.error("no available simulator matching " + substr); process.exit(1); }
+              console.log(match.udid);
+            });
+          ')
+          echo "Pre-booting $UDID"
+          xcrun simctl bootstatus "$UDID" -b
       - name: Smoke test (real simulator)
         run: npm run smoke
