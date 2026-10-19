@@ -1,0 +1,27 @@
+name: Tool request
+description: A simulator operation this daemon does not cover yet
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What you want to do
+      description: Describe it as you would ask an assistant, not as a simctl call.
+    validations:
+      required: true
+
+  - type: input
+    id: helper
+    attributes:
+      label: Helper command, if you know it
+      placeholder: "xcrun simctl io booted screenshot"
+
+  - type: checkboxes
+    id: lease
+    attributes:
+      label: Does it drive a specific simulator?
+      description: >
+        Simulator-driving tools are gated on the holding lease so two sessions
+        cannot drive one simulator. Saying so here settles the design early.
+      options:
+        - label: This would act on the lease-held simulator

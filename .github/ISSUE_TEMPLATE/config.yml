@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/devyhan/apple-debug-mcp/security/advisories/new
+    about: Report privately. Never post keychain material, provisioning profiles, app binaries, or personal device logs in a public issue.
+  - name: Doctor or proxy problem
+    url: https://github.com/devyhan/apple-debug-mcp/blob/main/docs/troubleshooting.md
+    about: Doctor failures, launchd registration, and the host proxy left on after a crash. Most of these are answered there.

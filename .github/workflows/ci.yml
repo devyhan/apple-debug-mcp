@@ -9,20 +9,123 @@ on:
     - cron: "23 2 * * 1"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
-    name: typecheck + unit tests
+    name: typecheck + unit tests (node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the floor declared in package.json engines; 22 and 24 are the
+        # active LTS lines.
+        node: [20, 22, 24]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+      # The guard against a runner that silently matches fewer files than it
+      # should: the suite is 20 files and 289 tests, so anything below 20
+      # files or 250 tests means something stopped being discovered.
+      - name: Assert the full suite ran
+        shell: bash
+        run: |
+          out=$(npx vitest run 2>&1)
+          echo "$out" | tail -n 8
+          files=$(echo "$out" | grep -E 'Test Files' | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -n1)
+          count=$(echo "$out" | grep -E '^\s*Tests ' | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -n1)
+          echo "test files passed: ${files:-?}"
+          echo "tests passed: ${count:-?}"
+          if [ "${files:-0}" -lt 20 ]; then
+            echo "::error::Only ${files:-0} test files passed; the suite should be 20."
+            exit 1
+          fi
+          if [ "${count:-0}" -lt 250 ]; then
+            echo "::error::Only ${count:-0} tests passed; the suite should be 250+."
+            echo "A runner that silently matches fewer files than it should is the"
+            echo "failure here."
+            exit 1
+          fi
+
+  package:
+    name: Package installs and runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # dist/ is gitignored, so this proves `prepack` rebuilds it. Without that
+      # script a publish from a clean checkout ships a tarball with no code and
+      # npm reports success.
+      - name: Pack from a clean checkout
+        run: |
+          npm pack --silent | tail -1 > /tmp/tgz
+          echo "tarball: $(cat /tmp/tgz)"
+          tar -tzf "$(cat /tmp/tgz)" | wc -l | xargs -I{} echo "files in tarball: {}"
+          if [ "$(tar -tzf "$(cat /tmp/tgz)" | wc -l)" -lt 50 ]; then
+            echo "::error::Tarball is nearly empty — prepack did not build."
+            exit 1
+          fi
+          tar -tzf "$(cat /tmp/tgz)" | grep -q 'package/LICENSE' || {
+            echo "::error::LICENSE is missing from the tarball."; exit 1; }
+          tar -tzf "$(cat /tmp/tgz)" | grep -q 'package/README.md' || {
+            echo "::error::README.md is missing from the tarball."; exit 1; }
+
+      - name: Install the tarball and run it
+        run: |
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y >/dev/null
+          npm install --silent "$GITHUB_WORKSPACE/$(cat /tmp/tgz)"
+          ./node_modules/.bin/apple-debug-mcp --version
+          ./node_modules/.bin/apple-debug-mcp --help | head -1
+
+      # The daemon speaks Streamable HTTP with a /health probe: boot it the way
+      # the launchd plist would and check the probe answers with this version.
+      # simslim/axe are stubbed — the daemon only runs `simslim version` and
+      # `axe --version` at boot, and neither exists on Linux.
+      - name: Boot it and check /health the way launchd would
+        run: |
+          cd /tmp/consumer
+          mkdir -p /tmp/stubbin
+          printf '#!/bin/sh\necho "stub 0.0.0"\n' > /tmp/stubbin/simslim
+          printf '#!/bin/sh\necho "stub 0.0.0"\n' > /tmp/stubbin/axe
+          chmod +x /tmp/stubbin/simslim /tmp/stubbin/axe
+          export PATH="/tmp/stubbin:$PATH"
+          export SIMSLIM_BIN=/tmp/stubbin/simslim AXE_BIN=/tmp/stubbin/axe
+          export SIM_MCP_PORT=3210 SIM_MCP_STATE_FILE=/tmp/consumer/health-state.json
+          ./node_modules/.bin/apple-debug-mcp > /tmp/consumer/daemon.log 2>&1 &
+          DAEMON=$!
+          trap 'kill $DAEMON 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3210/health > /tmp/consumer/health.json; then break; fi
+            sleep 1
+          done
+          cat /tmp/consumer/health.json
+          export EXPECTED="$(node -p 'require(process.env.GITHUB_WORKSPACE + "/package.json").version')"
+          node -e '
+            const h = require("/tmp/consumer/health.json");
+            const expected = process.env.EXPECTED;
+            console.log("ok:", h.ok, "version:", h.version, "expected:", expected);
+            if (h.ok !== true) { console.error("::error::/health did not report ok:true"); process.exit(1); }
+            if (h.version !== expected) { console.error(`::error::/health version ${h.version} != package.json ${expected}`); process.exit(1); }
+          '
 
   smoke-macos:
     name: macOS simulator smoke

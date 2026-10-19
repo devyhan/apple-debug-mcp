@@ -1,8 +1,14 @@
 # apple-debug-mcp
 
+[![npm version](https://img.shields.io/npm/v/apple-debug-mcp)](https://www.npmjs.com/package/apple-debug-mcp)
+[![CI](https://github.com/devyhan/apple-debug-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/devyhan/apple-debug-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An MCP debug daemon for Apple Simulators: multiple AI agent sessions share one Mac's simulator pool while the daemon tracks who holds which simulator (leases) and auto-dispatches freed simulators to the next waiter in line. It runs locally as a single shared daemon over Streamable HTTP, built on [simslim](https://github.com/MobAI-App/simslim) for simulator lifecycle (boot/shutdown/slim, low-RAM slim boots) and [AXe](https://github.com/cameroncooke/AXe) for UI automation.
 
 > **Not affiliated with Apple.** This is an independent community project. Apple, Xcode, Simulator, and Instruments are trademarks of Apple Inc., used here only to describe what this software connects to.
+
+Published on npm as [`apple-debug-mcp`](https://www.npmjs.com/package/apple-debug-mcp).
 
 ```
 Agent sessions (Orca / Claude Code / TMA / scripts)
@@ -27,7 +33,7 @@ apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
 ## Prerequisites
 
 - macOS + Xcode (Simulator runtime)
-- Node.js 18 or later
+- Node.js 20 or later
 - `simslim` and `axe`:
 
 ```
@@ -44,6 +50,14 @@ brew install mitmproxy            # net_proxy_*, net_assert_flow, map_local, map
 ```
 
 ## Install
+
+Consumer install (no checkout needed):
+
+```
+npm install -g apple-debug-mcp
+apple-debug-mcp --version
+apple-debug-mcp doctor            # read-only check; every failure prints its exact fix
+```
 
 From a checkout of this repo, five steps:
 
@@ -86,6 +100,8 @@ apple-debug-mcp launchd status
 Call `lease_acquire` with that body. With spare capacity you get a lease immediately; otherwise you get a wait ticket (`ticket_id`, `position`) — poll `queue_status` until it shows `status: "assigned"` with a `lease_id`. Drive the simulator with the `ui_*` tools, renew long work with `lease_heartbeat`, and finish with `lease_release`, which instantly dispatches the freed simulator to the first matching ticket.
 
 ## Configuration
+
+Full reference: [Configuration](docs/configuration.md).
 
 `install` writes Streamable-HTTP URL entries only. Shapes verified against the real configs on macOS:
 
@@ -168,6 +184,8 @@ npm uninstall -g apple-debug-mcp               # when installed via npm-global
 
 ## Tools
 
+Full reference: [Tools](docs/tools.md).
+
 65 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
 
 | Group | Tools |
@@ -200,6 +218,8 @@ Key behaviors:
 - Network proxy: `net_proxy_start {lease_id, rules?}` intercepts the lease simulator's HTTPS (mitmdump + generated rewrite addon + mitm CA into the simulator keychain); `net_proxy_set_rules` swaps rules (restarts only mitmdump, same port); `net_proxy_stop` is idempotent and restores the host proxy snapshot; `net_assert_flow` polls the holder's flow log (JSONL). Rules are `match{url_regex?, method?}` → `action{status?, headers?, body?, delay_ms?, request?, map_local?, map_remote?}`, first match wins, max 50; omitted `match` matches everything, `rules: []` is transparent intercept-and-log. See [Security](#security) for the host-wide warning and consent boundary.
 
 ## Usage examples
+
+More: [Usage examples](docs/examples.md).
 
 > "Boot a simulator, hold it, and tap through login."
 
@@ -239,6 +259,8 @@ That is `net_proxy_start`, then `net_assert_flow` to prove the app hit the endpo
 
 ## Instructions for AI agents
 
+Short form: [Instructions for AI agents](docs/agents.md).
+
 - There must be exactly one shared daemon. Never start a per-session stdio server — the pool and queue would not be shared. If `/health` is unreachable, say so instead of working around it with direct `simctl`.
 - Pass your tool's session ID as `session_id` with a `client` label so `sessions_list` shows who runs where. The server does not enforce the format.
 - A wait ticket is normal. Poll `queue_status`; do not boot simulators out of band to skip the line.
@@ -248,6 +270,8 @@ That is `net_proxy_start`, then `net_assert_flow` to prove the app hit the endpo
 - Turn the proxy and streams off when done: `net_proxy_stop`, `stream_stop`. Both cost host-wide resources while on.
 
 ## Troubleshooting
+
+Full reference: [Troubleshooting](docs/troubleshooting.md).
 
 Start with `doctor` — every failure prints its exact fix:
 
@@ -281,6 +305,8 @@ Normal shutdown (SIGINT/SIGTERM), `lease_release`, TTL expiry, sweeps, and exter
 
 ## Security
 
+Full reference: [Security](docs/security.md).
+
 - **Lease-gated mutation.** UI, apps, profiling, streaming, debugging, and the proxy all require the holding `lease_id`; cross-lease calls fail naming the holder. Only one proxy holder exists across all leases.
 - **sudo is narrow and explicit.** Host proxy control needs passwordless sudo for exactly four `networksetup` subcommands — `-setwebproxy`, `-setsecurewebproxy`, `-setwebproxystate`, `-setsecurewebproxystate` — always as `sudo -n` (never interactive). Reads (`-listallnetworkservices`, `-getwebproxy`/`-getsecurewebproxy`) need no sudo. Nothing is checked or changed at daemon boot, because every `-set*` mutates host state; `net_proxy_start` fails with a sudoers-setup hint when authorization is missing.
 - **Rules validate before any host change.** A bad rule is rejected without touching host networking.
@@ -296,7 +322,7 @@ It is also not a simulator runtime itself. Booting, slimming, and UI driving del
 
 ## Development
 
-Requires Node.js 18 or later, macOS + Xcode for anything past unit tests.
+Requires Node.js 20 or later, macOS + Xcode for anything past unit tests.
 
 ```
 npm install
@@ -313,7 +339,7 @@ npm run dev     # tsx hot run
 | `npm run build` | Compile to `dist/`. |
 | `npm run smoke` | Live E2E against real simulators. Needs macOS + Xcode + simslim/axe. |
 
-CI has two jobs: `check` (Linux, every PR/push: typecheck + unit tests + build) and `smoke-macos` (main pushes, weekly Mondays, manual dispatch, and PRs labeled `run-smoke`: installs simslim/axe via brew and runs the live smoke to catch external CLI/Xcode drift early). Dependabot opens weekly npm and GitHub Actions update PRs.
+CI has three jobs: `check` (Linux, every PR/push: typecheck + unit tests + build across Node 20/22/24), `package` (pack-from-clean tarball install plus `--version`/`--help` and a health/stdio guard), and `smoke-macos` (main pushes, weekly Mondays, manual dispatch, and PRs labeled `run-smoke`: installs simslim/axe via brew and runs the live smoke to catch external CLI/Xcode drift early). Dependabot opens weekly npm and GitHub Actions update PRs.
 
 Layout: `src/index.ts` (HTTP daemon/session map) · `src/server.ts` (MCP tool definitions) · `src/orchestrator.ts` (acquire/release/dispatch) · `src/store.ts` (JSON persistence) · `src/simslim.ts` · `src/axe.ts` · `src/servesim.ts` · `src/simlog.ts` · `src/simapps.ts` · `src/xctrace.ts` · `src/llmdb.ts` · `src/symbolicate.ts` · `src/netproxy.ts` · `src/extras.ts` · `src/exec.ts` · `src/cli.ts` · `src/version.ts` · `src/singleton.ts` · `src/launchd.ts` · `src/doctor.ts` · `src/install.ts` · `src/migrate.ts` · `test/`
 

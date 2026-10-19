@@ -7,19 +7,28 @@
     "apple-debug-mcp": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "clean": "rm -rf dist",
+    "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run build",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
     "smoke": "node scripts/smoke.mjs",
-    "prepublishOnly": "npm run build"
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/**/*.test.js",
+    "!dist/**/*.test.d.ts",
+    "!dist/**/*.test.js.map",
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
   "repository": {
     "type": "git",
@@ -30,8 +39,19 @@
   },
   "homepage": "https://github.com/devyhan/apple-debug-mcp#readme",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "apple",
+    "ios-simulator",
+    "xcode",
+    "simctl",
+    "ui-automation",
+    "debugging"
+  ],
+  "author": "devyhan",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "zod": "^3.23.8"
