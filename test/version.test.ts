@@ -23,7 +23,7 @@ describe("version", () => {
   it("getServerInfo carries name + version and an optional git sha", () => {
     __resetVersionCache();
     const info = getServerInfo();
-    expect(info.name).toBe("sim-orchestration-mcp");
+    expect(info.name).toBe("apple-debug-mcp");
     expect(info.version).toBe(getVersion());
     const sha = getGitSha();
     if (sha === undefined) {

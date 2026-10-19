@@ -60,7 +60,7 @@ export interface ServerInfo {
 
 /** Version payload shared by /health, the MCP handshake, and pool_status. */
 export function getServerInfo(): ServerInfo {
-  const info: ServerInfo = { name: "sim-orchestration-mcp", version: getVersion() };
+  const info: ServerInfo = { name: "apple-debug-mcp", version: getVersion() };
   const sha = getGitSha();
   if (sha) info.gitSha = sha;
   return info;

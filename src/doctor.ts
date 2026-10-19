@@ -127,7 +127,7 @@ export async function runDoctor(opts: DoctorOpts = {}): Promise<DoctorCheck[]> {
       name: "launchd",
       status: "fail",
       detail: `no plist at ${plist}`,
-      fix: "sim-orchestration-mcp launchd create",
+      fix: "apple-debug-mcp launchd create",
     });
   }
 
@@ -145,7 +145,7 @@ export async function runDoctor(opts: DoctorOpts = {}): Promise<DoctorCheck[]> {
       name: `daemon :${config.port}`,
       status: "fail",
       detail: "/health unreachable",
-      fix: "sim-orchestration-mcp launchd status  # then launchd create/restart, or run `npm start` in the repo",
+      fix: "apple-debug-mcp launchd status  # then launchd create/restart, or run `npm start` in the repo",
     });
   }
 
@@ -166,7 +166,7 @@ export function formatDoctorReport(checks: DoctorCheck[]): { text: string; exitC
 
 export function doctorHelp(): string {
   return [
-    "Usage: sim-orchestration-mcp doctor",
+    "Usage: apple-debug-mcp doctor",
     "",
     "Read-only environment + daemon health checks. Every failure prints the",
     "exact command to fix it; doctor itself changes nothing (no --fix).",

@@ -4,14 +4,20 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Runner, defaultRunner } from "./exec.js";
 
-export const LAUNCHD_LABEL = "com.sim-orchestration-mcp";
+export const LAUNCHD_LABEL = "com.apple-debug-mcp";
+/** Pre-rename label; `launchd create` refuses while its job is still around. */
+export const LEGACY_LAUNCHD_LABEL = "com.sim-orchestration-mcp";
 /** Single documented daemon log path for both stdout and stderr. */
-export const DAEMON_LOG_PATH = path.join(os.homedir(), ".sim-orchestration-mcp", "daemon.log");
+export const DAEMON_LOG_PATH = path.join(os.homedir(), ".apple-debug-mcp", "daemon.log");
 /** Marker comment identifying a plist rendered by `launchd create`. */
-export const MANAGED_MARKER = "managed by sim-orchestration-mcp launchd create";
+export const MANAGED_MARKER = "managed by apple-debug-mcp launchd create";
 
 export function plistPath(homeDir: string = os.homedir()): string {
   return path.join(homeDir, "Library", "LaunchAgents", `${LAUNCHD_LABEL}.plist`);
+}
+
+export function legacyPlistPath(homeDir: string = os.homedir()): string {
+  return path.join(homeDir, "Library", "LaunchAgents", `${LEGACY_LAUNCHD_LABEL}.plist`);
 }
 
 export interface PlistOptions {
@@ -137,7 +143,7 @@ export function resolveDaemonPath(opts: {
   if (opts.envDaemonPath) {
     return { daemonPath: opts.envDaemonPath };
   }
-  const globalBin = path.join(home, ".npm-global", "bin", "sim-orchestration-mcp");
+  const globalBin = path.join(home, ".npm-global", "bin", "apple-debug-mcp");
   if (exists(globalBin)) return { daemonPath: globalBin };
   const dist = opts.distPath ?? path.join(path.dirname(fileURLToPath(import.meta.url)), "index.js");
   return {
@@ -195,6 +201,34 @@ export interface LaunchdCommandResult {
   output: string;
 }
 
+/**
+ * Detect a pre-rename launchd job. Returns a refusal result (exit 2) with
+ * exact manual unload commands when the legacy plist exists or the legacy
+ * label is loaded; null when the coast is clear. --force never bypasses this:
+ * two daemons on one port would corrupt the pool, and only the operator may
+ * stop the live legacy job.
+ */
+export async function checkLegacyLaunchd(runner: Runner, home: string): Promise<LaunchdCommandResult | null> {
+  const legacyPlist = legacyPlistPath(home);
+  const legacyFileExists = fs.existsSync(legacyPlist);
+  const legacyLoaded = await isPlistLoaded(runner, LEGACY_LAUNCHD_LABEL);
+  if (!legacyFileExists && !legacyLoaded) return null;
+  const cmds: string[] = [];
+  if (legacyLoaded && legacyFileExists) cmds.push(`launchctl unload ${legacyPlist}`);
+  else if (legacyLoaded) cmds.push(`launchctl remove ${LEGACY_LAUNCHD_LABEL}`);
+  if (legacyFileExists) cmds.push(`rm ${legacyPlist}`);
+  return {
+    exitCode: 2,
+    output:
+      `Found a legacy ${LEGACY_LAUNCHD_LABEL} install ` +
+      `(plist ${legacyFileExists ? "present" : "absent"}, loaded: ${legacyLoaded ? "yes" : "no"}). ` +
+      `apple-debug-mcp never unloads it automatically.\n` +
+      `Run these commands by hand, then re-run \`apple-debug-mcp launchd create\`:\n` +
+      cmds.map((c) => `  ${c}`).join("\n") +
+      `\n(--force never bypasses this check.)\n`,
+  };
+}
+
 export async function launchdCreate(
   args: { force?: boolean; port?: number; host?: string },
   opts: LaunchdRunOpts = {},
@@ -203,6 +237,10 @@ export async function launchdCreate(
   const home = opts.homeDir ?? os.homedir();
   const plist = plistPath(home);
   const lines: string[] = [];
+  // Guided handoff: a pre-rename job would fight the new daemon over the same
+  // port. Never auto-unload it; refuse with copy-paste commands instead.
+  const legacyRefusal = await checkLegacyLaunchd(runner, home);
+  if (legacyRefusal) return legacyRefusal;
   const { daemonPath, fallbackWarning } = resolveDaemonPath({
     homeDir: home,
     distPath: opts.distPath,
@@ -234,7 +272,7 @@ export async function launchdCreate(
     pathDirs,
     port,
     host,
-    logPath: path.join(home, ".sim-orchestration-mcp", "daemon.log"),
+    logPath: path.join(home, ".apple-debug-mcp", "daemon.log"),
   });
 
   if (existing && existing === rendered) {
@@ -265,7 +303,7 @@ export async function launchdCreate(
       output: lines.join("\n") + `\nlaunchctl failed: ${(err as Error).message}\n`,
     };
   }
-  lines.push(`Loaded ${LAUNCHD_LABEL} (port ${port}). Logs: ${path.join(home, ".sim-orchestration-mcp", "daemon.log")}`);
+  lines.push(`Loaded ${LAUNCHD_LABEL} (port ${port}). Logs: ${path.join(home, ".apple-debug-mcp", "daemon.log")}`);
   return { exitCode: 0, output: lines.join("\n") + "\n" };
 }
 
@@ -308,11 +346,11 @@ export async function launchdRestart(
   const home = opts.homeDir ?? os.homedir();
   const plist = plistPath(home);
   const stateFile =
-    args.stateFile ?? process.env.SIM_MCP_STATE_FILE ?? path.join(home, ".sim-orchestration-mcp", "state.json");
+    args.stateFile ?? process.env.SIM_MCP_STATE_FILE ?? path.join(home, ".apple-debug-mcp", "state.json");
   if (!fs.existsSync(plist)) {
     return {
       exitCode: 2,
-      output: `No plist at ${plist}. Run \`sim-orchestration-mcp launchd create\` first.\n`,
+      output: `No plist at ${plist}. Run \`apple-debug-mcp launchd create\` first.\n`,
     };
   }
   const leases = countLeases(stateFile);
@@ -356,7 +394,7 @@ export async function launchdStatus(
 
 export function launchdHelp(): string {
   return [
-    "Usage: sim-orchestration-mcp launchd <create|remove|restart|status> [options]",
+    "Usage: apple-debug-mcp launchd <create|remove|restart|status> [options]",
     "",
     "  create [--port N] [--host H] [--force]  write + load the launchd plist",
     "  remove [--force]                        unload + delete the plist",

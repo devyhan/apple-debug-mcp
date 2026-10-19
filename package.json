@@ -1,10 +1,10 @@
 {
-  "name": "sim-orchestration-mcp",
+  "name": "apple-debug-mcp",
   "version": "0.1.0",
-  "description": "MCP orchestration daemon for Apple Simulators: pool state, tool-agnostic session leases, wait queue with auto-dispatch. Built on simslim (lifecycle) + AXe (UI automation).",
+  "description": "MCP debug daemon for Apple Simulators: pool state, tool-agnostic session leases, wait queue with auto-dispatch. Built on simslim (lifecycle) + AXe (UI automation).",
   "type": "module",
   "bin": {
-    "sim-orchestration-mcp": "./dist/index.js"
+    "apple-debug-mcp": "./dist/index.js"
   },
   "scripts": {
     "build": "tsc",

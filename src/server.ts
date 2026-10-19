@@ -58,7 +58,7 @@ function truncate(text: string, maxChars: number): { text: string; truncated: bo
 
 export function createMcpServer(deps: ServerDeps): McpServer {
   const { orchestrator: orch, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir } = deps;
-  const server = new McpServer({ name: "sim-orchestration-mcp", version: getVersion() });
+  const server = new McpServer({ name: "apple-debug-mcp", version: getVersion() });
 
   // ---------------- pool state ----------------
 

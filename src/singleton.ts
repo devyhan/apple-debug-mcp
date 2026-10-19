@@ -52,7 +52,7 @@ export function checkNotRunning(lockPath: string): { running: boolean; pid?: num
 export function alreadyRunningMessage(pid: number): string {
   return (
     `[sim-mcp] Another daemon is already running (pid ${pid}). ` +
-    `Use \`sim-orchestration-mcp launchd restart\` to restart it, or stop it first.`
+    `Use \`apple-debug-mcp launchd restart\` to restart it, or stop it first.`
   );
 }
 
@@ -79,6 +79,6 @@ export function isAddrInUse(err: unknown): boolean {
 export function portInUseMessage(port: number): string {
   return (
     `[sim-mcp] Port ${port} is already in use. Another daemon (or process) is bound there — ` +
-    `use \`sim-orchestration-mcp launchd restart\` to restart the managed daemon instead of starting a second one.`
+    `use \`apple-debug-mcp launchd restart\` to restart the managed daemon instead of starting a second one.`
   );
 }

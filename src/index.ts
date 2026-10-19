@@ -6,6 +6,7 @@ import { Axe } from "./axe.js";
 import { isCliCommand, runCli } from "./cli.js";
 import { loadConfig } from "./config.js";
 import { Llmdb } from "./llmdb.js";
+import { migrateLegacyStateDir } from "./migrate.js";
 import { NetProxy } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import { createMcpServer } from "./server.js";
@@ -29,6 +30,11 @@ import { getServerInfo } from "./version.js";
 import { XCTrace } from "./xctrace.js";
 
 async function main(): Promise<void> {
+  try {
+    migrateLegacyStateDir();
+  } catch (err) {
+    console.warn(`[sim-mcp] WARNING: legacy state migration failed: ${(err as Error).message}`);
+  }
   const cliArgs = process.argv.slice(2);
   if (isCliCommand(cliArgs)) {
     process.exit(await runCli(cliArgs));

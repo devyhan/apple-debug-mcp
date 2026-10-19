@@ -13,16 +13,17 @@ export const SUPPORTED_CLIENTS: ClientName[] = ["claude-code", "codex", "muse"];
 
 export const BACKUP_SUFFIX = ".bak-sim-mcp";
 
+/** Uniform MCP server key for every client. */
+export const SERVER_KEY = "apple-debug";
+/** Pre-rename keys, removed on install (without --remove) while adding SERVER_KEY. */
+export const LEGACY_SERVER_KEYS = ["sim-orchestration-mcp", "sim-orchestration"];
+
 export interface ClientSpec {
   name: ClientName;
   /** Config file path, given a home dir. */
   configPath: (homeDir: string) => string;
   kind: "json" | "toml";
-  /**
-   * MCP server key. Matches the established per-client convention (verified
-   * on-machine and in README): full package name for Claude Code, short name
-   * for Codex/Muse. Uniform keys would duplicate existing entries.
-   */
+  /** MCP server key. Uniform `apple-debug` for every client. */
   serverKey: string;
   restartStep: string;
 }
@@ -32,21 +33,21 @@ export const CLIENT_SPECS: Record<ClientName, ClientSpec> = {
     name: "claude-code",
     configPath: (home) => path.join(home, ".claude.json"),
     kind: "json",
-    serverKey: "sim-orchestration-mcp",
+    serverKey: SERVER_KEY,
     restartStep: "Restart Claude Code (or /mcp → reconnect) to pick up the new server.",
   },
   codex: {
     name: "codex",
     configPath: (home) => path.join(home, ".codex", "config.toml"),
     kind: "toml",
-    serverKey: "sim-orchestration",
+    serverKey: SERVER_KEY,
     restartStep: "Restart Codex (config.toml is read at startup).",
   },
   muse: {
     name: "muse",
     configPath: (home) => path.join(home, ".config", "muse", "settings.json"),
     kind: "json",
-    serverKey: "sim-orchestration",
+    serverKey: SERVER_KEY,
     restartStep: "Restart the Muse session to pick up the new server.",
   },
 };
@@ -247,6 +248,32 @@ export function readTomlStatus(
   return { installed: false, detail: "section present without url" };
 }
 
+/** Pre-rename keys still present in a JSON client config (never includes SERVER_KEY). */
+export function findLegacyJsonKeys(filePath: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return [];
+  }
+  const servers = (parsed as Record<string, unknown>)?.["mcpServers"];
+  if (typeof servers !== "object" || servers === null || Array.isArray(servers)) return [];
+  const table = servers as Record<string, unknown>;
+  return LEGACY_SERVER_KEYS.filter((k) => k !== SERVER_KEY && k in table);
+}
+
+/** Pre-rename sections still present in a TOML client config. */
+export function findLegacyTomlKeys(filePath: string): string[] {
+  let text: string;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+  const lines = text.split("\n").map((l) => l.trim());
+  return LEGACY_SERVER_KEYS.filter((k) => k !== SERVER_KEY && lines.includes(sectionHeader(k)));
+}
+
 // ---------------- command ----------------
 
 export interface InstallArgs {
@@ -341,13 +368,16 @@ export async function installCommand(args: InstallArgs, opts: InstallOpts = {}):
     }
     // install / upsert
     const current = spec.kind === "json" ? readJsonStatus(filePath, client) : readTomlStatus(filePath, spec.serverKey);
-    if (current.installed && current.url === url) {
+    const legacyKeys =
+      spec.kind === "json" ? findLegacyJsonKeys(filePath) : findLegacyTomlKeys(filePath);
+    if (current.installed && current.url === url && legacyKeys.length === 0) {
       lines.push(`${client}: already installed (${current.detail}) — ${filePath}`);
       continue;
     }
     if (args.dryRun) {
       lines.push(
-        `${client}: [dry-run] would write url ${url} to ${filePath} (${current.detail})`,
+        `${client}: [dry-run] would write url ${url} to ${filePath} (${current.detail}` +
+          `${legacyKeys.length > 0 ? `; would remove legacy: ${legacyKeys.join(", ")}` : ""})`,
       );
       continue;
     }
@@ -363,6 +393,7 @@ export async function installCommand(args: InstallArgs, opts: InstallOpts = {}):
           parsed = {};
         }
         const { created } = upsertJsonEntry(parsed, client, url);
+        const removedLegacy = legacyKeys.filter((k) => removeJsonEntry(parsed, k));
         if (fs.existsSync(filePath)) {
           const backup = backupOnce(filePath);
           if (backup) lines.push(`${client}: backup ${backup}`);
@@ -371,11 +402,21 @@ export async function installCommand(args: InstallArgs, opts: InstallOpts = {}):
         }
         writeJson(filePath, raw, parsed);
         lines.push(
-          `${client}: ${created ? "added" : "updated"} entry in ${filePath} → ${url}. ${spec.restartStep}`,
+          `${client}: ${created ? "added" : "updated"} entry in ${filePath} → ${url}.` +
+            `${removedLegacy.length > 0 ? ` Removed legacy: ${removedLegacy.join(", ")}.` : ""} ${spec.restartStep}`,
         );
       } else {
         const raw = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
-        const { text, created } = upsertTomlEntry(raw, spec.serverKey, url);
+        const upserted = upsertTomlEntry(raw, spec.serverKey, url);
+        let text = upserted.text;
+        const removedLegacy: string[] = [];
+        for (const legacy of legacyKeys) {
+          const removed = removeTomlEntry(text, legacy);
+          if (removed.changed) {
+            text = removed.text;
+            removedLegacy.push(legacy);
+          }
+        }
         if (fs.existsSync(filePath)) {
           const backup = backupOnce(filePath);
           if (backup) lines.push(`${client}: backup ${backup}`);
@@ -384,7 +425,8 @@ export async function installCommand(args: InstallArgs, opts: InstallOpts = {}):
         }
         fs.writeFileSync(filePath, text);
         lines.push(
-          `${client}: ${created ? "added" : "updated"} [mcp_servers.${spec.serverKey}] in ${filePath} → ${url}. ${spec.restartStep}`,
+          `${client}: ${upserted.created ? "added" : "updated"} [mcp_servers.${spec.serverKey}] in ${filePath} → ${url}.` +
+            `${removedLegacy.length > 0 ? ` Removed legacy: ${removedLegacy.join(", ")}.` : ""} ${spec.restartStep}`,
         );
       }
     } catch (err) {
@@ -402,7 +444,7 @@ function writeJson(filePath: string, raw: string, parsed: Record<string, unknown
 
 export function installHelp(): string {
   return [
-    "Usage: sim-orchestration-mcp install --client <claude-code,codex,muse,all> [--dry-run] [--status] [--remove]",
+    "Usage: apple-debug-mcp install --client <claude-code,codex,muse,all> [--dry-run] [--status] [--remove]",
     "",
     "Writes Streamable-HTTP URL entries (user scope) into each client's config.",
     "Idempotent; backs up every edited file to <config>.bak-sim-mcp first.",

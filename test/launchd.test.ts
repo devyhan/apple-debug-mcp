@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { Runner } from "../src/exec.js";
 import {
   LAUNCHD_LABEL,
+  LEGACY_LAUNCHD_LABEL,
   MANAGED_MARKER,
   countLeases,
   diffPlists,
@@ -12,6 +13,7 @@ import {
   launchdCreate,
   launchdRestart,
   launchdStatus,
+  legacyPlistPath,
   parsePlistEnv,
   plistPath,
   renderPlist,
@@ -26,7 +28,7 @@ function plistOpts() {
     pathDirs: ["/home/u/.npm-global/bin", "/opt/homebrew/bin"],
     port: 3100,
     host: "127.0.0.1",
-    logPath: "/home/u/.sim-orchestration-mcp/daemon.log",
+    logPath: "/home/u/.apple-debug-mcp/daemon.log",
   };
 }
 
@@ -39,15 +41,15 @@ describe("renderPlist", () => {
     expect(text).toContain("SIM_MCP_PORT</key>\n    <string>3100</string>");
     expect(text).toContain("/home/u/.npm-global/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
     expect(text).toContain("<key>KeepAlive</key>\n  <true/>");
-    const logHits = text.split("/home/u/.sim-orchestration-mcp/daemon.log").length - 1;
+    const logHits = text.split("/home/u/.apple-debug-mcp/daemon.log").length - 1;
     expect(logHits).toBe(2); // StandardOutPath + StandardErrorPath, same file
     expect(text).toContain(MANAGED_MARKER);
   });
 
   it("uses a bare bin path (no node wrapper) for the npm-global entry", () => {
-    const text = renderPlist({ ...plistOpts(), daemonPath: "/home/u/.npm-global/bin/sim-orchestration-mcp" });
+    const text = renderPlist({ ...plistOpts(), daemonPath: "/home/u/.npm-global/bin/apple-debug-mcp" });
     expect(text).not.toContain("/usr/local/bin/node");
-    expect(text).toContain("/home/u/.npm-global/bin/sim-orchestration-mcp");
+    expect(text).toContain("/home/u/.npm-global/bin/apple-debug-mcp");
   });
 
   it("escapes XML metacharacters in paths", () => {
@@ -81,9 +83,9 @@ describe("resolveDaemonPath", () => {
   it("prefers the npm-global bin when present", () => {
     const res = resolveDaemonPath({
       homeDir: "/home/u",
-      exists: (p) => p === "/home/u/.npm-global/bin/sim-orchestration-mcp",
+      exists: (p) => p === "/home/u/.npm-global/bin/apple-debug-mcp",
     });
-    expect(res.daemonPath).toBe("/home/u/.npm-global/bin/sim-orchestration-mcp");
+    expect(res.daemonPath).toBe("/home/u/.npm-global/bin/apple-debug-mcp");
     expect(res.fallbackWarning).toBeUndefined();
   });
 
@@ -117,14 +119,19 @@ describe("launchd commands (stubbed runner)", () => {
     return fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-home-"));
   }
 
-  /** Stub runner: launchctl list fails (= not loaded) unless told otherwise. */
-  function stubRunner(loaded = false): Runner & { calls: string[][] } {
+  /**
+   * Stub runner: launchctl list fails (= not loaded) unless told otherwise.
+   * Pass a label list to load only those labels (for legacy-handoff tests).
+   */
+  function stubRunner(loaded: boolean | string[] = false): Runner & { calls: string[][] } {
     const calls: string[][] = [];
     const run = (async (bin: string, args: string[]) => {
       calls.push([bin, ...args]);
       if (bin === "launchctl" && args[0] === "list") {
-        if (!loaded) throw new Error("Could not find service");
-        return { stdout: `{\n"Label" = "${LAUNCHD_LABEL}";\n"PID" = 123;\n}`, stderr: "" };
+        const label = args[1] ?? "";
+        const isLoaded = Array.isArray(loaded) ? loaded.includes(label) : loaded;
+        if (!isLoaded) throw new Error("Could not find service");
+        return { stdout: `{\n"Label" = "${label}";\n"PID" = 123;\n}`, stderr: "" };
       }
       return { stdout: "", stderr: "" };
     }) as Runner & { calls: string[][] };
@@ -175,9 +182,9 @@ describe("launchd commands (stubbed runner)", () => {
 
   it("restart refuses when leases are held unless --force", async () => {
     const home = tmpHome();
-    const runner = stubRunner(true);
+    const runner = stubRunner([LAUNCHD_LABEL]);
     await launchdCreate({}, { runner, homeDir: home, exists: () => false, distPath: "/repo/dist/index.js" });
-    const state = path.join(home, ".sim-orchestration-mcp", "state.json");
+    const state = path.join(home, ".apple-debug-mcp", "state.json");
     fs.mkdirSync(path.dirname(state), { recursive: true });
     fs.writeFileSync(state, JSON.stringify({ seq: 1, leases: [{ leaseId: "lease_1" }] }));
     const refused = await launchdRestart({ stateFile: state }, { runner, homeDir: home });
@@ -190,9 +197,67 @@ describe("launchd commands (stubbed runner)", () => {
     expect(runner.calls).toContainEqual(["launchctl", "load", plistPath(home)]);
   });
 
+  it("create refuses while the legacy job is loaded (guided handoff, never auto-unloads)", async () => {
+    const home = tmpHome();
+    const runner = stubRunner([LEGACY_LAUNCHD_LABEL]);
+    const res = await launchdCreate(
+      {},
+      { runner, homeDir: home, exists: () => false, distPath: "/repo/dist/index.js" },
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.output).toContain(LEGACY_LAUNCHD_LABEL);
+    expect(res.output).toContain("never unloads it automatically");
+    expect(res.output).toContain("launchctl remove com.sim-orchestration-mcp");
+    expect(res.output).toContain("apple-debug-mcp launchd create");
+    expect(fs.existsSync(plistPath(home))).toBe(false);
+    expect(runner.calls.filter(([bin, sub]) => bin === "launchctl" && sub !== "list")).toEqual([]);
+  });
+
+  it("create refuses while a legacy plist file exists, even with --force", async () => {
+    const home = tmpHome();
+    const legacyPlist = legacyPlistPath(home);
+    fs.mkdirSync(path.dirname(legacyPlist), { recursive: true });
+    fs.writeFileSync(legacyPlist, "<plist>legacy</plist>");
+    for (const force of [false, true]) {
+      const runner = stubRunner(false);
+      const res = await launchdCreate(
+        { force },
+        { runner, homeDir: home, exists: () => false, distPath: "/repo/dist/index.js" },
+      );
+      expect(res.exitCode).not.toBe(0);
+      expect(res.output).toContain(`rm ${legacyPlist}`);
+      expect(fs.existsSync(plistPath(home))).toBe(false);
+      expect(runner.calls.filter(([bin, sub]) => bin === "launchctl" && sub !== "list")).toEqual([]);
+    }
+    // Guided handoff completes once the operator removes the legacy plist.
+    fs.rmSync(legacyPlist);
+    const runner = stubRunner(false);
+    const res = await launchdCreate(
+      {},
+      { runner, homeDir: home, exists: () => false, distPath: "/repo/dist/index.js" },
+    );
+    expect(res.exitCode).toBe(0);
+    expect(fs.existsSync(plistPath(home))).toBe(true);
+  });
+
+  it("create prints unload + rm when the legacy job is loaded from its plist", async () => {
+    const home = tmpHome();
+    const legacyPlist = legacyPlistPath(home);
+    fs.mkdirSync(path.dirname(legacyPlist), { recursive: true });
+    fs.writeFileSync(legacyPlist, "<plist>legacy</plist>");
+    const runner = stubRunner([LEGACY_LAUNCHD_LABEL]);
+    const res = await launchdCreate(
+      {},
+      { runner, homeDir: home, exists: () => false, distPath: "/repo/dist/index.js" },
+    );
+    expect(res.exitCode).not.toBe(0);
+    expect(res.output).toContain(`launchctl unload ${legacyPlist}`);
+    expect(res.output).toContain(`rm ${legacyPlist}`);
+  });
+
   it("status reports plist + loaded + /health version", async () => {
     const home = tmpHome();
-    const runner = stubRunner(true);
+    const runner = stubRunner([LAUNCHD_LABEL]);
     await launchdCreate({}, { runner, homeDir: home, exists: () => false, distPath: "/repo/dist/index.js" });
     const res = await launchdStatus(
       { port: 3100 },

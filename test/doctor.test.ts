@@ -27,7 +27,7 @@ const ALL_OK: Record<string, string> = {
 };
 
 function loadedLaunchctl(): Record<string, string> {
-  return { ...ALL_OK, "launchctl list com.sim-orchestration-mcp": '{\n"Label" = "com.sim-orchestration-mcp";\n}' };
+  return { ...ALL_OK, "launchctl list com.apple-debug-mcp": '{\n"Label" = "com.apple-debug-mcp";\n}' };
 }
 
 function tmpHome(withPlist: boolean): string {
@@ -35,7 +35,7 @@ function tmpHome(withPlist: boolean): string {
   if (withPlist) {
     const dir = path.join(home, "Library", "LaunchAgents");
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "com.sim-orchestration-mcp.plist"), "<plist/>");
+    fs.writeFileSync(path.join(dir, "com.apple-debug-mcp.plist"), "<plist/>");
   }
   return home;
 }
@@ -99,7 +99,7 @@ describe("doctor (stubbed runner)", () => {
 
   it("fails launchd + daemon checks with exact fix commands when down", async () => {
     const checks = await runDoctor({
-      runner: stubRunner({ ...ALL_OK, "launchctl list com.sim-orchestration-mcp": new Error("no such service") }),
+      runner: stubRunner({ ...ALL_OK, "launchctl list com.apple-debug-mcp": new Error("no such service") }),
       homeDir: tmpHome(false),
       fetchHealth: async () => ({ ok: false }),
     });
@@ -114,7 +114,7 @@ describe("doctor (stubbed runner)", () => {
 
   it("distinguishes present-but-unloaded plist", async () => {
     const checks = await runDoctor({
-      runner: stubRunner({ ...ALL_OK, "launchctl list com.sim-orchestration-mcp": new Error("no such service") }),
+      runner: stubRunner({ ...ALL_OK, "launchctl list com.apple-debug-mcp": new Error("no such service") }),
       homeDir: tmpHome(true),
       fetchHealth: async () => ({ ok: true }),
     });

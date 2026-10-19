@@ -42,7 +42,7 @@ export function loadConfig(): Config {
     port: num("SIM_MCP_PORT", 3100),
     stateFile: str(
       "SIM_MCP_STATE_FILE",
-      path.join(os.homedir(), ".sim-orchestration-mcp", "state.json"),
+      path.join(os.homedir(), ".apple-debug-mcp", "state.json"),
     ),
     simslimBin: str("SIMSLIM_BIN", "simslim"),
     axeBin: str("AXE_BIN", "axe"),

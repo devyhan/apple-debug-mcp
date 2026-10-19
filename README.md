@@ -1,467 +1,343 @@
-# sim-orchestration-mcp
+# apple-debug-mcp
 
-Apple Simulator 오케스트레이션 MCP 데몬. 여러 AI 에이전트 세션이 한 Mac의 시뮬레이터 풀을 공유하면서
-**누가 어떤 시뮬레이터를 쓰고 있는지(Lease)** 추적하고, 빈 시뮬레이터가 생기면 **대기열의 다음 작업에 자동 분배**한다.
+An MCP debug daemon for Apple Simulators: multiple AI agent sessions share one Mac's simulator pool while the daemon tracks who holds which simulator (leases) and auto-dispatches freed simulators to the next waiter in line. It runs locally as a single shared daemon over Streamable HTTP, built on [simslim](https://github.com/MobAI-App/simslim) for simulator lifecycle (boot/shutdown/slim, low-RAM slim boots) and [AXe](https://github.com/cameroncooke/AXe) for UI automation.
 
-기반 오픈소스:
-
-- [simslim](https://github.com/MobAI-App/simslim) — 시뮬레이터 라이프사이클(boot/shutdown/slim) + 저RAM slim 부팅
-- [AXe](https://github.com/cameroncooke/AXe) — UI 자동화(describe-ui, tap, type, swipe, screenshot…)
+> **Not affiliated with Apple.** This is an independent community project. Apple, Xcode, Simulator, and Instruments are trademarks of Apple Inc., used here only to describe what this software connects to.
 
 ```
-에이전트 세션들 (Orca / Claude Code / TMA / 스크립트)
-        │  Streamable HTTP (POST /mcp), 세션별 MCP 연결
+Agent sessions (Orca / Claude Code / TMA / scripts)
+        │  Streamable HTTP (POST /mcp), one MCP connection per session
         ▼
-sim-orchestration-mcp 데몬 ── 공유 상태: Lease + 대기열 + 자동 분배
-        │  자식 프로세스
-        ├── simslim ── 부팅/종료/slim, 풀 상태
-        └── axe ────── Lease 소유자만 UI 조작 가능
+apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
+        │  child processes
+        ├── simslim ── boot/shutdown/slim, pool state
+        └── axe ────── lease holders only
 ```
 
-## 요구사항
+## Features
+
+- **65 tools across 10 groups** — pool/lease/queue, AXe UI automation, device extras, synthetic camera, app lifecycle, xctrace profiling, live streaming, llmdb debugging, crash symbolication, and an HTTPS intercept proxy
+- **One shared daemon** — leases, the wait queue, and auto-dispatch live in a single process; per-session stdio servers would split the pool
+- **Lease ownership gates** — each lease holds one simulator and only its holder may drive UI, apps, debugging, or the proxy through it
+- **Wait queue with auto-dispatch** — when no simulator matches, callers get a ticket; releases, TTL expiry, and external-shutdown detection hand the next match to the first fitting ticket (FIFO)
+- **Optional dependencies degrade gracefully** — serve-sim, llmdb, and mitmdump are probed at boot; the daemon starts without them and only the tools that need them fail, with install hints
+- **Operator-safe CLI** — `doctor` is read-only, `launchd restart` refuses while leases are held, hand-edited plists are never overwritten silently, and the legacy install is never unloaded automatically
+- **Single version source** — `package.json` feeds `/health`, the MCP handshake (`serverInfo`), and the `server` field of `pool_status` alike
+
+## Prerequisites
 
 - macOS + Xcode (Simulator runtime)
-- Node.js 18+
-- `simslim`, `axe` 바이너리 (`brew install mobai-app/tap/simslim`, `brew install cameroncooke/axe/axe`)
-- `serve-sim` (선택): `npm install -g serve-sim` — 회전/CA 디버그/메모리 경고 도구(`sim_rotate`,
-  `sim_ca_debug`, `sim_memory_warning`)와 합성 카메라(`camera_start`/`camera_switch`/
-  `camera_mirror`/`camera_status`/`camera_stop`), 라이브 스트리밍(`stream_start`/`stream_stop`,
-  `lease_acquire`의 `stream` 옵션)에만 필요. 없어도 데몬은 정상 기동하며 해당 도구 호출 시에만
-  설치 안내와 함께 실패한다.
-- `llmdb` (선택): `brew install alexmx/tools/llmdb` — 디버깅 도구(`debug_attach`/
-  `debug_break`/`debug_continue`/`debug_bt`/`debug_locals`/`debug_eval`/`debug_step`/
-  `debug_detach`)에만 필요. 없어도 데몬은 정상 기동하며 해당 도구 호출 시에만
-  설치 안내와 함께 실패한다.
+- Node.js 18 or later
+- `simslim` and `axe`:
 
-## 실행
-
-```sh
-npm install
-npm run build
-npm start
-# → http://127.0.0.1:3100/mcp, 상태 파일 ~/.sim-orchestration-mcp/state.json
+```
+brew install mobai-app/tap/simslim
+brew install cameroncooke/axe/axe
 ```
 
-반드시 **하나의 공유 데몬**으로 띄워야 한다. 세션마다 stdio 프로세스를 띄우면 풀/큐가 공유되지 않는다.
+Optional, enabling only the tools named:
 
-### 설치 (Install)
-
-```sh
-npm install
-npm run build
-npm install -g .   # 권장: launchd plist가 가리키는 안정 경로 (~/.npm-global/bin)
-sim-orchestration-mcp doctor            # 읽기 전용 점검 (실패마다 정확한 fix 명령 출력)
-sim-orchestration-mcp launchd create    # plist 작성 + load
-sim-orchestration-mcp install --client all   # Claude Code/Codex/Muse에 URL 등록
-curl http://127.0.0.1:3100/health       # {"ok":true,"version":"...","gitSha":"...",...}
-tail -f ~/.sim-orchestration-mcp/daemon.log
+```
+npm install -g serve-sim          # sim_rotate, sim_ca_debug, sim_memory_warning, camera_*, stream_*
+brew install alexmx/tools/llmdb   # debug_*
+brew install mitmproxy            # net_proxy_*, net_assert_flow, map_local, map_remote
 ```
 
-기본값(고정):
+## Install
 
-- 데몬 경로: npm-global bin(`~/.npm-global/bin/sim-orchestration-mcp`) 우선,
-  없으면 현재 체크아웃의 `dist/index.js`로 폴백(경고 출력).
-- 로그: `~/.sim-orchestration-mcp/daemon.log` 하나로 stdout/stderr 통합.
-- 버전 단일 출처: `package.json` — `/health`, MCP 핸드셰이크(`serverInfo`),
-  `pool_status`의 `server` 필드가 모두 같은 값을 보고한다. `gitSha`는
-  git 체크아웃에서만 포함된다.
-- `install`은 user scope에만 쓴다. 프로젝트 scope에 쓰면 세션마다 다른 데몬을
-  가리킬 수 있어 풀이 쪼개지기 때문이다. 공유 데몬 1개가 전제다.
-- CLI는 레지스트리(npm)에 핑하지 않는다. 버전 확인은 로컬 `package.json`이
-  유일한 출처이며, 네트워크 체크는 이번 라운드에서 의도적으로 제외했다.
+From a checkout of this repo, five steps:
 
-### 업그레이드 (Upgrade)
-
-```sh
-git pull
-npm install
-npm run build
-npm install -g .   # launchd plist가 npm-global을 가리키는 경우
-sim-orchestration-mcp launchd restart        # Lease 보유 중이면 거부 → --force로 강제
-sim-orchestration-mcp launchd status         # loaded + /health + version 확인
+```
+1. npm install
+2. npm run build
+3. npm install -g .   # recommended: the launchd plist points at the stable npm-global bin (~/.npm-global/bin)
+4. apple-debug-mcp doctor            # read-only check; every failure prints its exact fix
+5. apple-debug-mcp launchd create    # write the plist + load it
 ```
 
-`launchd create`를 다시 실행하면 기존 plist의 포트/환경을 유지한 채 재생성한다.
-직접 손댄 plist는 diff를 보여주고 `--force` 없이 덮어쓰지 않는다.
+Then register the daemon URL in your clients and verify it answers:
 
-### 재시작 (Restart)
-
-```sh
-sim-orchestration-mcp launchd restart        # unload + load
-sim-orchestration-mcp launchd restart --force  # Lease 보유 중에도 강제
+```
+apple-debug-mcp install --client all   # Claude Code / Codex / Muse (user scope)
+curl http://127.0.0.1:3100/health      # {"ok":true,"version":"...","gitSha":"...",...}
+tail -f ~/.apple-debug-mcp/daemon.log
 ```
 
-재시작은 활성 Lease가 없을 때만 수행된다. 진행 중 시뮬레이터 작업이 있으면
-거부 메시지와 함께 종료되므로 `--force`는 정말 필요할 때만 쓴다.
-포트 충돌로 데몬이 뜨지 않으면 종료 코드 `10`(포트 사용 중),
-이미 실행 중이면 `11`로 구분된다(일반 실패 `1`과 다름).
+Defaults (fixed):
 
-### 제거 (Uninstall)
+- Daemon path: the npm-global bin (`~/.npm-global/bin/apple-debug-mcp`) first, falling back to this checkout's `dist/index.js` with a loud warning. `SIM_MCP_DAEMON_PATH` overrides both.
+- Log: `~/.apple-debug-mcp/daemon.log`, stdout and stderr combined.
+- State: `~/.apple-debug-mcp/state.json` (leases/queue), lockfile `daemon.lock` beside it.
+- `install` writes user scope only. Project scope could point sessions at different daemons and split the pool — one shared daemon is the premise.
+- The CLI never pings the npm registry. The local `package.json` is the only version source.
 
-```sh
-sim-orchestration-mcp install --client all --remove  # 클라이언트 설정에서 제거
-sim-orchestration-mcp launchd remove                 # unload + plist 삭제
-npm uninstall -g sim-orchestration-mcp               # npm-global 설치 시
+## Quick start
+
+Check the daemon is up, then take a lease:
+
 ```
-
-편집된 클라이언트 설정은 수정 전 `<config>.bak-sim-mcp`으로 백업된다
-(최초 1회만 생성, 이후 덮어쓰지 않음).
-
-### 클라이언트 등록 상세 (모든 세션 공유)
-
-`install`이 쓰는 항목은 Streamable-HTTP URL뿐이다. 형식은 각 클라이언트의 실제
-설정에서 확인한 것이다(2026-10-16, macOS):
-
-```sh
-# Claude Code (user scope = 전 세션): ~/.claude.json → mcpServers
-#   "sim-orchestration-mcp": { "type": "http", "url": "http://127.0.0.1:3100/mcp" }
-# 수동 등록도 가능:
-claude mcp add -s user --transport http sim-orchestration-mcp http://127.0.0.1:3100/mcp
-```
-
-```toml
-# Codex: ~/.codex/config.toml
-[mcp_servers.sim-orchestration]
-url = "http://127.0.0.1:3100/mcp"
+apple-debug-mcp launchd status
 ```
 
 ```json
-// Muse: ~/.config/muse/settings.json → mcpServers
-"sim-orchestration": { "type": "streamable-http", "url": "http://127.0.0.1:3100/mcp" }
+{ "session_id": "<your session id>", "client": "claude-code", "task": "log in and screenshot" }
 ```
 
-```sh
-sim-orchestration-mcp install --client codex,muse --dry-run  # 변경 미리보기
-sim-orchestration-mcp install --client all --status          # 등록 상태만 확인
+Call `lease_acquire` with that body. With spare capacity you get a lease immediately; otherwise you get a wait ticket (`ticket_id`, `position`) — poll `queue_status` until it shows `status: "assigned"` with a `lease_id`. Drive the simulator with the `ui_*` tools, renew long work with `lease_heartbeat`, and finish with `lease_release`, which instantly dispatches the freed simulator to the first matching ticket.
+
+## Configuration
+
+`install` writes Streamable-HTTP URL entries only. Shapes verified against the real configs on macOS:
+
+```json
+{
+  "mcpServers": {
+    "apple-debug": { "type": "http", "url": "http://127.0.0.1:3100/mcp" }
+  }
+}
 ```
 
-미지원 클라이언트 이름은 "Unsupported" 오류로 끝나며 파일을 절대 건드리지 않는다.
-
-### 환경 변수
-
-| 변수 | 기본값 | 설명 |
-|---|---|---|
-| `SIM_MCP_HOST` / `SIM_MCP_PORT` | `127.0.0.1` / `3100` | 리슨 주소 |
-| `SIM_MCP_STATE_FILE` | `~/.sim-orchestration-mcp/state.json` | Lease/큐 영속 파일 |
-| `SIMSLIM_BIN` / `AXE_BIN` | `simslim` / `axe` | 바이너리 경로 |
-| `SERVE_SIM_BIN` | `serve-sim` | serve-sim 바이너리 경로 (선택 의존성) |
-| `LLMDB_BIN` | `llmdb` | llmdb 바이너리 경로 (선택 의존성) |
-| `SERVE_SIM_PORT_BASE` | `3220` | Lease 스트림 헬퍼의 시작 포트 (빈 포트 탐색) |
-| `MITMDUMP_BIN` | `mitmdump` | mitmdump 바이너리 경로 (선택 의존성) |
-| `NETPROXY_PORT_BASE` | `3240` | Lease 네트워크 프록시(mitmdump)의 시작 포트 (빈 포트 탐색) |
-| `SIM_MCP_MAX_SIMS` | `0` (무제한) | 동시 부팅 상한. 도달 시 대기열로 |
-| `SIM_MCP_LEASE_TTL_MS` | `1800000` (30분) | heartbeat 없이 유지되는 시간 |
-| `SIM_MCP_SCREENSHOT_DIR` | `$TMPDIR/sim-mcp-shots` | 스크린샷 저장 위치 |
-
-## 클라이언트 연결
-
-Streamable HTTP를 지원하는 MCP 클라이언트에서 아래 URL을 등록한다:
+Claude Code (user scope, `~/.claude.json` → `mcpServers`); manual equivalent:
 
 ```
-http://127.0.0.1:3100/mcp
+claude mcp add -s user --transport http apple-debug http://127.0.0.1:3100/mcp
 ```
 
-- **Claude Code**: `claude mcp add --transport http sim-orchestration-mcp http://127.0.0.1:3100/mcp`
-- **Orca / TMA / 기타**: 각 도구의 MCP 설정에서 위 HTTP 엔드포인트를 등록 (Streamable HTTP 방식)
+Codex (`~/.codex/config.toml`):
 
-## 사용 흐름 (에이전트용)
-
-1. `lease_acquire` — `{session_id, client, task, device?…}` 전달.
-   여유가 있으면 즉시 Lease, 없으면 대기 티켓(`ticket_id`, `position`) 반환.
-2. 티켓을 받았으면 `queue_status`로 폴링. 누군가 반납하면 자동 할당되어
-   `status: "assigned"` + `lease_id`가 보인다.
-3. `ui_*` 도구로 작업. Lease당 시뮬레이터 1대, 소유자만 조작 가능.
-4. 긴 작업은 `lease_heartbeat`로 갱신 (TTL 초과 시 자동 회수 후 큐에 재배정).
-5. 끝나면 `lease_release` — 해제 즉시 조건 맞는 첫 대기 티켓에 자동 분배.
-
-`session_id`는 호출자 도구의 세션 ID를 그대로 쓰면 된다. 서버는 형식을 강제하지 않으므로
-Orca, Claude Code, TMA, 스크립트 어디서든 `client` 라벨과 함께 쓰면 `sessions_list`에서
-"어떤 세션이 어떤 시뮬레이터에서 실행 중인지" 한눈에 보인다.
-
-## 도구 (65개)
-
-| 그룹 | 도구 |
-|---|---|
-| 풀/상태 | `pool_status`, `sessions_list`, `sim_boot`, `sim_shutdown`, `sim_slim` |
-| Lease/큐 | `lease_acquire`, `lease_release`, `lease_heartbeat`, `lease_list`, `queue_status`, `queue_cancel`, `lease_actions` |
-| UI 자동화 (Lease 필수) | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch` |
-| 기기 부가 기능 | `sim_rotate`, `sim_ca_debug`, `sim_memory_warning`, `sim_log_stream`, `sim_log_show` |
-| 합성 카메라 | `camera_start`, `camera_switch`, `camera_mirror`, `camera_status`, `camera_stop` |
-| 앱 생명주기 (Lease 필수) | `app_open_url`, `app_install`, `app_uninstall`, `app_launch`, `app_terminate` |
-| 프로파일링 (Lease 필수) | `profile_trace` |
-| 라이브 스트리밍 (Lease 필수) | `stream_start`, `stream_stop` |
-| 디버깅 (Lease 필수) | `debug_attach`, `debug_launch`, `debug_break`, `debug_continue`, `debug_run_until`, `debug_wait`, `debug_interrupt`, `debug_bt`, `debug_threads`, `debug_locals`, `debug_scopes`, `debug_expand`, `debug_eval`, `debug_set_var`, `debug_output`, `debug_step`, `debug_detach`, `debug_sessions`, `debug_doctor`, `symbolicate`(Lease 선택) |
-| 네트워크 프록시 (Lease 필수) | `net_proxy_start`, `net_proxy_set_rules`, `net_proxy_stop`, `net_proxy_status`, `net_assert_flow`, `map_local`, `map_remote` |
-
-주요 동작:
-
-- `lease_acquire`: 조건(`udid`/`device` 부분일치/`osVersion` 접두/`platform`) 매칭 → 부팅 필요 시 자동 부팅 →
-  stock이면 자동 slim(`--no-reboot`, 기존 커스텀 프로필은 건드리지 않음) → 그래도 없으면 대기열 등록.
-- `lease_release` / TTL 만료 / 외부 종료 감지 시 대기열 자동 분배 (FIFO + 조건 매칭, `auto_boot` 허용 티켓은 부팅까지).
-  참고: release는 시뮬레이터를 종료하지 않는다 (다음 대기자에게 부팅된 채로 인계). 종료가 필요하면 `sim_shutdown`을 별도 호출.
-- `sim_shutdown`은 Lease 중이면 거부 (`force=true`로 선점 가능). `sim_slim`의 리부팅 slim,
-  `sim_rotate`/`sim_ca_debug`/`sim_memory_warning`도 동일 (보유 세션을 에러에 명시).
-- `ui_screenshot`은 PNG 경로 + 이미지 블록을 함께 반환.
-- `sim_rotate`는 `portrait|portrait_upside_down|landscape_left|landscape_right`,
-  `sim_ca_debug`는 `option=blended|copies|misaligned|offscreen|slow-animations` + `enabled` 불리언.
-- `sim_log_stream`은 지정 시간(기본 5초, 최대 60초) 동안 live 로그 수집
-  (`level=default|info|debug`, 기본 `default`),
-  `sim_log_show`는 `--last` 구간(기본 `5m`)의 과거 로그 조회
-  (`info`/`debug`/`signpost` 불리언으로 상세 레벨 추가). 둘 다 `xcrun simctl spawn` 기반이라
-  serve-sim 없이도 동작한다. 결과는 `{log, truncated, timedOut}`이며,
-  `stream`은 항상 윈도우 만료로 끝나므로 `timedOut: true`가 정상이다.
-- 로그 필터: 전체 predicate(`predicate`, 예: `process == "MyApp"`) 또는 간편 지정
-  (`process`, 예: `"Preferences"`). 둘을 함께 주면 `process` 조건과 AND로 결합된다.
-  predicate는 비어 있거나 따옴표/괄호가 짝이 맞지 않으면 호출 전에 거부된다.
-  따옴표·괄호 팁: 문자열 리터럴은 큰따옴표로 감싸고(`eventMessage CONTAINS "x"`),
-  리터럴 안의 괄호는 무시되므로 `process == "My(App)"`도 유효하다.
-- 출력이 `max_chars`(기본 20000)를 넘으면 끝(tail)만 남기고, 앞에
-  `…[truncated N chars]` 접두사로 잘린 분량을 표시한다. 최신 로그가 필요한 경우가
-  대부분이므로, 좁은 윈도우(`timeout_sec`/`last`) + `process` 필터 조합을 권장한다.
-- 앱 생명주기: `app_launch {lease_id, bundle_id, args?}`(실행 후 `{pid}` 반환),
-  `app_terminate`, `app_open_url {url}`(스톡 핸들러, 예: https → Safari),
-  `app_install {app_path}`, `app_uninstall {bundle_id}`. 전부 `xcrun simctl`
-  기반이라 추가 의존성이 없고, Lease 소유자만 호출 가능하며 `lease_actions`에
-  기록된다. `terminate`는 실행 중이 아닌 앱에 "found nothing to terminate"으로
-  실패하고, `uninstall`은 존재하지 않는 번들도 조용히 성공(idempotent)한다.
-- 프로파일링: `profile_trace {lease_id, duration_sec?(기본 5, 최대 60),
-  template?(기본 "Time Profiler"), attach?, output_dir?}` —
-  `xcrun xctrace record --device`로 `.trace` 파일을 저장한다. `--attach`는
-  시뮬레이터 앱 프로세스를 찾지 못하는 경우가 많아("Cannot find process")
-  기본은 전체 프로세스 기록이다. 참고: 이 호스트 계열에서는 시뮬레이터 대상
-  녹화가 "Starting recording..."에서 멈추는 것이 확인되어(호스트 녹화는 정상),
-  스모크 테스트는 검증 경로만 단언하고 실제 녹화는 호출하지 않는다.
-- 합성 카메라: `camera_start {udid, bundle_id, source?}`로 앱을 합성 피드와 함께 실행
-  (`source=placeholder|webcam|file`, `file`은 이미지/동영상 경로, `webcam`은
-  `serve-sim camera --list-webcams`의 이름). 실행 중 피드는 `camera_switch`로 교체,
-  미리보기 반전은 `camera_mirror {mode=auto|on|off}`, 상태는 `camera_status`
-  (`{alive:false}`면 미실행), 종료는 `camera_stop`(idempotent). 시작/전환은 앱 내용에
-  영향을 주므로 Lease 중이면 `force=true` 없이 거부되고, `mirror`/`status`/`stop`은
-  Lease와 무관하게 동작한다. 전체 E2E는 디버깅 가능한(get-task-allow) 앱이 있어야
-  가능하며, 스톡 Apple 앱은 dylib 주입을 거부한다.
-- 모든 `ui_*` 호출과 serve-sim 3종은 Lease별 인메모리 액션 링(최근 100개)에 한 줄 요약으로 기록되며,
-  `lease_actions`로 조회한다. Lease 해제 시 링도 함께 버려진다.
-- 스트리밍은 opt-in: `lease_acquire`의 `stream: true` (실패해도 경고만 남기고 Lease는 유효) 또는
-  `stream_start`/`stream_stop` (둘 다 idempotent). 스트림 URL은 Lease의 `streamUrl`에 저장되어
-  `pool_status`/`sessions_list`/`lease_list`에 그대로 보인다. `stream_start`는 실행 중인 스트림이
-  있으면 기존 URL을 그대로 반환한다.
-- 디버깅: `debug_attach {lease_id, bundle_id|pid}`(또는 바이너리 경로로
-  `debug_launch {lease_id, path, args?}`)로 Lease당 1개 llmdb 세션을 열고,
-  `debug_break {file, line, condition?, hit_condition?}`(또는 `list=true`/
-  `delete=<id>`/`exception=[...]`, 호출당 정확히 1개 op) →
-  `debug_continue {wait_sec?}`/`debug_run_until {file, line}`/`debug_wait
-  {timeout?}`/`debug_interrupt` → `debug_bt {depth?, thread?}`/`debug_threads`/
-  `debug_locals`/`debug_scopes {frame?}`/`debug_expand {ref}`/
-  `debug_eval {expr}`/`debug_set_var {target, value}`/`debug_output {clear?}`/
-  `debug_step {mode?}`로 중단점·중단·검사를 수행한다. 종료는
-  `debug_detach`(idempotent), 진단은 `debug_sessions`/`debug_doctor`.
-  `symbolicate {pcs, binary, arch?, load_addr?, lease_id?}`는 atos 기반
-  크래시 심볼리케이션(호스트 로컬, Lease는 선택). 세션 ID는 Lease 레코드에
-  저장되며, `lease_release`/TTL 만료/스윕/외부 종료 감지 시 자동
-  detach된다(실패해도 해제는 성공). 전제 조건: 디버깅 가능한(get-task-allow)
-  빌드 + 호스트의 1회성 개발자 도구 인증 — 스톡 Apple 앱은 attach를 거부한다.
-  llmdb 0.2.0의 `break set`은 `file:line`만 받으므로 심볼 브레이크포인트는
-  미지원이고, `expand`는 식이 아니라 variablesReference 숫자를 받으며,
-  `launch`는 번들 ID가 아니라 바이너리 경로만 받는다.
-- 네트워크 프록시: `net_proxy_start {lease_id, rules?}`로 Lease 시뮬레이터의 HTTPS를
-  가로채고(`mitmdump` + 생성된 rewrite addon + 시뮬레이터 키체인에 mitm CA 설치),
-  `net_proxy_set_rules {rules}`로 규칙 교체(같은 포트에서 mitmdump만 재시작),
-  `net_proxy_stop`(idempotent)으로 종료 + 호스트 프록시 스냅샷 복원,
-  `net_proxy_status`로 상태/홀더 확인. 규칙은
-  `match{url_regex?, method?}` → `action{status?, headers?, body?, delay_ms?,
-  request?, map_local?, map_remote?}` (첫 매칭 우선). `request{method?, url?,
-  headers?, body?}`는 전달 전 요청 방향 rewrite, `map_local {file}`은 로컬
-  파일 서빙(읽기 실패 시 502), `map_remote {url}`은 업스트림 URL 고정
-  rewrite — `map_local`/`map_remote` 도구는 같은 패턴의 기존 맵을 교체하고
-  아니면 맨 앞에 삽입한다. 모든 요청은 flow 로그(JSONL)에 기록되며,
-  `net_assert_flow {url_regex, method?, min_count?, timeout_sec?}`로
-  홀더가 폴링 단언한다(프록시 미보유 시 깔끔하게 실패).
-  **호스트 프록시는 전역**이라 홀더는 Lease당 1개 — 다른 Lease가 잡고 있으면
-  보유 세션을 명시한 에러로 거부된다. `lease_release`/TTL 만료/스윕/외부 종료
-  감지 시 홀더의 프록시는 자동 종료된다 (실패해도 해제는 성공). 규칙 검증은
-  어떤 호스트 변경보다 먼저 수행되므로, 잘못된 규칙은 호스트 네트워크를
-  건드리지 않고 거부된다. 프로세스 단위 가로채기(`mitmdump --mode
-  local:…`)는 스파이크에서 macOS System Extension 승인 차단으로 미실증되어
-  host 모드만 제공한다.
-
-## 라이브 스트리밍
-
-Lease별 MJPEG 화면 스트림. 사람이 보거나 VLM이 확인할 때만 켜는 것을 권장한다.
-
-- 시작: `lease_acquire {…, stream: true}` 또는 `stream_start {lease_id}` →
-  `http://127.0.0.1:<port>/helper/<udid>/stream.mjpeg` 형태의 URL 반환
-- 포트: `SERVE_SIM_PORT_BASE`(기본 `3220`)부터 빈 포트를 위로 탐색해 Lease마다 별도 serve-sim
-  헬퍼를 띄운다. serve-sim 기본값(`:3100`, 데몬 기본 포트와 충돌!)과 프리뷰(`:3200`)를 피한다.
-  참고로 serve-sim은 지정 포트가 점유 중이면 스캔 대신 점유 프로세스를 kill하므로, 빈 포트
-  탐색은 필수다.
-- 종료: `stream_stop {lease_id}`. `lease_release`/TTL 만료/스윕/외부 종료 감지 시에도 자동 종료된다.
-  대기 티켓에 `stream: true`가 있으면 디스패치 시 자동 시작 (실패 시 assignment의 `streamError`에 기록).
-- 리소스: 스트림 1개당 serve-sim 헬퍼 프로세스 1개 + MJPEG 인코딩 CPU가 든다. 장시간 켜 두면
-  배터리/CPU를 소모하므로, 볼 때만 켜고 끝나면 끄자. 스트리밍 없이 스크린샷만 필요하면
-  `ui_screenshot`이 가볍다.
-
-## 합성 카메라
-
-serve-sim의 simcam 헬퍼로 시뮬레이터 앱에 가짜 카메라 피드를 주입한다. 호스트 헬퍼가
-BGRA 프레임을 공유 메모리에 쓰고, dylib가 AVFoundation을 가로채 앱이 읽게 한다.
-
-- 시작: `camera_start {udid, bundle_id, source?}` — 앱을 재실행하므로 **디버깅 가능한
-  (get-task-allow) 빌드가 필수**다. 스톡 Apple 앱은 dylib 주입을 거부해서 실패한다.
-  `source`는 `placeholder`(기본 애니메이션) | `webcam`(호스트 카메라) | `file`
-  (이미지/동영상, 종류 자동 판별).
-- 교체: `camera_switch {udid, source, file?}` — 앱 재실행 없이 피드만 핫스왑.
-- 반전: `camera_mirror {udid, mode}` — 미리보기만 `auto|on|off`, 데이터 버퍼는 미반전.
-- 상태/종료: `camera_status {udid}`(미실행 시 `{alive:false}`), `camera_stop {udid}`
-  (idempotent, 주입된 앱도 함께 종료).
-- Lease 게이트: `start`/`switch`는 Lease 중이면 `force=true` 없이 거부(보유 세션 명시),
-  `mirror`/`status`/`stop`은 Lease와 무관.
-
-수동 확인 (디버깅 가능한 앱이 있을 때):
-
-```sh
-serve-sim camera --list-webcams
-serve-sim camera com.example.DebugApp -d <udid> --webcam   # 또는 --file ~/x.png
-serve-sim camera status -d <udid>
-serve-sim camera switch placeholder -d <udid>
-serve-sim camera mirror on -d <udid>
-serve-sim camera --stop-webcam -d <udid>
+```toml
+[mcp_servers.apple-debug]
+url = "http://127.0.0.1:3100/mcp"
 ```
 
-참고: serve-sim 0.1.48에서 `-q/--quiet`는 camera 하위 명령에 효과가 없다(전역 옵션으로
-먼저 소비됨). 시작/전환/반전/종료 출력은 사람이 읽는 텍스트이며, JSON으로 파싱되는 것은
-`status`와 `--list-webcams`(TSV)뿐이다.
+Muse (`~/.config/muse/settings.json` → `mcpServers`):
 
-## 디버깅 (llmdb)
-
-llmdb CLI(lldb-dap 래퍼, 세션형 JSON 출력)를 Lease 단위로 감싼 도구들이다.
-시뮬레이터 앱은 일반 macOS 프로세스라 debugserver 없이 직접 attach한다.
-
-- 전제 조건 (3가지가 모두 필요):
-  1. 디버깅 가능한 빌드 — `get-task-allow=true` (Xcode 디버그 빌드 기본값).
-     릴리스/Hardened Runtime 빌드는 attach 불가.
-  2. 호스트 1회성 인증 — 처음 attach할 때 macOS가 "개발자 도구" 접근 승인을
-     요구한다. 이 호스트에서는 아직 승인되지 않아 attach가 거부된다.
-  3. 서드파티 앱 — 스톡 Apple 앱(설정, Safari 등)은 attach를 거부한다.
-     위 이유로 스모크 테스트는 검증 경로만 단언하고 실제 attach는 호출하지 않는다.
-- 흐름: `app_launch`로 앱 실행 → `debug_attach {bundle_id}`(또는
-  `debug_launch {path, args?}`로 직접 실행) → `debug_break {file, line}` →
-  `debug_continue` → `debug_bt`/`debug_locals`/`debug_eval {expr}`/
-  `debug_step {mode=over|in|out}` → `debug_detach`.
-- `bundle_id`(부팅된 시뮬레이터에서 simctl로 해석) 또는 `pid`(호스트 프로세스)
-  중 정확히 하나를 지정한다. 둘 다 주거나 둘 다 생략하면 거부된다.
-- Lease당 세션 1개: 재-attach/재-launch하면 이전 세션을 정리(best-effort)하고
-  교체한다. `debug_continue {wait_sec}`(기본 60, 최대 600)는 다음 중단까지
-  블로킹되며, 실행 타임아웃은 대기 시간 + 30초 여유로 자동 설정된다.
-- 라운드 2: `debug_run_until {file, line, wait_sec?}`(중단점+계속),
-  `debug_wait {timeout?}`(실행 종료까지 블로킹), `debug_interrupt`(실행 중
-  일시정지), `debug_threads` + `debug_bt {thread?}`, `debug_scopes {frame?}`/
-  `debug_expand {ref}`(variablesReference 숫자 — 식이 아님),
-  `debug_set_var {target, value, frame?}`, `debug_output {clear?}`,
-  `debug_sessions`/`debug_doctor`(세션 없이 호출 가능).
-  `debug_break`는 호출당 1개 op: set(`file`+`line`, 선택 `condition`/
-  `hit_condition`) · `list=true` · `delete=<id>` · `exception=[필터…]`
-  (`[]`면 해제). 모든 argv는 llmdb 0.2.0 `--help`와 대조 검증됐다.
-- `symbolicate {pcs, binary, arch?, load_addr?, lease_id?}`: `atos -o` 기반.
-  시뮬레이터를 건드리지 않는 호스트 로컬 읽기 전용이라 `lease_id`는 선택
-  (주면 검증+기록)이며 udid/force 게이트는 없다. `binary`는 사실상 필수
-  (live-pid 모드 미노출).
-- 수동 확인 (디버깅 가능한 앱 + 호스트 인증이 있을 때):
-
-```sh
-llmdb doctor
-llmdb attach --app com.example.DebugApp   # → {"sessionId": ...}
-llmdb break set ./Sources/App/main.swift:34 --session <id>
-llmdb continue --session <id>
-llmdb bt --session <id>
-llmdb stop --session <id>
+```json
+"apple-debug": { "type": "streamable-http", "url": "http://127.0.0.1:3100/mcp" }
 ```
 
-## 네트워크 프록시 (mitm)
+Preview or inspect without writing:
 
-Lease 시뮬레이터의 HTTPS 트래픽을 가로채 응답을 고쳐 쓰는 도구들이다.
-시뮬레이터 트래픽 MITM이 종단간 실증된 메커니즘 그대로만 구현되어 있다.
+```
+apple-debug-mcp install --client codex,muse --dry-run  # preview the change
+apple-debug-mcp install --client all --status          # registration status only
+```
 
-- 동작 방식: `net_proxy_start`는 (1) 모든 네트워크 서비스의 프록시 설정을
-  스냅샷하고, (2) Lease 시뮬레이터 키체인에 mitm CA를 설치하고
-  (`xcrun simctl keychain <udid> add-root-cert`), (3) `NETPROXY_PORT_BASE`(기본
-  `3240`)부터 빈 포트를 탐색해 규칙이 박힌 addon과 함께 `mitmdump -p <port> -s`
-  를 띄우고, (4) 마지막으로 **모든 서비스의 호스트 웹 프록시를 mitmdump로
-  켠다**(`sudo -n networksetup -setwebproxy/-setsecurewebproxy` +
-  `-setwebproxystate/-setsecurewebproxystate on`). 종료는 역순: 호스트 스냅샷
-  복원 → mitmdump 종료 → addon 삭제.
-- 규칙: `match{url_regex?, method?}` → `action{status?, headers?, body?,
-  delay_ms?, request?, map_local?, map_remote?}`. 모든 요청은 일단 flow
-  로그(JSONL, `net_proxy_status`의 `flow_log_path`)에 기록되고, 첫 번째로
-  매칭된 규칙이 요청을 고쳐 쓰고(`request{method?, url?, headers?, body?}`,
-  `map_remote` URL 고정 rewrite) 전달한 뒤 응답을 변형한다(status 교체,
-  headers 병합, body 교체 + content-encoding 제거, 요청 전달 전 delay).
-  `map_local`은 업스트림 없이 로컬 파일을 서빙한다(읽기 실패 시 502).
-  `match` 생략 = 전체 매칭, `rules: []` = 가로채기+로깅만(투명 모드).
-  최대 50개.
-- 라운드 2: `net_assert_flow {url_regex, method?, min_count?(기본 1),
-  timeout_sec?(기본 5, 최대 120)}`는 홀더의 flow 로그를 폴링해 매칭 요청을
-  단언한다(미달이면 실패, 프록시 미보유면 깔끔한 에러).
-  `map_local {url_regex, file}`/`map_remote {url_regex, url}`은 맵 규칙을
-  교체-삽입(upsert: 같은 패턴+같은 종류면 교체, 아니면 맨 앞 삽입 —
-  mitmdump 내장 `--map-local/--map-remote` 옵션 대신 기존 재시작 경로를 재
-  사용하는 addon 확장으로 구현). 맵 규칙은 홀더 검사보다 검증을 먼저
-  수행하므로 잘못된 파일/URL/정규식은 프록시 없이도 거부된다.
-- local 모드 미제공 노트: 프로세스 단위 가로채기(`mitmdump --mode
-  local:MobileSafari` 등, 이름·PID·부정·콤마 리스트 문법 확인)를 스파이크
-  했으나, macOS System Extension(`org.mitmproxy.macos-redirector`)의 사용자
-  수동 승인이 필요해 CI/무인 환경에서 터널이 성립하지 않았다("Control
-  channel connected" 미도달, 트래픽 0). 승인 전까지는 실증 불가이므로
-  `mode: host|local` 분기는 구현하지 않고 host 모드(host `networksetup`
-  전역 토글)만 제공한다. 승인이 갖춰진 호스트에서 재실증되면 addon·flow
-  로그·assert/map 경로는 그대로 local 모드에도 재사용 가능하다.
-- 전제 조건 (2가지가 모두 필요):
-  1. `mitmdump` 설치 (`brew install mitmproxy`, 선택 의존성 — 없으면 데몬은
-     경고만 남기고 뜨고, `net_proxy_*` 호출 시 설치 힌트와 함께 실패).
-     CA(`~/.mitmproxy/mitmproxy-ca-cert.pem`)는 mitmdump 첫 실행 시 자동 생성된다.
-  2. 호스트 프록시 제어용 passwordless sudo — 딱 4개 하위 명령에만 필요:
-     `networksetup -setwebproxy/-setsecurewebproxy/-setwebproxystate/-setsecurewebproxystate`.
-     데몬 시작 시에는 점검하지 않고(모든 `-set*`이 호스트 상태를 바꾸므로),
-     `net_proxy_start` 호출 시점에 실패하면 sudoers 안내와 함께 거부된다.
-- ⚠️ HOST-WIDE 경고: 프록시가 켜져 있는 동안은 **호스트 전체의 웹 트래픽**
-  (다른 앱 백그라운드 통신 포함)이 mitmdump를 통과한다. 사설 CA를 쓰는 호스트
-  내부망 사이트는 mitm 검증 실패로 깨질 수 있다(종료·복원 시 정상화).
-  꼭 필요한 동안만 켜고 끝나면 바로 끄자. 홀더는 전체 Lease 중 1개뿐이며,
-  다른 Lease가 잡고 있으면 보유 세션·Lease를 명시한 에러로 거부된다.
-- 잔류물(leakage) 노트: 종료해도 시뮬레이터 키체인의 mitm CA는 남는다
-  (프록시 없이는 무해하며, 완전 제거는 `xcrun simctl keychain <udid> reset`).
-  데몬이 SIGKILL 등으로 비정상 종료되면 호스트 프록시가 켜진 채로 남을 수 있다.
-  수동 복구:
-  ```sh
-  pkill -f "mitmdump -p "   # mitmdump 종료
-  networksetup -listallnetworkservices | tail -n +2 | while IFS= read -r svc; do
-    svc="${svc#\*}"   # 비활성 표시(*) 제거
-    sudo networksetup -setwebproxystate "$svc" off
-    sudo networksetup -setsecurewebproxystate "$svc" off
-  done
-  ```
-  정상 종료(SIGINT/SIGTERM)·`lease_release`·TTL 만료·스윕·외부 종료 감지 시에는
-  자동 복원된다(복원 실패가 해제를 막지는 않는다).
-- 스모크 테스트는 호스트 네트워크를 절대 건드리지 않는다: 정지 상태 확인 +
-  Lease 게이트 + 규칙 검증 경로만 단언한다.
+Unknown client names fail as "Unsupported" without touching any file. Every edited config is backed up to `<config>.bak-sim-mcp` first (created once, never overwritten).
 
-## 개발
+Environment variables (all optional):
 
-```sh
-npm test        # 단위 테스트 (orchestrator/래퍼/store/CLI·launchd·doctor·install)
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SIM_MCP_HOST` / `SIM_MCP_PORT` | `127.0.0.1` / `3100` | Listen address |
+| `SIM_MCP_STATE_FILE` | `~/.apple-debug-mcp/state.json` | Lease/queue persistence file |
+| `SIMSLIM_BIN` / `AXE_BIN` | `simslim` / `axe` | Binary paths |
+| `SERVE_SIM_BIN` | `serve-sim` | serve-sim binary path (optional dependency) |
+| `LLMDB_BIN` | `llmdb` | llmdb binary path (optional dependency) |
+| `MITMDUMP_BIN` | `mitmdump` | mitmdump binary path (optional dependency) |
+| `SERVE_SIM_PORT_BASE` | `3220` | First port scanned for per-lease stream helpers |
+| `NETPROXY_PORT_BASE` | `3240` | First port scanned for the lease-held proxy listener |
+| `SIM_MCP_MAX_SIMS` | `0` (uncapped) | Cap on concurrently booted simulators; excess waits |
+| `SIM_MCP_LEASE_TTL_MS` | `1800000` (30 min) | Lease survival without a heartbeat |
+| `SIM_MCP_SWEEP_MS` | `60000` (60 s) | Lease/queue sweep interval |
+| `SIM_MCP_EXEC_TIMEOUT_MS` | `60000` (60 s) | Helper child-process timeout |
+| `SIM_MCP_BOOT_TIMEOUT_MS` | `600000` (10 min) | Simulator boot timeout |
+| `SIM_MCP_SCREENSHOT_DIR` | `$TMPDIR/sim-mcp-shots` | Screenshot storage |
+| `SIM_MCP_DAEMON_PATH` | _(unset)_ | Override the daemon entry the plist launches |
+
+## Upgrade
+
+```
+git pull
+npm install
+npm run build
+npm install -g .   # when the launchd plist points at the npm-global bin
+apple-debug-mcp launchd restart        # refused while leases are held; --force overrides
+apple-debug-mcp launchd status         # loaded + /health + version
+```
+
+Re-running `launchd create` regenerates the plist while preserving its port/host. A hand-edited plist shows a diff and is never overwritten without `--force`.
+
+## Uninstall
+
+```
+apple-debug-mcp install --client all --remove  # unregister from client configs
+apple-debug-mcp launchd remove                 # unload + delete the plist
+npm uninstall -g apple-debug-mcp               # when installed via npm-global
+```
+
+## Migrate from sim-orchestration-mcp
+
+The pre-rename install used the launchd label `com.sim-orchestration-mcp`, the state dir `~/.sim-orchestration-mcp`, and the client keys `sim-orchestration-mcp` / `sim-orchestration`. Migration is three parts: the state dir and client keys move automatically, the live launchd job needs two commands by hand because this tool never unloads another daemon on its own.
+
+1. Stop and delete the legacy launchd job (exact commands — `launchd create` refuses until this is done, and `--force` never bypasses it):
+
+```
+launchctl unload ~/Library/LaunchAgents/com.sim-orchestration-mcp.plist
+rm ~/Library/LaunchAgents/com.sim-orchestration-mcp.plist
+```
+
+If the plist file is already gone but the job is still loaded, use `launchctl remove com.sim-orchestration-mcp` instead of the `unload` line.
+
+2. Run anything once: the first start of the new daemon or CLI moves `~/.sim-orchestration-mcp` to `~/.apple-debug-mcp` (logged, idempotent; it never merges into an existing new dir).
+3. Re-run install: `apple-debug-mcp install --client all` adds the uniform `apple-debug` entry and removes the legacy keys from each client's config in the same write.
+
+Then proceed with [Install](#install) step 5 (`launchd create`).
+
+## Tools
+
+65 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
+
+| Group | Tools |
+| --- | --- |
+| Pool/state (5) | `pool_status`, `sessions_list`, `sim_boot`, `sim_shutdown`, `sim_slim` |
+| Lease/queue (7) | `lease_acquire`, `lease_release`, `lease_heartbeat`, `lease_list`, `queue_status`, `queue_cancel`, `lease_actions` |
+| UI automation (8) \* | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch` |
+| Device extras (5) | `sim_rotate`, `sim_ca_debug`, `sim_memory_warning`, `sim_log_stream`, `sim_log_show` |
+| Synthetic camera (5) | `camera_start`, `camera_switch`, `camera_mirror`, `camera_status`, `camera_stop` |
+| App lifecycle (5) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_launch`, `app_terminate` |
+| Profiling (1) \* | `profile_trace` |
+| Live streaming (2) \* | `stream_start`, `stream_stop` |
+| Debugging (20) \* | `debug_attach`, `debug_launch`, `debug_break`, `debug_continue`, `debug_run_until`, `debug_wait`, `debug_interrupt`, `debug_bt`, `debug_threads`, `debug_locals`, `debug_scopes`, `debug_expand`, `debug_eval`, `debug_set_var`, `debug_output`, `debug_step`, `debug_detach`, `debug_sessions`, `debug_doctor`, `symbolicate` (lease optional) |
+| Network proxy (7) \* | `net_proxy_start`, `net_proxy_set_rules`, `net_proxy_stop`, `net_proxy_status`, `net_assert_flow`, `map_local`, `map_remote` |
+
+Key behaviors:
+
+- `lease_acquire`: matches conditions (`udid` / `device` substring / `osVersion` prefix / `platform`), auto-boots when needed, auto-slims stock simulators (`--no-reboot`, custom profiles untouched), else enqueues a ticket.
+- `lease_release`, TTL expiry, and external-shutdown detection auto-dispatch the freed simulator to the first matching ticket (FIFO; `auto_boot` tickets may boot one). Release does not shut the simulator down — it hands over booted; call `sim_shutdown` separately to stop it.
+- `sim_shutdown` refuses on a held simulator unless `force=true`; rebooting `sim_slim`, `sim_rotate`, `sim_ca_debug`, and `sim_memory_warning` behave the same, naming the holder in the error. `camera_start`/`camera_switch` are lease-gated the same way; `camera_mirror`/`camera_status`/`camera_stop` ignore leases.
+- `ui_screenshot` returns a PNG path plus an image block. `sim_rotate` takes `portrait|portrait_upside_down|landscape_left|landscape_right`; `sim_ca_debug` takes `option=blended|copies|misaligned|offscreen|slow-animations` plus an `enabled` boolean.
+- `sim_log_stream` collects live logs for a window (default 5s, max 60s), `sim_log_show` reads the past `--last` window (default `5m`); both are `xcrun simctl spawn`-based, so they need no serve-sim. Results are `{log, truncated, timedOut}` — `stream` always ends on window expiry, so `timedOut: true` is normal.
+- Log filters: a full predicate (`predicate`, e.g. `process == "MyApp"`) or the `process` shorthand; both combine with AND. Predicates are rejected before the call when empty or unbalanced. Quote string literals with double quotes (`eventMessage CONTAINS "x"`); parens inside literals are ignored, so `process == "My(App)"` is valid.
+- Output past `max_chars` (default 20000) keeps the tail with a `…[truncated N chars]` prefix. Prefer a narrow window (`timeout_sec`/`last`) plus a `process` filter.
+- App lifecycle is `xcrun simctl`-based with no extra dependencies: `app_launch` returns `{pid}`; `terminate` fails on a non-running app ("found nothing to terminate"); `uninstall` quietly succeeds on a missing bundle (idempotent). Every call is recorded in `lease_actions`.
+- `profile_trace` records with `xcrun xctrace record --device` into a `.trace` file (default template "Time Profiler", default 5s, max 60s). `--attach` often cannot find the simulator process ("Cannot find process"), so whole-system recording is the default. Note: on this host family simulator-target recording stalls at "Starting recording..." (host recording works), so the smoke test asserts the validation path only.
+- Streaming is opt-in: `lease_acquire` with `stream: true` (a stream failure only warns; the lease stands) or `stream_start`/`stream_stop` (both idempotent; `stream_start` returns the existing URL when already streaming). The URL lives on the lease's `streamUrl`, visible in `pool_status`/`sessions_list`/`lease_list`. One stream costs one serve-sim helper process plus MJPEG CPU — turn it on to look, off when done; `ui_screenshot` is cheaper for stills. Ports scan upward from `SERVE_SIM_PORT_BASE` because serve-sim kills whatever occupies its requested port instead of scanning (and its `:3100` default would collide with this daemon).
+- Debugging wraps the llmdb CLI (an lldb-dap wrapper with session JSON): `debug_attach {bundle_id|pid}` (exactly one) or `debug_launch {path, args?}` opens one session per lease, then break/continue/inspect. Needs a debuggable (`get-task-allow`) third-party build plus one-time host developer-tools authorization — stock Apple apps refuse attach. llmdb 0.2.0 takes `file:line` breakpoints only (no symbol breakpoints), `expand` takes a variablesReference number (not an expression), and `launch` takes a binary path (not a bundle ID).
+- `symbolicate` is `atos`-based host-local crash symbolication: `lease_id` is optional (validated and logged when given), with no udid/force gates. `binary` is effectively required (no live-pid mode).
+- Network proxy: `net_proxy_start {lease_id, rules?}` intercepts the lease simulator's HTTPS (mitmdump + generated rewrite addon + mitm CA into the simulator keychain); `net_proxy_set_rules` swaps rules (restarts only mitmdump, same port); `net_proxy_stop` is idempotent and restores the host proxy snapshot; `net_assert_flow` polls the holder's flow log (JSONL). Rules are `match{url_regex?, method?}` → `action{status?, headers?, body?, delay_ms?, request?, map_local?, map_remote?}`, first match wins, max 50; omitted `match` matches everything, `rules: []` is transparent intercept-and-log. See [Security](#security) for the host-wide warning and consent boundary.
+
+## Usage examples
+
+> "Boot a simulator, hold it, and tap through login."
+
+```json
+{ "session_id": "sess-1", "client": "claude-code", "task": "login flow", "device": "iPhone 16" }
+```
+
+```json
+{ "lease_id": "<from lease_acquire>" }
+```
+
+```json
+{ "lease_id": "<lease>", "label": "Continue" }
+```
+
+That is `lease_acquire`, then `ui_describe`, then `ui_tap` on the named element (`label` matches the accessibility label; `ui_button` is for hardware buttons only). Finish with `lease_release`.
+
+> "Record a 10-second Time Profiler trace of the app under test."
+
+```json
+{ "lease_id": "<lease>", "duration_sec": 10 }
+```
+
+That is `profile_trace`; the result carries the `.trace` path.
+
+> "Rewrite one API response to a fixture file while the test runs."
+
+```json
+{ "lease_id": "<lease>", "rules": [{ "match": { "url_regex": "api\\.example\\.com/v1/feed" }, "action": { "map_local": "/tmp/feed.json" } }] }
+```
+
+```json
+{ "lease_id": "<lease>", "url_regex": "api\\.example\\.com/v1/feed", "min_count": 1 }
+```
+
+That is `net_proxy_start`, then `net_assert_flow` to prove the app hit the endpoint. Stop with `net_proxy_stop` as soon as the test is done.
+
+## Instructions for AI agents
+
+- There must be exactly one shared daemon. Never start a per-session stdio server — the pool and queue would not be shared. If `/health` is unreachable, say so instead of working around it with direct `simctl`.
+- Pass your tool's session ID as `session_id` with a `client` label so `sessions_list` shows who runs where. The server does not enforce the format.
+- A wait ticket is normal. Poll `queue_status`; do not boot simulators out of band to skip the line.
+- Only the holding lease may call that lease's gated tools. On a holder-mismatch error, stop and report the holder — do not retry with `force=true` unless the user asked for preemption.
+- Renew long work with `lease_heartbeat` before the TTL (default 30 min) expires; expired leases are reclaimed and redispatched.
+- Release with `lease_release` when done. Release hands the simulator over booted — shut it down with `sim_shutdown` only if the task needs it stopped.
+- Turn the proxy and streams off when done: `net_proxy_stop`, `stream_stop`. Both cost host-wide resources while on.
+
+## Troubleshooting
+
+Start with `doctor` — every failure prints its exact fix:
+
+```
+apple-debug-mcp doctor
+apple-debug-mcp launchd status   # plist present? loaded? /health reachable (which version)?
+tail -f ~/.apple-debug-mcp/daemon.log
+```
+
+Common failures:
+
+- `/health` unreachable but the plist is loaded: the daemon crashed at boot — the log shows why (missing `simslim`/`axe` is the usual cause).
+- Port conflict: the daemon exits `10` when the port is taken, `11` when another daemon holds the lockfile (generic failures exit `1`). Restart via `apple-debug-mcp launchd restart`, never by launching a second daemon.
+- `launchd create` refuses with a legacy `com.sim-orchestration-mcp` install: follow [Migrate from sim-orchestration-mcp](#migrate-from-sim-orchestration-mcp) — it never unloads the old job for you.
+- `launchd restart` refuses with active leases: wait for release or re-run with `--force` (drops in-flight work).
+- Hand-edited plist: `create`/`remove` show a diff and refuse without `--force`.
+- `install` reports "already installed" on the second run — that is the idempotent success path, not an error.
+- Optional-tool failure naming `serve-sim`, `llmdb`, or `mitmdump`: install that binary (see [Prerequisites](#prerequisites)); the daemon runs fine without it otherwise.
+- `debug_attach` refused: the build needs `get-task-allow`, the host needs its one-time developer-tools approval, and stock Apple apps always refuse.
+- Host proxy left on after a daemon crash (SIGKILL skips cleanup): kill mitmdump and switch every service off by hand:
+
+```
+pkill -f "mitmdump -p "
+networksetup -listallnetworkservices | tail -n +2 | while IFS= read -r svc; do
+  svc="${svc#\*}"   # strip the disabled marker
+  sudo networksetup -setwebproxystate "$svc" off
+  sudo networksetup -setsecurewebproxystate "$svc" off
+done
+```
+
+Normal shutdown (SIGINT/SIGTERM), `lease_release`, TTL expiry, sweeps, and external-shutdown detection all restore the snapshot automatically.
+
+## Security
+
+- **Lease-gated mutation.** UI, apps, profiling, streaming, debugging, and the proxy all require the holding `lease_id`; cross-lease calls fail naming the holder. Only one proxy holder exists across all leases.
+- **sudo is narrow and explicit.** Host proxy control needs passwordless sudo for exactly four `networksetup` subcommands — `-setwebproxy`, `-setsecurewebproxy`, `-setwebproxystate`, `-setsecurewebproxystate` — always as `sudo -n` (never interactive). Reads (`-listallnetworkservices`, `-getwebproxy`/`-getsecurewebproxy`) need no sudo. Nothing is checked or changed at daemon boot, because every `-set*` mutates host state; `net_proxy_start` fails with a sudoers-setup hint when authorization is missing.
+- **Rules validate before any host change.** A bad rule is rejected without touching host networking.
+- **Host-wide proxy warning.** While the proxy is on, all host web traffic (including other apps' background traffic) flows through mitmdump, and intranet sites on a private CA may break until stop/restore. Keep it on only as long as the test needs. The mitm CA stays in the simulator keychain after stop (harmless without the proxy; full removal is `xcrun simctl keychain <udid> reset`).
+- **No silent destructive actions.** `doctor` is read-only (no `--fix`); restart refuses under active leases; hand-edited plists need `--force`; the legacy launchd job is never auto-unloaded; local-only mode exists because process-scoped interception (`mitmdump --mode local:…`) needs a manually approved macOS System Extension and is unverifiable in unattended environments, so only host mode ships.
+- **Localhost only by default.** The daemon binds `127.0.0.1:3100`; the MCP endpoint has no authentication, so do not rebind it to a shared interface.
+
+## What this is not
+
+This is a local, single-host debug daemon. It manages simulators on the Mac it runs on, keeps its state in a local JSON file, and serves MCP over unauthenticated localhost HTTP. It is not a multi-host device farm, not a CI XCTest runner, and not a general macOS automation server — the tools cover the simulator debug loop (boot, lease, drive UI, profile, debug, intercept) and project their results down to what a model can usefully read.
+
+It is also not a simulator runtime itself. Booting, slimming, and UI driving delegate to simslim, AXe, serve-sim, llmdb, and the Xcode toolchain; when those drift, `doctor` and the weekly CI smoke run are the early warning.
+
+## Development
+
+Requires Node.js 18 or later, macOS + Xcode for anything past unit tests.
+
+```
+npm install
+npm test        # unit tests (orchestrator/wrappers/store/CLI/launchd/doctor/install/…)
 npm run typecheck
-npm run smoke   # 실제 시뮬레이터 E2E (데몬 기동→부팅→큐→분배→종료)
-npm run dev     # tsx 핫 실행
+npm run smoke   # live-simulator E2E (daemon boot → boot → queue → dispatch → shutdown)
+npm run dev     # tsx hot run
 ```
 
-## CI
+| Command | What it does |
+| --- | --- |
+| `npm test` | Runs the suite. This is the one to run. |
+| `npm run typecheck` | Types only, no emit. |
+| `npm run build` | Compile to `dist/`. |
+| `npm run smoke` | Live E2E against real simulators. Needs macOS + Xcode + simslim/axe. |
 
-- `check` (Linux, 모든 PR/푸시): typecheck + 단위 테스트 + 빌드
-- `smoke-macos` (main 푸시·매주 월요일·수동·`run-smoke` 라벨 PR): simslim·axe를 brew로 설치해
-  실제 시뮬레이터 스모크 — 외부 CLI/Xcode 드리프트를 조기 발견
-- Dependabot이 npm·GitHub Actions 업데이트 PR을 주 1회 생성
+CI has two jobs: `check` (Linux, every PR/push: typecheck + unit tests + build) and `smoke-macos` (main pushes, weekly Mondays, manual dispatch, and PRs labeled `run-smoke`: installs simslim/axe via brew and runs the live smoke to catch external CLI/Xcode drift early). Dependabot opens weekly npm and GitHub Actions update PRs.
 
-구조: `src/index.ts`(HTTP 데몬/세션 map) · `src/server.ts`(MCP 도구 정의) ·
-`src/orchestrator.ts`(acquire/release/dispatch) · `src/store.ts`(JSON 영속화) ·
-`src/simslim.ts` · `src/axe.ts` · `src/servesim.ts` · `src/simlog.ts` · `src/simapps.ts` · `src/xctrace.ts` · `src/llmdb.ts`(lldb-dap 래퍼) · `src/symbolicate.ts`(atos 래퍼) · `src/netproxy.ts`(mitm 프록시) · `src/extras.ts`(기기 부가 도구) ·
-`src/exec.ts` · `src/cli.ts`(서브커맨드) · `src/version.ts`(단일 버전 출처) ·
-`src/singleton.ts`(lockfile/EADDRINUSE) · `src/launchd.ts` · `src/doctor.ts` · `src/install.ts` · `test/`
+Layout: `src/index.ts` (HTTP daemon/session map) · `src/server.ts` (MCP tool definitions) · `src/orchestrator.ts` (acquire/release/dispatch) · `src/store.ts` (JSON persistence) · `src/simslim.ts` · `src/axe.ts` · `src/servesim.ts` · `src/simlog.ts` · `src/simapps.ts` · `src/xctrace.ts` · `src/llmdb.ts` · `src/symbolicate.ts` · `src/netproxy.ts` · `src/extras.ts` · `src/exec.ts` · `src/cli.ts` · `src/version.ts` · `src/singleton.ts` · `src/launchd.ts` · `src/doctor.ts` · `src/install.ts` · `src/migrate.ts` · `test/`
+
+(A Korean translation of this README is welcome later — contributions accepted.)
+
+## Licence
+
+MIT — see the `license` field in `package.json`.

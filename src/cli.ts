@@ -17,7 +17,7 @@ export function isCliCommand(argv: string[]): boolean {
 
 export function topLevelHelp(): string {
   return [
-    "Usage: sim-orchestration-mcp [command]",
+    "Usage: apple-debug-mcp [command]",
     "",
     "No command: start the daemon (Streamable HTTP on SIM_MCP_HOST:SIM_MCP_PORT).",
     "",

@@ -4,6 +4,8 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   CLIENT_SPECS,
+  LEGACY_SERVER_KEYS,
+  SERVER_KEY,
   installCommand,
   parseClientList,
   readTomlStatus,
@@ -12,7 +14,7 @@ import {
 } from "../src/install.js";
 
 const URL = "http://127.0.0.1:3100/mcp";
-const KEY = "sim-orchestration"; // codex/muse server key
+const KEY = SERVER_KEY; // uniform server key for every client
 
 function tmpHome(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-install-"));
@@ -96,15 +98,18 @@ describe("install command (temp HOME fixtures)", () => {
       const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, Record<string, unknown>>;
       expect((parsed["mcpServers"]![CLIENT_SPECS[client].serverKey] as Record<string, string>)["url"]).toBe(URL);
     }
-    // Per-client keys match the established convention.
+    // The server key is uniform across every client.
+    expect(CLIENT_SPECS["claude-code"].serverKey).toBe("apple-debug");
+    expect(CLIENT_SPECS["codex"].serverKey).toBe("apple-debug");
+    expect(CLIENT_SPECS["muse"].serverKey).toBe("apple-debug");
     const claudeFile = CLIENT_SPECS["claude-code"].configPath(home);
     expect(Object.keys(JSON.parse(fs.readFileSync(claudeFile, "utf8"))["mcpServers"])).toContain(
-      "sim-orchestration-mcp",
+      "apple-debug",
     );
     // Second run: idempotent, no edits.
     const second = await installCommand({ clientsRaw: "all" }, { homeDir: home, url: URL });
     expect(second.output).toMatch(/already installed/);
-    expect(second.output).toContain("[mcp_servers.sim-orchestration]");
+    expect(second.output).toContain("[mcp_servers.apple-debug]");
     // Backup preserves the pre-edit content on the next real edit.
     const before = fs.readFileSync(claudeFile, "utf8");
     await installCommand({ clientsRaw: "claude-code", remove: true }, { homeDir: home, url: URL });
@@ -157,6 +162,89 @@ describe("install command (temp HOME fixtures)", () => {
     await installCommand({ clientsRaw: "codex" }, { homeDir: home, url: URL });
     const after = await installCommand({ clientsRaw: "codex", status: true }, { homeDir: home, url: URL });
     expect(after.output).toMatch(/codex: installed/);
+  });
+
+  it("removes legacy JSON keys while adding the uniform key (single backup, idempotent)", async () => {
+    const home = tmpHome();
+    const file = CLIENT_SPECS["claude-code"].configPath(home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const before = JSON.stringify({
+      mcpServers: {
+        "sim-orchestration-mcp": { type: "http", url: "http://old/mcp" },
+        "sim-orchestration": { type: "http", url: "http://old/mcp" },
+        other: { type: "http", url: "https://x" },
+      },
+    });
+    fs.writeFileSync(file, before);
+    const res = await installCommand({ clientsRaw: "claude-code" }, { homeDir: home, url: URL });
+    expect(res.exitCode).toBe(0);
+    expect(res.output).toMatch(/Removed legacy/);
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, Record<string, unknown>>;
+    expect((parsed["mcpServers"]![KEY] as Record<string, string>)["url"]).toBe(URL);
+    for (const legacy of LEGACY_SERVER_KEYS) {
+      expect(parsed["mcpServers"]![legacy]).toBeUndefined();
+    }
+    expect(parsed["mcpServers"]!["other"]).toBeDefined();
+    // Single backup holding the pre-edit content.
+    expect(fs.readFileSync(`${file}.bak-sim-mcp`, "utf8")).toBe(before);
+    // Second run: fully idempotent now that legacy keys are gone.
+    const second = await installCommand({ clientsRaw: "claude-code" }, { homeDir: home, url: URL });
+    expect(second.output).toMatch(/already installed/);
+    expect(second.output).not.toMatch(/Removed legacy/);
+  });
+
+  it("removes legacy TOML sections while adding the uniform key", async () => {
+    const home = tmpHome();
+    const file = CLIENT_SPECS["codex"].configPath(home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const before =
+      `[mcp_servers.other]\nurl = "https://x"\n\n` +
+      `[mcp_servers.sim-orchestration]\nurl = "http://old/mcp"\n`;
+    fs.writeFileSync(file, before);
+    const res = await installCommand({ clientsRaw: "codex" }, { homeDir: home, url: URL });
+    expect(res.exitCode).toBe(0);
+    expect(res.output).toMatch(/Removed legacy: sim-orchestration/);
+    const text = fs.readFileSync(file, "utf8");
+    expect(text).toContain(`[mcp_servers.${KEY}]\nurl = "${URL}"`);
+    expect(text).toContain('[mcp_servers.other]\nurl = "https://x"');
+    expect(text).not.toContain("sim-orchestration");
+    expect(fs.readFileSync(`${file}.bak-sim-mcp`, "utf8")).toBe(before);
+    const second = await installCommand({ clientsRaw: "codex" }, { homeDir: home, url: URL });
+    expect(second.output).toMatch(/already installed/);
+  });
+
+  it("cleans legacy keys even when the uniform entry is already installed", async () => {
+    const home = tmpHome();
+    const file = CLIENT_SPECS["muse"].configPath(home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        mcpServers: {
+          [KEY]: { type: "streamable-http", url: URL },
+          "sim-orchestration": { type: "streamable-http", url: URL },
+        },
+      }),
+    );
+    const res = await installCommand({ clientsRaw: "muse" }, { homeDir: home, url: URL });
+    expect(res.exitCode).toBe(0);
+    expect(res.output).toMatch(/Removed legacy: sim-orchestration/);
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, Record<string, unknown>>;
+    expect(parsed["mcpServers"]!["sim-orchestration"]).toBeUndefined();
+    expect((parsed["mcpServers"]![KEY] as Record<string, string>)["url"]).toBe(URL);
+  });
+
+  it("dry-run reports pending legacy removal and writes nothing", async () => {
+    const home = tmpHome();
+    const file = CLIENT_SPECS["codex"].configPath(home);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const before = `[mcp_servers.sim-orchestration]\nurl = "http://old/mcp"\n`;
+    fs.writeFileSync(file, before);
+    const res = await installCommand({ clientsRaw: "codex", dryRun: true }, { homeDir: home, url: URL });
+    expect(res.exitCode).toBe(0);
+    expect(res.output).toMatch(/would remove legacy: sim-orchestration/);
+    expect(fs.readFileSync(file, "utf8")).toBe(before);
+    expect(fs.existsSync(`${file}.bak-sim-mcp`)).toBe(false);
   });
 
   it("rejects unknown clients and changes nothing", async () => {
