@@ -78,8 +78,9 @@ async function connect(name, attempts = 5) {
   fail(`${name} connect failed after ${attempts} attempts: ${last?.message ?? last}`);
 }
 
-async function call(client, tool, args) {
-  const result = await client.callTool({ name: tool, arguments: args });
+async function call(client, tool, args, timeout) {
+  const options = timeout === undefined ? undefined : { timeout };
+  const result = await client.callTool({ name: tool, arguments: args }, undefined, options);
   const text = result.content.find((c) => c.type === "text")?.text ?? "{}";
   return {
     isError: result.isError === true,
@@ -191,9 +192,11 @@ async function main() {
       fail(`pool_status server.version ${JSON.stringify(pool.json.server)} !== package.json ${pkg.version}`);
     }
     log(`pool_status server version ok (${pool.json.server.version})`);
+    // Prefer an already-Booted device: CI pre-boots one because a cold boot
+    // inside lease_acquire exceeds the MCP request timeout on fresh runners.
     const target = pool.json.simulators
       .filter((s) => s.name.toLowerCase().includes(DEVICE_SUBSTR))
-      .sort((x, y) => Number(x.state === "Booted") - Number(y.state === "Booted"))[0];
+      .sort((x, y) => Number(y.state === "Booted") - Number(x.state === "Booted"))[0];
     if (!target) fail(`no simulator matching ${DEVICE_SUBSTR}`);
     const udid = target.udid;
     log(`target: ${target.name} (${udid}, ${target.state})`);
@@ -217,7 +220,7 @@ async function main() {
 
     const leaseA = await call(a, "lease_acquire", {
       session_id: "ci-smoke-a", client: "ci", task: "ci smoke", udid, slim: true, stream: true,
-    });
+    }, 300_000);
     expectOk(leaseA, "lease_acquire A");
     if (leaseA.json.queued) fail("A should have received a lease, not a ticket");
     log(`A leased ${leaseA.json.lease.leaseId}`);
