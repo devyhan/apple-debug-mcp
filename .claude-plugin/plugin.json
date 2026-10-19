@@ -1,0 +1,29 @@
+{
+  "$schema": "https://code.claude.com/schemas/plugin.json",
+  "name": "apple-debug-mcp",
+  "displayName": "Apple Debug MCP",
+  "version": "0.1.0",
+  "description": "Debug Apple Simulators from Claude Code: simulator pool with session leases, AXe UI automation, app lifecycle, xctrace profiling, crash symbolication, and an HTTPS intercept proxy. Connects to the shared daemon at 127.0.0.1:3100 over Streamable HTTP — start it first with `apple-debug-mcp launchd create` (SIM_MCP_PORT/SIM_MCP_HOST to change).",
+  "author": {
+    "name": "devyhan",
+    "url": "https://github.com/devyhan"
+  },
+  "homepage": "https://github.com/devyhan/apple-debug-mcp#readme",
+  "repository": "https://github.com/devyhan/apple-debug-mcp",
+  "license": "MIT",
+  "keywords": [
+    "apple",
+    "ios-simulator",
+    "xcode",
+    "simctl",
+    "ui-automation",
+    "debugging",
+    "mcp"
+  ],
+  "mcpServers": {
+    "apple-debug": {
+      "type": "http",
+      "url": "http://127.0.0.1:3100/mcp"
+    }
+  }
+}

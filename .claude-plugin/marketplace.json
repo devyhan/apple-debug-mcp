@@ -1,0 +1,16 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "devyhan",
+  "owner": {
+    "name": "devyhan",
+    "url": "https://github.com/devyhan"
+  },
+  "plugins": [
+    {
+      "name": "apple-debug-mcp",
+      "source": "./",
+      "description": "Debug Apple Simulators from Claude Code: simulator pool with session leases, UI automation, app lifecycle, profiling, and HTTPS interception."
+    }
+  ],
+  "description": "Apple Simulator debugging tools for Claude Code, over a shared MCP daemon."
+}
