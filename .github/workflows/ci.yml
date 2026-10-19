@@ -45,8 +45,9 @@ jobs:
         run: |
           out=$(npx vitest run 2>&1)
           echo "$out" | tail -n 8
-          files=$(echo "$out" | grep -E 'Test Files' | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -n1)
-          count=$(echo "$out" | grep -E '^\s*Tests ' | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -n1)
+          clean=$(echo "$out" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g')
+          files=$(echo "$clean" | grep -E 'Test Files' | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -n1 || true)
+          count=$(echo "$clean" | grep -E '^\s*Tests ' | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -n1 || true)
           echo "test files passed: ${files:-?}"
           echo "tests passed: ${count:-?}"
           if [ "${files:-0}" -lt 20 ]; then
