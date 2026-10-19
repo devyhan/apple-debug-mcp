@@ -173,19 +173,44 @@ jobs:
       # Shutdown target makes lease_acquire fail with -32001. Pre-boot one
       # matching device here (same filter as smoke.mjs SMOKE_DEVICE_SUBSTR);
       # the smoke test prefers Booted devices and picks this one up.
+      # Candidates go newest-runtime-first: the first match across all
+      # runtimes can belong to an old runtime that never finishes booting
+      # (bootstatus still exits 0), so every candidate is verified Booted
+      # and the step fails loudly if none reaches it.
       - name: Pre-boot simulator
         run: |
-          UDID=$(xcrun simctl list devices available -j | node -e '
+          CANDS=($(xcrun simctl list devices available -j | node -e '
             let data = "";
             process.stdin.on("data", (c) => (data += c)).on("end", () => {
               const substr = (process.env.SMOKE_DEVICE_SUBSTR ?? "iphone").toLowerCase();
-              const devices = Object.values(JSON.parse(data).devices ?? {}).flat();
-              const match = devices.find((d) => d.isAvailable !== false && d.name.toLowerCase().includes(substr));
-              if (!match) { console.error("no available simulator matching " + substr); process.exit(1); }
-              console.log(match.udid);
+              const byRuntime = JSON.parse(data).devices ?? {};
+              const ver = (rt) => { const m = rt.match(/(\d+)-(\d+)/); return m ? [+m[1], +m[2]] : [0, 0]; };
+              const runtimes = Object.keys(byRuntime).sort((a, b) => ver(a)[0] - ver(b)[0] || ver(a)[1] - ver(b)[1]);
+              const cands = runtimes.reverse().flatMap((rt) =>
+                (byRuntime[rt] ?? []).filter((d) => d.isAvailable !== false && d.name.toLowerCase().includes(substr)),
+              );
+              if (cands.length === 0) { console.error("no available simulator matching " + substr); process.exit(1); }
+              console.log(cands.slice(0, 5).map((d) => d.udid).join("\n"));
             });
-          ')
-          echo "Pre-booting $UDID"
-          xcrun simctl bootstatus "$UDID" -b
+          '))
+          UDID=""
+          for CAND in "${CANDS[@]}"; do
+            echo "Trying $CAND"
+            xcrun simctl bootstatus "$CAND" -b || true
+            STATE=$(xcrun simctl list devices -j | CAND="$CAND" node -e '
+              let data = "";
+              process.stdin.on("data", (c) => (data += c)).on("end", () => {
+                const devices = Object.values(JSON.parse(data).devices ?? {}).flat();
+                console.log(devices.find((d) => d.udid === process.env.CAND)?.state ?? "unknown");
+              });
+            ')
+            echo "$CAND state: $STATE"
+            if [ "$STATE" = "Booted" ]; then UDID="$CAND"; break; fi
+          done
+          if [ -z "$UDID" ]; then
+            echo "::error::no simulator reached Booted state"
+            exit 1
+          fi
+          echo "Pre-booted $UDID"
       - name: Smoke test (real simulator)
         run: npm run smoke
