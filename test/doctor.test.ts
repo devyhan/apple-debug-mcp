@@ -23,6 +23,7 @@ const ALL_OK: Record<string, string> = {
   "serve-sim --version": "serve-sim 2.0.0",
   "llmdb --version": "llmdb 3.0.0",
   "mitmdump --version": "mitmdump 11",
+  "tcpdump --version": "tcpdump version 4.99.1",
   "launchctl list": "not used",
 };
 
@@ -48,6 +49,9 @@ describe("doctor (stubbed runner)", () => {
       fetchHealth: async () => ({ ok: true, version: "0.1.0" }),
     });
     expect(checks.every((c) => c.status === "pass")).toBe(true);
+    const byName = Object.fromEntries(checks.map((c) => [c.name, c]));
+    expect(byName["tcpdump"]!.status).toBe("pass");
+    expect(byName["tcpdump"]!.detail).toMatch(/tcpdump version/);
     const { exitCode, text } = formatDoctorReport(checks);
     expect(exitCode).toBe(0);
     expect(text).toMatch(/all checks passed/);
@@ -85,6 +89,7 @@ describe("doctor (stubbed runner)", () => {
         "serve-sim --version": fail,
         "llmdb --version": fail,
         "mitmdump --version": fail,
+        "tcpdump --version": fail,
       }),
       homeDir: tmpHome(true),
       fetchHealth: async () => ({ ok: true, version: "0.1.0" }),
@@ -94,6 +99,8 @@ describe("doctor (stubbed runner)", () => {
     expect(byName["serve-sim"]!.fix).toMatch(/npm install -g serve-sim/);
     expect(byName["llmdb"]!.fix).toMatch(/brew install alexmx\/tools\/llmdb/);
     expect(byName["mitmdump"]!.fix).toMatch(/brew install mitmproxy/);
+    expect(byName["tcpdump"]!.status).toBe("warn");
+    expect(byName["tcpdump"]!.fix).toMatch(/TCPDUMP_BIN/);
     expect(formatDoctorReport(checks).exitCode).toBe(0);
   });
 

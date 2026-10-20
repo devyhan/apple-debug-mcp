@@ -16,11 +16,15 @@ import {
   NetProxyStatus,
   ProxyBusyError,
   ProxyOps,
+  QUIC_BLOCK_ANCHOR,
   WaitReadyFn,
   buildAddon,
+  buildQuicBlockRules,
   makeTcpWaitReady,
   normalizeRules,
   parseFlowLog,
+  parsePfEnableToken,
+  parsePfEnabled,
   parseProxyState,
   parseServicesList,
 } from "../src/netproxy.js";
@@ -716,17 +720,24 @@ class FakeProxy implements ProxyOps {
   holder: { leaseId: string; sessionId: string; udid: string } | null = null;
   rules: NetProxyRule[] = [];
   stops: string[] = [];
+  blockQuicSeen: (boolean | undefined)[] = [];
+  quicBlocked = false;
   failStop = false;
 
   async startProxy(
     udid: string,
     holder: { leaseId: string; sessionId: string },
     rules: NetProxyRule[],
+    opts?: { blockQuic?: boolean },
   ): Promise<{ port: number; pid?: number }> {
     if (this.holder && this.holder.leaseId !== holder.leaseId) {
       throw new ProxyBusyError({ ...this.holder, port: 3240 }, "start");
     }
-    if (!this.holder) this.holder = { ...holder, udid };
+    this.blockQuicSeen.push(opts?.blockQuic);
+    if (!this.holder) {
+      this.holder = { ...holder, udid };
+      this.quicBlocked = opts?.blockQuic === true;
+    }
     this.rules = rules;
     return { port: 3240, pid: 99 };
   }
@@ -742,6 +753,7 @@ class FakeProxy implements ProxyOps {
     if (this.holder.leaseId !== leaseId) throw new ProxyBusyError({ ...this.holder, port: 3240 }, "stop");
     this.stops.push(leaseId);
     this.holder = null;
+    this.quicBlocked = false;
     if (this.failStop) throw new Error("stop exploded");
     return { stopped: true };
   }
@@ -756,6 +768,7 @@ class FakeProxy implements ProxyOps {
       sessionId: this.holder.sessionId,
       udid: this.holder.udid,
       ruleCount: this.rules.length,
+      quicBlocked: this.quicBlocked,
     };
   }
 
@@ -1194,5 +1207,193 @@ describe("net_assert_flow / map_* tools (stubbed real proxy)", () => {
 
     const tools = orch.leaseActions(a.leaseId).map((e) => e.tool);
     expect(tools).toEqual(["net_proxy_start", "map_local", "map_remote", "net_assert_flow", "net_proxy_stop"]);
+  });
+});
+
+describe("net_proxy block_quic wiring", () => {
+  it("passes block_quic through tools and reports actual QUIC state", async () => {
+    const { client, fake, a } = await makeToolClient();
+    const start = await call(client, "net_proxy_start", { lease_id: a.leaseId, block_quic: true });
+    expect(start.json).toMatchObject({ ok: true, quic_blocked: true });
+    expect(fake.blockQuicSeen).toEqual([true]);
+
+    const status = await call(client, "net_proxy_status", { lease_id: a.leaseId });
+    expect(status.json).toMatchObject({ ok: true, running: true, quic_blocked: true });
+
+    // Idempotent re-start ignores new opts: the response must echo ACTUAL
+    // state (still blocked), not the new request (block_quic false).
+    const again = await call(client, "net_proxy_start", { lease_id: a.leaseId, block_quic: false });
+    expect(again.json).toMatchObject({ ok: true, quic_blocked: true });
+    expect(fake.blockQuicSeen).toEqual([true, false]);
+
+    await call(client, "net_proxy_stop", { lease_id: a.leaseId });
+    const plain = await call(client, "net_proxy_start", { lease_id: a.leaseId });
+    expect(plain.json).toMatchObject({ ok: true, quic_blocked: false });
+    expect(fake.blockQuicSeen).toEqual([true, false, false]);
+    const status2 = await call(client, "net_proxy_status", { lease_id: a.leaseId });
+    expect(status2.json).toMatchObject({ ok: true, running: true, quic_blocked: false });
+  });
+});
+
+describe("quic block helpers", () => {
+  it("builds a family-agnostic UDP/443 drop (covers v4 + v6)", () => {
+    // Loaded via `pfctl -a <anchor> -f`, so the file holds only the rule.
+    expect(buildQuicBlockRules()).toBe("block drop quick proto udp to any port 443\n");
+  });
+
+  it("keeps the anchor directly under com.apple/ so stock pf.conf evaluates it", () => {
+    // Dots do NOT create PF anchor hierarchy (see man pf.conf): a dotted
+    // top-level anchor would load fine yet never be evaluated — a silent
+    // no-op no call-sequence stub can catch. Pin the slash form instead.
+    expect(QUIC_BLOCK_ANCHOR).toMatch(/^com\.apple\/[A-Za-z0-9_.-]+$/);
+  });
+
+  it("parses pfctl -s info status, including real uptime suffixes", () => {
+    expect(parsePfEnabled("Status: Enabled for 3 days 01:02:03           Debug: Urgent\n")).toBe(true);
+    expect(parsePfEnabled("Status:Enabled\n")).toBe(true);
+    expect(parsePfEnabled("  status: enabled  \n")).toBe(true);
+    expect(parsePfEnabled("Status: Disabled\n")).toBe(false);
+    expect(parsePfEnabled("")).toBe(false);
+    expect(parsePfEnabled("no status here")).toBe(false);
+  });
+
+  it("parses the pfctl -E enable token", () => {
+    expect(parsePfEnableToken("Token : 4242\n")).toBe("4242");
+    expect(parsePfEnableToken("Token: 99")).toBe("99");
+    expect(() => parsePfEnableToken("")).toThrow(/enable token/);
+    expect(() => parsePfEnableToken("Status: Enabled\n")).toThrow(/enable token/);
+  });
+});
+
+describe("startProxy with blockQuic", () => {
+  const anchorPattern = QUIC_BLOCK_ANCHOR.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+
+  function makeQuicProxy(opts: { pfInfo: string; pfFailOn?: string; failReadyOnCall?: number }) {
+    const base = makeProxy();
+    const handler = (bin: string, args: string[]) => {
+      if (bin === "sudo" && args[1] === "pfctl") {
+        const sub = args.slice(2).join(" ");
+        if (opts.pfFailOn && sub.startsWith(opts.pfFailOn)) {
+          throw new ExecError("sudo", args, 1, "", "pfctl: permission denied");
+        }
+        if (sub === "-s info") return { stdout: opts.pfInfo, stderr: "" };
+        // Mirrors real macOS: the token arrives on stderr, stdout is empty.
+        if (sub === "-E") return { stdout: "", stderr: "pf enabled\nToken : 4242\n" };
+        return { stdout: "", stderr: "" };
+      }
+      return proxyHandler({ sudoFails: false })(bin, args);
+    };
+    const run = stubRunner(handler);
+    let readyCalls = 0;
+    const waitReady: WaitReadyFn = async () => {
+      readyCalls += 1;
+      if (opts.failReadyOnCall === readyCalls) throw new Error("mitmdump never became ready");
+    };
+    const children: StubChild[] = [];
+    const proxy = new NetProxy({
+      runner: run,
+      spawnFn: () => {
+        const child = new StubChild(5000 + children.length);
+        children.push(child);
+        return child as unknown as MitmChild;
+      },
+      caPemPath: base.caPem,
+      workDir: base.workDir,
+      portBase: 45600,
+      waitReady,
+    });
+    const pfctlCalls = () =>
+      run.calls.filter((c) => c.bin === "sudo" && c.args[1] === "pfctl").map((c) => c.args.slice(2).join(" "));
+    const workLeftovers = () => {
+      try {
+        return fs.readdirSync(base.workDir).filter((f) => f.startsWith("addon-") || f.startsWith("flow-") || f.startsWith("pf-"));
+      } catch {
+        return []; // Work dir never created: nothing could strand.
+      }
+    };
+    return { proxy, run, pfctlCalls, children, workLeftovers };
+  }
+
+  it("enables PF via -E, loads the anchor, and releases the token on stop when PF was off", async () => {
+    const { proxy, pfctlCalls } = makeQuicProxy({ pfInfo: "Status: Disabled\n" });
+    await proxy.startProxy("U1", { leaseId: "l1" }, [], { blockQuic: true });
+    expect(proxy.proxyStatus()).toMatchObject({ running: true, quicBlocked: true });
+
+    const pfctl = pfctlCalls();
+    expect(pfctl[0]).toBe("-s info");
+    expect(pfctl[1]).toBe("-E");
+    expect(pfctl[2]).toMatch(new RegExp(`^-a ${anchorPattern} -f \\S+$`));
+    // Rules file on disk while running, holding the drop rule.
+    const rulesPath = pfctl[2]!.split(" ").pop()!;
+    expect(fs.readFileSync(rulesPath, "utf8")).toBe(buildQuicBlockRules());
+
+    await proxy.stopProxy("l1");
+    expect(pfctlCalls().slice(3)).toEqual([`-a ${QUIC_BLOCK_ANCHOR} -F all`, "-X 4242"]);
+    expect(fs.existsSync(rulesPath)).toBe(false);
+    expect(proxy.proxyStatus()).toEqual({ running: false });
+  });
+
+  it("flushes only the anchor on stop when PF was already on", async () => {
+    const { proxy, pfctlCalls } = makeQuicProxy({ pfInfo: "Status: Enabled for 1 day\n" });
+    await proxy.startProxy("U1", { leaseId: "l1" }, [], { blockQuic: true });
+    const pfctl = pfctlCalls();
+    expect(pfctl).toHaveLength(2); // -s info + anchor load, no -E
+    expect(pfctl[1]).toMatch(/^-a .* -f \S+$/);
+    await proxy.stopProxy("l1");
+    expect(pfctlCalls().slice(2)).toEqual([`-a ${QUIC_BLOCK_ANCHOR} -F all`]); // flush only, no -X
+  });
+
+  it("rolls everything back when the anchor load fails", async () => {
+    const { proxy, run, pfctlCalls, workLeftovers } = makeQuicProxy({ pfInfo: "Status: Disabled\n", pfFailOn: "-a " });
+    await expect(proxy.startProxy("U1", { leaseId: "l1" }, [], { blockQuic: true })).rejects.toThrow(
+      /Failed to block QUIC.*previous state restored/,
+    );
+    // sudo-flavored failures carry the passwordless-sudo provisioning hint.
+    await expect(proxy.startProxy("U1", { leaseId: "l1" }, [], { blockQuic: true })).rejects.toThrow(/passwordless sudo/);
+    // The anchor flush also fails here, so the message must hedge the restore claim.
+    await expect(proxy.startProxy("U1", { leaseId: "l1" }, [], { blockQuic: true })).rejects.toThrow(/QUIC cleanup also failed/);
+    expect(proxy.proxyStatus()).toEqual({ running: false });
+    // Host proxy snapshot restored (services pointed back at 127.0.0.1:port were reverted).
+    const sets = run.calls.filter((c) => c.bin === "sudo" && c.args[1] === "networksetup" && c.args[2] === "-setwebproxy");
+    expect(sets.length).toBeGreaterThan(0);
+    // Our enable reference is released even though the anchor flush also fails.
+    const pfctl = pfctlCalls();
+    expect(pfctl).toContain("-E");
+    expect(pfctl).toContain("-X 4242");
+    // No generated files strand in the work dir.
+    expect(workLeftovers()).toEqual([]);
+  });
+
+  it("fails with a sudoers hint before mutating anything when the PF read is refused", async () => {
+    const { proxy, run, pfctlCalls, workLeftovers } = makeQuicProxy({ pfInfo: "Status: Disabled\n", pfFailOn: "-s info" });
+    await expect(proxy.startProxy("U1", { leaseId: "l1" }, [], { blockQuic: true })).rejects.toThrow(/passwordless sudo/);
+    expect(proxy.proxyStatus()).toEqual({ running: false });
+    expect(pfctlCalls()).toEqual(["-s info"]);
+    // Snapshot reads happened, but no host mutation: no -set* calls at all,
+    // and not even the sim keychain write.
+    expect(run.calls.some((c) => c.args.some((a) => a.startsWith("-set")))).toBe(false);
+    expect(run.calls.some((c) => c.bin === "xcrun")).toBe(false);
+    expect(workLeftovers()).toEqual([]);
+  });
+
+  it("removes the QUIC block when a rules update kills the proxy", async () => {
+    const { proxy, pfctlCalls, children, workLeftovers } = makeQuicProxy({ pfInfo: "Status: Disabled\n", failReadyOnCall: 2 });
+    await proxy.startProxy("U1", { leaseId: "l1" }, [], { blockQuic: true });
+    await expect(proxy.setProxyRules("l1", [])).rejects.toThrow(/Proxy rules update failed.*proxy was stopped/);
+    expect(proxy.proxyStatus()).toEqual({ running: false });
+    // Anchor flushed + our enable reference released despite the dead proxy.
+    expect(pfctlCalls().slice(3)).toEqual([`-a ${QUIC_BLOCK_ANCHOR} -F all`, "-X 4242"]);
+    // The replacement child is stopped (not stranded) and no files strand.
+    expect(children).toHaveLength(2);
+    expect(children[1]!.kills).toContain("SIGTERM");
+    expect(workLeftovers()).toEqual([]);
+  });
+
+  it("does not touch pfctl when blockQuic is off", async () => {
+    const { proxy, run } = makeQuicProxy({ pfInfo: "Status: Disabled\n" });
+    await proxy.startProxy("U1", { leaseId: "l1" }, []);
+    expect(proxy.proxyStatus()).toMatchObject({ running: true, quicBlocked: false });
+    expect(run.calls.some((c) => c.args.includes("pfctl"))).toBe(false);
+    await proxy.stopProxy("l1");
   });
 });

@@ -67,6 +67,7 @@ different daemons and split the pool — one shared daemon is the premise.
 | `SERVE_SIM_BIN` | `serve-sim` | serve-sim binary path (optional dependency) |
 | `LLMDB_BIN` | `llmdb` | llmdb binary path (optional dependency) |
 | `MITMDUMP_BIN` | `mitmdump` | mitmdump binary path (optional dependency) |
+| `TCPDUMP_BIN` | `tcpdump` | tcpdump binary path (optional dependency, ships with macOS) |
 | `SERVE_SIM_PORT_BASE` | `3220` | First port scanned for per-lease stream helpers |
 | `NETPROXY_PORT_BASE` | `3240` | First port scanned for the lease-held proxy listener |
 | `SIM_MCP_MAX_SIMS` | `0` (uncapped) | Cap on concurrently booted simulators; excess waits |

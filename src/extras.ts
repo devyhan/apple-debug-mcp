@@ -80,6 +80,17 @@ function lldmdbError(err: unknown): string {
 }
 
 /** Missing-binary errors get an install hint; everything else passes through. */
+function netCaptureError(err: unknown): string {
+  const msg = (err as Error).message;
+  if (err instanceof ExecError && err.code === "ENOENT") {
+    return `${msg}. tcpdump is not installed or not on PATH (macOS ships it; or set TCPDUMP_BIN)`;
+  }
+  if (/tcpdump.*(not found|ENOENT)|spawn tcpdump/i.test(msg)) {
+    return `${msg}. tcpdump is not installed or not on PATH (macOS ships it; or set TCPDUMP_BIN)`;
+  }
+  return msg;
+}
+
 function netProxyError(err: unknown): string {
   const msg = (err as Error).message;
   if (err instanceof ExecError && err.code === "ENOENT") {
@@ -1306,15 +1317,23 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         rules: netProxyRulesSchema.optional().describe("Response-rewrite rules, first match wins. Default: none (transparent interception)."),
+        block_quic: z
+          .boolean()
+          .optional()
+          .describe(
+            "Also block QUIC (UDP/443) via a PF anchor so apps fall back to TCP/TLS through the proxy. " +
+              "Host-wide while running; removed on stop. Needs passwordless sudo for pfctl.",
+          ),
       },
     },
-    async ({ lease_id, rules }) => {
+    async ({ lease_id, rules, block_quic }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        const { port, pid } = await orch.startLeaseProxy(lease_id, rules ?? []);
+        const { port, pid, quicBlocked } = await orch.startLeaseProxy(lease_id, rules ?? [], { blockQuic: block_quic === true });
         const count = rules?.length ?? 0;
-        await orch.logAction(lease_id, "net_proxy_start", `proxy :${port}${count > 0 ? ` (${count} rules)` : " (transparent)"}`);
-        return ok({ lease_id, udid: lease.udid, port, pid, rule_count: count });
+        const quic = quicBlocked ? ", quic blocked" : "";
+        await orch.logAction(lease_id, "net_proxy_start", `proxy :${port}${count > 0 ? ` (${count} rules)` : " (transparent)"}${quic}`);
+        return ok({ lease_id, udid: lease.udid, port, pid, rule_count: count, quic_blocked: quicBlocked });
       } catch (err) {
         return fail(netProxyError(err));
       }
@@ -1368,14 +1387,14 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     "net_proxy_status",
     {
       description:
-        "Show the network proxy state: running flag, port/pid, the holding lease/session when active, and the rule count. Any valid lease may view it.",
+        "Show the network proxy state: running flag, port/pid, QUIC-block flag, the holding lease/session when active, and the rule count. Any valid lease may view it.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
     },
     async ({ lease_id }) => {
       try {
-        const { lease, running, port, pid, leaseId, sessionId, udid, ruleCount, addonPath, flowLogPath } =
+        const { lease, running, port, pid, leaseId, sessionId, udid, ruleCount, quicBlocked, addonPath, flowLogPath } =
           await orch.leaseProxyStatus(lease_id);
         return ok({
           lease_id,
@@ -1383,6 +1402,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           running,
           ...(port !== undefined ? { port } : {}),
           ...(pid !== undefined ? { pid } : {}),
+          ...(quicBlocked !== undefined ? { quic_blocked: quicBlocked } : {}),
           ...(leaseId !== undefined ? { holder_lease_id: leaseId } : {}),
           ...(sessionId !== undefined ? { holder_session_id: sessionId } : {}),
           ...(udid !== undefined ? { holder_udid: udid } : {}),
@@ -1392,6 +1412,104 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         });
       } catch (err) {
         return fail(netProxyError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "net_capture_start",
+    {
+      description:
+        "Start a packet capture (tcpdump) on the host interface carrying simulator traffic. " +
+        "Use for traffic the HTTP proxy cannot see: raw TCP/UDP sockets and QUIC (UDP/443). " +
+        "Only one capture runs at a time; the holding lease owns it. " +
+        "Capturing needs passwordless sudo for tcpdump.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        filter: z
+          .string()
+          .optional()
+          .describe('BPF filter, e.g. "tcp port 6555" or "udp port 443". Omit to capture everything (noisy).'),
+        snaplen: z
+          .number()
+          .int()
+          .min(64)
+          .max(65535)
+          .optional()
+          .describe("Bytes captured per packet (-s). Default 256: headers plus a protocol peek. TLS payloads stay encrypted."),
+        interface: z.string().optional().describe("Capture interface (e.g. en0). Default: the default-route interface."),
+      },
+    },
+    async ({ lease_id, filter, snaplen, interface: iface }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const { pid, pcapPath } = await orch.startLeaseCapture(lease_id, { filter, snaplen, interface: iface });
+        await orch.logAction(lease_id, "net_capture_start", `capture pid ${pid}${filter ? ` filter ${JSON.stringify(filter)}` : ""} -> ${pcapPath}`);
+        return ok({ lease_id, udid: lease.udid, pid, pcap_path: pcapPath });
+      } catch (err) {
+        return fail(netCaptureError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "net_capture_stop",
+    {
+      description:
+        "Stop the packet capture and return a per-flow packet/byte summary plus the pcap path. " +
+        "Idempotent: stopping twice succeeds with stopped=false. Only the holding lease may stop. " +
+        "The pcap file stays on disk for manual inspection (tcpdump -r / Wireshark) until your lease's next capture overwrites it.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id (must hold the capture)."),
+      },
+    },
+    async ({ lease_id }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const { stopped, pcapPath, summary } = await orch.stopLeaseCapture(lease_id);
+        await orch.logAction(lease_id, "net_capture_stop", stopped ? `capture stopped (${summary?.packets ?? 0} packets)` : "capture already stopped");
+        return ok({
+          lease_id,
+          udid: lease.udid,
+          stopped,
+          ...(pcapPath !== undefined ? { pcap_path: pcapPath } : {}),
+          ...(summary !== undefined ? { summary } : {}),
+        });
+      } catch (err) {
+        return fail(netCaptureError(err));
+      }
+    },
+  );
+
+  server.registerTool(
+    "net_capture_status",
+    {
+      description:
+        "Show the packet capture state: running flag, pid, filter, pcap path, and the holding lease/session when active. Any valid lease may view it.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+      },
+    },
+    async ({ lease_id }) => {
+      try {
+        const { lease, running, pid, leaseId, sessionId, udid, interface: iface, filter, pcapPath, startedAt, bytesWritten } =
+          await orch.leaseCaptureStatus(lease_id);
+        return ok({
+          lease_id,
+          udid: lease.udid,
+          running,
+          ...(pid !== undefined ? { pid } : {}),
+          ...(leaseId !== undefined ? { holder_lease_id: leaseId } : {}),
+          ...(sessionId !== undefined ? { holder_session_id: sessionId } : {}),
+          ...(udid !== undefined ? { holder_udid: udid } : {}),
+          ...(iface !== undefined ? { interface: iface } : {}),
+          ...(filter !== undefined ? { filter } : {}),
+          ...(pcapPath !== undefined ? { pcap_path: pcapPath } : {}),
+          ...(startedAt !== undefined ? { started_at: startedAt } : {}),
+          ...(bytesWritten !== undefined ? { bytes_written: bytesWritten } : {}),
+        });
+      } catch (err) {
+        return fail(netCaptureError(err));
       }
     },
   );

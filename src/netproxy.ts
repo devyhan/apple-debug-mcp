@@ -70,6 +70,7 @@ export interface NetProxyStatus {
   sessionId?: string;
   udid?: string;
   ruleCount?: number;
+  quicBlocked?: boolean;
   addonPath?: string;
   flowLogPath?: string;
 }
@@ -103,7 +104,12 @@ export interface AssertFlowResult {
 
 /** Minimal proxy surface the orchestrator needs (implemented by NetProxy, faked in tests). */
 export interface ProxyOps {
-  startProxy(udid: string, holder: ProxyHolder, rules: NetProxyRule[]): Promise<{ port: number; pid?: number }>;
+  startProxy(
+    udid: string,
+    holder: ProxyHolder,
+    rules: NetProxyRule[],
+    opts?: { blockQuic?: boolean },
+  ): Promise<{ port: number; pid?: number }>;
   setProxyRules(leaseId: string, rules: NetProxyRule[]): Promise<void>;
   stopProxy(leaseId: string): Promise<{ stopped: boolean }>;
   proxyStatus(): NetProxyStatus;
@@ -153,6 +159,34 @@ export function parseServicesList(text: string): string[] {
     out.push(trimmed.startsWith("*") ? trimmed.slice(1) : trimmed);
   }
   return out;
+}
+
+/**
+ * PF anchor carrying the QUIC block. Anchors attach via `/`-separated paths
+ * (dots do NOT create hierarchy): stock macOS pf.conf evaluates only
+ * `anchor "com.apple/*"`, so the block must live directly under `com.apple/`
+ * to take effect without editing any system file. Removal flushes only this
+ * anchor.
+ */
+export const QUIC_BLOCK_ANCHOR = "com.apple/apple-debug-mcp.quicblock";
+
+/** PF rules blocking QUIC (UDP/443) so apps fall back to TCP/TLS through the proxy. */
+export function buildQuicBlockRules(): string {
+  return "block drop quick proto udp to any port 443\n";
+}
+
+/** Parse `pfctl -s info` output; true on a `Status: Enabled...` line (real output appends uptime). */
+export function parsePfEnabled(text: string): boolean {
+  return text.split("\n").some((line) => /^status:\s*enabled(\s|$)/i.test(line.trim()));
+}
+
+/** Parse the enable-reference token printed by `pfctl -E` (`Token : <n>`). */
+export function parsePfEnableToken(text: string): string {
+  const match = text.match(/Token\s*:\s*(\S+)/);
+  if (!match?.[1]) {
+    throw new Error(`Could not parse the pfctl -E enable token from: ${JSON.stringify(text.slice(0, 120))}`);
+  }
+  return match[1];
 }
 
 /** Parse `networksetup -getwebproxy/-getsecurewebproxy` output (Enabled/Server/Port lines). */
@@ -571,6 +605,19 @@ function mitmError(err: unknown): string {
   return msg;
 }
 
+function sudoHintPf(err: unknown): string {
+  const msg = (err as Error).message;
+  if (/passwordless sudo/.test(msg)) return msg; // Already hinted; never double-wrap.
+  if (/password is required|\bsudo\b/i.test(msg)) {
+    return (
+      `${msg}. QUIC blocking needs passwordless sudo for: ` +
+      `pfctl -s info/-E/-X and pfctl -a ${QUIC_BLOCK_ANCHOR} -f/-F ` +
+      `(ask an admin to provision a sudoers rule, then retry)`
+    );
+  }
+  return msg;
+}
+
 function sudoHint(err: unknown): string {
   const msg = (err as Error).message;
   if (/password is required|\bsudo\b/i.test(msg)) {
@@ -598,6 +645,10 @@ interface ActiveProxy {
   addonPath: string;
   flowLogPath: string;
   child: MitmChild;
+  quicBlocked: boolean;
+  /** Enable-reference token from `pfctl -E`; present only when WE enabled PF. */
+  pfEnableToken?: string;
+  pfRulesPath?: string;
 }
 
 /** Upper bound for net_assert_flow polling (keeps the tool call bounded). */
@@ -670,6 +721,7 @@ export class NetProxy implements ProxyOps {
       sessionId: active.sessionId,
       udid: active.udid,
       ruleCount: active.rules.length,
+      quicBlocked: active.quicBlocked,
       addonPath: active.addonPath,
       flowLogPath: active.flowLogPath,
     };
@@ -681,7 +733,12 @@ export class NetProxy implements ProxyOps {
    * a different lease gets a ProxyBusyError naming the holding session.
    * Validation (rules, CA file) runs before any host change.
    */
-  async startProxy(udid: string, holder: ProxyHolder, rules: NetProxyRule[]): Promise<{ port: number; pid?: number }> {
+  async startProxy(
+    udid: string,
+    holder: ProxyHolder,
+    rules: NetProxyRule[],
+    opts?: { blockQuic?: boolean },
+  ): Promise<{ port: number; pid?: number }> {
     const active = this.active;
     if (active) {
       if (active.leaseId === holder.leaseId) return { port: active.port, pid: active.pid };
@@ -692,8 +749,10 @@ export class NetProxy implements ProxyOps {
     if (!fs.existsSync(this.caPemPath)) {
       throw new Error(`mitm CA not found at ${this.caPemPath}; run "mitmdump" once on this host to generate it, then retry.`);
     }
+    const blockQuic = opts?.blockQuic === true;
     const port = await findFreePort(this.portBase);
     const snapshot = await this.snapshotHost();
+    const pfWasEnabled = blockQuic ? await this.readPfEnabled() : false;
     await this.run("xcrun", ["simctl", "keychain", udid, "add-root-cert", this.caPemPath], {
       timeoutMs: this.execTimeoutMs,
     });
@@ -717,6 +776,7 @@ export class NetProxy implements ProxyOps {
       await this.waitReady(port, () => spawnError);
     } catch (err) {
       await stopChildQuiet(child);
+      this.unlinkGenerated([addonPath, flowLogPath]);
       throw new Error(mitmError(err));
     }
     try {
@@ -727,7 +787,34 @@ export class NetProxy implements ProxyOps {
     } catch (err) {
       await stopChildQuiet(child);
       await this.restoreSnapshot(snapshot);
+      this.unlinkGenerated([addonPath, flowLogPath]);
       throw new Error(`Failed to enable the host proxy (previous state restored): ${sudoHint(err)}`);
+    }
+    let pfRulesPath: string | undefined;
+    let pfEnableToken: string | undefined;
+    if (blockQuic) {
+      try {
+        fs.mkdirSync(this.workDir, { recursive: true });
+        pfRulesPath = path.join(this.workDir, `pf-quicblock-${port}.conf`);
+        fs.writeFileSync(pfRulesPath, buildQuicBlockRules());
+        // Token assigned BEFORE the anchor load: if the load fails, rollback
+        // still releases our enable reference instead of leaking it.
+        if (!pfWasEnabled) pfEnableToken = await this.acquirePfEnable();
+        await this.loadQuicAnchor(pfRulesPath);
+      } catch (err) {
+        let cleanupErr: unknown = null;
+        try {
+          await this.removeQuicBlock(pfRulesPath, pfEnableToken);
+        } catch (err2) {
+          cleanupErr = err2;
+        }
+        await stopChildQuiet(child);
+        await this.restoreSnapshot(snapshot);
+        this.unlinkGenerated([addonPath, flowLogPath]);
+        const cleanupNote =
+          cleanupErr !== null ? ` (QUIC cleanup also failed: ${(cleanupErr as Error).message})` : "";
+        throw new Error(`Failed to block QUIC (previous state restored${cleanupNote}): ${sudoHintPf(err)}`);
+      }
     }
     this.active = {
       leaseId: holder.leaseId,
@@ -740,6 +827,9 @@ export class NetProxy implements ProxyOps {
       addonPath,
       flowLogPath,
       child,
+      quicBlocked: blockQuic,
+      pfEnableToken,
+      pfRulesPath,
     };
     return { port, pid: child.pid };
   }
@@ -857,8 +947,20 @@ export class NetProxy implements ProxyOps {
     try {
       await this.waitReady(active.port, () => spawnError);
     } catch (err) {
+      // The replacement child may still be alive (readiness timeout, not
+      // exit): stop it, or it strands with no reference holding the port.
+      await stopChildQuiet(child);
       await this.restoreSnapshot(active.snapshot);
+      // The proxy is gone but our PF state is not: flush the anchor and
+      // release our enable reference, or the block strands host-wide with
+      // no later stop able to reach it (status already reports not-running).
+      if (active.quicBlocked) {
+        await this.removeQuicBlock(active.pfRulesPath, active.pfEnableToken).catch((quicErr) => {
+          console.error(`[netproxy] Failed to remove the QUIC block: ${(quicErr as Error).message}`);
+        });
+      }
       this.active = null;
+      this.unlinkGenerated([active.addonPath, active.flowLogPath]);
       throw new Error(
         `${failurePrefix} and the proxy was stopped (host proxy restored): ${mitmError(err)}. ` +
           `Call net_proxy_start to resume.`,
@@ -894,6 +996,11 @@ export class NetProxy implements ProxyOps {
   private async teardown(active: ActiveProxy): Promise<void> {
     this.active = null;
     await this.restoreSnapshot(active.snapshot);
+    if (active.quicBlocked) {
+      await this.removeQuicBlock(active.pfRulesPath, active.pfEnableToken).catch((err) => {
+        console.error(`[netproxy] Failed to remove the QUIC block: ${(err as Error).message}`);
+      });
+    }
     await stopChildQuiet(active.child);
     for (const generated of [active.addonPath, active.flowLogPath]) {
       try {
@@ -902,6 +1009,83 @@ export class NetProxy implements ProxyOps {
         // Best-effort.
       }
     }
+  }
+
+  /** Read PF enabled-state (needs sudo; pfctl refuses /dev/pf for mortals). */
+  private async readPfEnabled(): Promise<boolean> {
+    try {
+      const { stdout } = await this.run("sudo", ["-n", "pfctl", "-s", "info"], {
+        timeoutMs: this.execTimeoutMs,
+      });
+      return parsePfEnabled(stdout);
+    } catch (err) {
+      // Nothing is mutated yet (the snapshot is read-only), so fail here
+      // with the provisioning hint instead of a raw sudo error.
+      throw new Error(sudoHintPf(err));
+    }
+  }
+
+  /**
+   * Enable PF via `pfctl -E` (not `-e`) per the contract in stock
+   * /etc/pf.conf. Returns the enable-reference token, which releases only OUR
+   * reference via `pfctl -X`, so a `-d`-style global disable can never kill
+   * another component's filtering. The token arrives on stderr
+   * (`pf enabled\nToken : <n>`), so both streams are parsed.
+   */
+  private async acquirePfEnable(): Promise<string> {
+    const { stdout, stderr } = await this.run("sudo", ["-n", "pfctl", "-E"], { timeoutMs: this.execTimeoutMs });
+    return parsePfEnableToken(`${stdout}\n${stderr}`);
+  }
+
+  /** Best-effort removal of generated work files on failure paths (never throws). */
+  private unlinkGenerated(paths: (string | undefined)[]): void {
+    for (const p of paths) {
+      if (!p) continue;
+      try {
+        fs.unlinkSync(p);
+      } catch {
+        // Best-effort.
+      }
+    }
+  }
+
+  /** Load the QUIC block rules into our (evaluated) anchor. */
+  private async loadQuicAnchor(rulesPath: string): Promise<void> {
+    await this.run("sudo", ["-n", "pfctl", "-a", QUIC_BLOCK_ANCHOR, "-f", rulesPath], {
+      timeoutMs: this.execTimeoutMs,
+    });
+  }
+
+  /**
+   * Flush only our anchor (never the user's ruleset) and release our PF
+   * enable reference when we hold one. The flush and the release are
+   * independent: either failing must not skip the other, and the rules file
+   * is always unlinked. Best-effort at teardown (callers catch).
+   */
+  private async removeQuicBlock(rulesPath: string | undefined, pfEnableToken?: string): Promise<void> {
+    let firstError: unknown;
+    try {
+      await this.run("sudo", ["-n", "pfctl", "-a", QUIC_BLOCK_ANCHOR, "-F", "all"], {
+        timeoutMs: this.execTimeoutMs,
+      });
+    } catch (err) {
+      firstError = err;
+    }
+    if (pfEnableToken !== undefined) {
+      try {
+        await this.run("sudo", ["-n", "pfctl", "-X", pfEnableToken], { timeoutMs: this.execTimeoutMs });
+      } catch (err) {
+        firstError ??= err;
+      }
+    }
+    if (rulesPath) {
+      try {
+        fs.unlinkSync(rulesPath);
+      } catch {
+        // Best-effort.
+      }
+    }
+    if (firstError) throw firstError;
   }
 
   /** Snapshot every network service (reads need no sudo). Unreadable endpoints restore to off. */

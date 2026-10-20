@@ -26,7 +26,7 @@ apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
 - **One shared daemon** — leases, the wait queue, and auto-dispatch live in a single process; per-session stdio servers would split the pool
 - **Lease ownership gates** — each lease holds one simulator and only its holder may drive UI, apps, debugging, or the proxy through it
 - **Wait queue with auto-dispatch** — when no simulator matches, callers get a ticket; releases, TTL expiry, and external-shutdown detection hand the next match to the first fitting ticket (FIFO)
-- **Optional dependencies degrade gracefully** — serve-sim, llmdb, and mitmdump are probed at boot; the daemon starts without them and only the tools that need them fail, with install hints
+- **Optional dependencies degrade gracefully** — serve-sim, llmdb, mitmdump, and tcpdump are probed at boot; the daemon starts without them and only the tools that need them fail, with install hints
 - **Operator-safe CLI** — `doctor` is read-only, `launchd restart` refuses while leases are held, hand-edited plists are never overwritten silently
 - **Single version source** — `package.json` feeds `/health`, the MCP handshake (`serverInfo`), and the `server` field of `pool_status` alike
 
@@ -47,6 +47,13 @@ Optional, enabling only the tools named:
 npm install -g serve-sim          # sim_rotate, sim_ca_debug, sim_memory_warning, camera_*, stream_*
 brew install alexmx/tools/llmdb   # debug_*
 brew install mitmproxy            # net_proxy_*, net_assert_flow, map_local, map_remote
+```
+
+tcpdump ships with macOS (`net_capture_*`); packet capture additionally needs
+passwordless sudo for tcpdump, e.g. via `sudo visudo`:
+
+```
+%admin ALL=(ALL) NOPASSWD: /usr/sbin/tcpdump
 ```
 
 ## Install
@@ -151,6 +158,7 @@ Environment variables (all optional):
 | `SERVE_SIM_BIN` | `serve-sim` | serve-sim binary path (optional dependency) |
 | `LLMDB_BIN` | `llmdb` | llmdb binary path (optional dependency) |
 | `MITMDUMP_BIN` | `mitmdump` | mitmdump binary path (optional dependency) |
+| `TCPDUMP_BIN` | `tcpdump` | tcpdump binary path (optional dependency, ships with macOS) |
 | `SERVE_SIM_PORT_BASE` | `3220` | First port scanned for per-lease stream helpers |
 | `NETPROXY_PORT_BASE` | `3240` | First port scanned for the lease-held proxy listener |
 | `SIM_MCP_MAX_SIMS` | `0` (uncapped) | Cap on concurrently booted simulators; excess waits |
@@ -200,6 +208,7 @@ Full reference: [Tools](docs/tools.md).
 | Live streaming (2) \* | `stream_start`, `stream_stop` |
 | Debugging (20) \* | `debug_attach`, `debug_launch`, `debug_break`, `debug_continue`, `debug_run_until`, `debug_wait`, `debug_interrupt`, `debug_bt`, `debug_threads`, `debug_locals`, `debug_scopes`, `debug_expand`, `debug_eval`, `debug_set_var`, `debug_output`, `debug_step`, `debug_detach`, `debug_sessions`, `debug_doctor`, `symbolicate` (lease optional) |
 | Network proxy (7) \* | `net_proxy_start`, `net_proxy_set_rules`, `net_proxy_stop`, `net_proxy_status`, `net_assert_flow`, `map_local`, `map_remote` |
+| Packet capture (3) \* | `net_capture_start`, `net_capture_stop`, `net_capture_status` |
 
 Key behaviors:
 
@@ -215,7 +224,8 @@ Key behaviors:
 - Streaming is opt-in: `lease_acquire` with `stream: true` (a stream failure only warns; the lease stands) or `stream_start`/`stream_stop` (both idempotent; `stream_start` returns the existing URL when already streaming). The URL lives on the lease's `streamUrl`, visible in `pool_status`/`sessions_list`/`lease_list`. One stream costs one serve-sim helper process plus MJPEG CPU — turn it on to look, off when done; `ui_screenshot` is cheaper for stills. Ports scan upward from `SERVE_SIM_PORT_BASE` because serve-sim kills whatever occupies its requested port instead of scanning (and its `:3100` default would collide with this daemon).
 - Debugging wraps the llmdb CLI (an lldb-dap wrapper with session JSON): `debug_attach {bundle_id|pid}` (exactly one) or `debug_launch {path, args?}` opens one session per lease, then break/continue/inspect. Needs a debuggable (`get-task-allow`) third-party build plus one-time host developer-tools authorization — stock Apple apps refuse attach. llmdb 0.2.0 takes `file:line` breakpoints only (no symbol breakpoints), `expand` takes a variablesReference number (not an expression), and `launch` takes a binary path (not a bundle ID).
 - `symbolicate` is `atos`-based host-local crash symbolication: `lease_id` is optional (validated and logged when given), with no udid/force gates. `binary` is effectively required (no live-pid mode).
-- Network proxy: `net_proxy_start {lease_id, rules?}` intercepts the lease simulator's HTTPS (mitmdump + generated rewrite addon + mitm CA into the simulator keychain); `net_proxy_set_rules` swaps rules (restarts only mitmdump, same port); `net_proxy_stop` is idempotent and restores the host proxy snapshot; `net_assert_flow` polls the holder's flow log (JSONL). Rules are `match{url_regex?, method?}` → `action{status?, headers?, body?, delay_ms?, request?, map_local?, map_remote?}`, first match wins, max 50; omitted `match` matches everything, `rules: []` is transparent intercept-and-log. See [Security](#security) for the host-wide warning and consent boundary.
+- Network proxy: `net_proxy_start {lease_id, rules?}` intercepts the lease simulator's HTTPS (mitmdump + generated rewrite addon + mitm CA into the simulator keychain); `net_proxy_set_rules` swaps rules (restarts only mitmdump, same port); `net_proxy_stop` is idempotent and restores the host proxy snapshot; `net_assert_flow` polls the holder's flow log (JSONL). Rules are `match{url_regex?, method?}` → `action{status?, headers?, body?, delay_ms?, request?, map_local?, map_remote?}`, first match wins, max 50; omitted `match` matches everything, `rules: []` is transparent intercept-and-log. `net_proxy_start {block_quic: true}` additionally blocks QUIC (UDP/443) via a PF anchor so apps fall back to TCP/TLS through the proxy; the anchor is flushed (and PF restored) on stop. See [Security](#security) for the host-wide warning and consent boundary.
+- Packet capture: `net_capture_start {lease_id, filter?, snaplen?, interface?}` runs tcpdump on the default-route interface for traffic the HTTP proxy cannot see (raw TCP/UDP sockets, QUIC); `net_capture_stop` is idempotent and returns a per-flow packet/byte summary plus the pcap path (kept on disk until your lease's next capture overwrites it). BPF filters are allowlisted; capturing needs passwordless sudo for tcpdump. TLS payloads stay encrypted — headers and flow sizes only.
 
 ## Usage examples
 
@@ -288,7 +298,7 @@ Common failures:
 - `launchd restart` refuses with active leases: wait for release or re-run with `--force` (drops in-flight work).
 - Hand-edited plist: `create`/`remove` show a diff and refuse without `--force`.
 - `install` reports "already installed" on the second run — that is the idempotent success path, not an error.
-- Optional-tool failure naming `serve-sim`, `llmdb`, or `mitmdump`: install that binary (see [Prerequisites](#prerequisites)); the daemon runs fine without it otherwise.
+- Optional-tool failure naming `serve-sim`, `llmdb`, `mitmdump`, or `tcpdump`: install that binary (see [Prerequisites](#prerequisites)); the daemon runs fine without it otherwise.
 - `debug_attach` refused: the build needs `get-task-allow`, the host needs its one-time developer-tools approval, and stock Apple apps always refuse.
 - Host proxy left on after a daemon crash (SIGKILL skips cleanup): kill mitmdump and switch every service off by hand:
 
@@ -303,14 +313,19 @@ done
 
 Normal shutdown (SIGINT/SIGTERM), `lease_release`, TTL expiry, sweeps, and external-shutdown detection all restore the snapshot automatically.
 
+- QUIC block or capture left behind after a daemon crash (SIGKILL skips cleanup): flush only our anchor, release enable references the daemon leaked, and kill a stranded tcpdump:
+  - `sudo pfctl -a com.apple/apple-debug-mcp.quicblock -F all` (never flush the main ruleset)
+  - a leaked `-E` enable reference has no token listing and no visible refcount: if PF was Disabled before the crash and no other PF user exists, `sudo pfctl -d` returns it to Disabled; when in doubt, reboot instead of guessing (or release your own known token via `sudo pfctl -X <token>`)
+  - `sudo pkill -f "tcpdump -i .* -w .*apple-debug-mcp-netcapture"` (match the state dir so unrelated captures survive)
+
 ## Security
 
 Full reference: [Security](docs/security.md).
 
-- **Lease-gated mutation.** UI, apps, profiling, streaming, debugging, and the proxy all require the holding `lease_id`; cross-lease calls fail naming the holder. Only one proxy holder exists across all leases.
-- **sudo is narrow and explicit.** Host proxy control needs passwordless sudo for exactly four `networksetup` subcommands — `-setwebproxy`, `-setsecurewebproxy`, `-setwebproxystate`, `-setsecurewebproxystate` — always as `sudo -n` (never interactive). Reads (`-listallnetworkservices`, `-getwebproxy`/`-getsecurewebproxy`) need no sudo. Nothing is checked or changed at daemon boot, because every `-set*` mutates host state; `net_proxy_start` fails with a sudoers-setup hint when authorization is missing.
+- **Lease-gated mutation.** UI, apps, profiling, streaming, debugging, the proxy, and packet capture all require the holding `lease_id`; cross-lease calls fail naming the holder. Only one proxy holder and one capture holder exist across all leases.
+- **sudo is narrow and explicit.** Host proxy control needs passwordless sudo for exactly four `networksetup` subcommands — `-setwebproxy`, `-setsecurewebproxy`, `-setwebproxystate`, `-setsecurewebproxystate` — always as `sudo -n` (never interactive). QUIC blocking (`block_quic`) adds `pfctl -s info`/`-E`/`-X` (enable references, never a global `-d`) and `pfctl -a <own anchor> -f`/`-F` (flush touches only that anchor, never the user's ruleset); packet capture adds `tcpdump` capture while `-r` readback needs no sudo. Reads (`-listallnetworkservices`, `-getwebproxy`/`-getsecurewebproxy`) need no sudo. Nothing is checked or changed at daemon boot, because every `-set*` mutates host state; `net_proxy_start` fails with a sudoers-setup hint when authorization is missing.
 - **Rules validate before any host change.** A bad rule is rejected without touching host networking.
-- **Host-wide proxy warning.** While the proxy is on, all host web traffic (including other apps' background traffic) flows through mitmdump, and intranet sites on a private CA may break until stop/restore. Keep it on only as long as the test needs. The mitm CA stays in the simulator keychain after stop (harmless without the proxy; full removal is `xcrun simctl keychain <udid> reset`).
+- **Host-wide proxy warning.** While the proxy is on, all host web traffic (including other apps' background traffic) flows through mitmdump, and intranet sites on a private CA may break until stop/restore. Keep it on only as long as the test needs. The mitm CA stays in the simulator keychain after stop (harmless without the proxy; full removal is `xcrun simctl keychain <udid> reset`). QUIC blocking is likewise host-wide while active (all apps' UDP/443 is dropped until the anchor is flushed on stop), and packet captures record host-wide traffic on the interface — use a BPF `filter` to narrow what is recorded.
 - **No silent destructive actions.** `doctor` is read-only (no `--fix`); restart refuses under active leases; hand-edited plists need `--force`; local-only mode exists because process-scoped interception (`mitmdump --mode local:…`) needs a manually approved macOS System Extension and is unverifiable in unattended environments, so only host mode ships.
 - **Localhost only by default.** The daemon binds `127.0.0.1:3100`; the MCP endpoint has no authentication, so do not rebind it to a shared interface.
 

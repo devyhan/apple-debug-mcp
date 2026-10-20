@@ -14,6 +14,7 @@ export interface Config {
   mitmdumpBin: string;
   /** First port scanned for the lease-held mitmdump listener. */
   netProxyPortBase: number;
+  tcpdumpBin: string;
   /** 0 = no cap on concurrently booted simulators managed by acquire. */
   maxSims: number;
   leaseTtlMs: number;
@@ -51,6 +52,7 @@ export function loadConfig(): Config {
     serveSimPortBase: num("SERVE_SIM_PORT_BASE", 3220),
     mitmdumpBin: str("MITMDUMP_BIN", "mitmdump"),
     netProxyPortBase: num("NETPROXY_PORT_BASE", 3240),
+    tcpdumpBin: str("TCPDUMP_BIN", "tcpdump"),
     maxSims: num("SIM_MCP_MAX_SIMS", 0),
     leaseTtlMs: num("SIM_MCP_LEASE_TTL_MS", 30 * 60 * 1000),
     sweepIntervalMs: num("SIM_MCP_SWEEP_MS", 60 * 1000),

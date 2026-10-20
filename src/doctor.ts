@@ -6,6 +6,7 @@ import { loadConfig } from "./config.js";
 import { Runner, defaultRunner } from "./exec.js";
 import { isPlistLoaded, plistPath } from "./launchd.js";
 import { Llmdb } from "./llmdb.js";
+import { NetCapture } from "./netcapture.js";
 import { NetProxy } from "./netproxy.js";
 import { ServeSim } from "./servesim.js";
 import { Simslim } from "./simslim.js";
@@ -96,10 +97,12 @@ export async function runDoctor(opts: DoctorOpts = {}): Promise<DoctorCheck[]> {
   const serveSim = new ServeSim({ bin: config.serveSimBin, runner, execTimeoutMs: config.execTimeoutMs });
   const lldmdb = new Llmdb({ bin: config.llmdbBin, runner, execTimeoutMs: config.execTimeoutMs });
   const netProxy = new NetProxy({ bin: config.mitmdumpBin, runner, execTimeoutMs: config.execTimeoutMs });
+  const netCapture = new NetCapture({ bin: config.tcpdumpBin, runner });
   for (const [name, check, fix] of [
     ["serve-sim", () => serveSim.checkAvailable(), "npm install -g serve-sim"],
     ["llmdb", () => lldmdb.checkAvailable(), "brew install alexmx/tools/llmdb"],
     ["mitmdump", () => netProxy.checkAvailable(), "brew install mitmproxy"],
+    ["tcpdump", () => netCapture.checkAvailable(), "macOS ships tcpdump; check TCPDUMP_BIN"],
   ] as const) {
     try {
       const version = await check();

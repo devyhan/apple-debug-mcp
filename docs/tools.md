@@ -15,6 +15,7 @@ the holding lease.
 | Live streaming (2) \* | `stream_start`, `stream_stop` |
 | Debugging (20) \* | `debug_attach`, `debug_launch`, `debug_break`, `debug_continue`, `debug_run_until`, `debug_wait`, `debug_interrupt`, `debug_bt`, `debug_threads`, `debug_locals`, `debug_scopes`, `debug_expand`, `debug_eval`, `debug_set_var`, `debug_output`, `debug_step`, `debug_detach`, `debug_sessions`, `debug_doctor`, `symbolicate` (lease optional) |
 | Network proxy (7) \* | `net_proxy_start`, `net_proxy_set_rules`, `net_proxy_stop`, `net_proxy_status`, `net_assert_flow`, `map_local`, `map_remote` |
+| Packet capture (3) \* | `net_capture_start`, `net_capture_stop`, `net_capture_status` |
 
 Key behaviors:
 
@@ -103,5 +104,14 @@ Key behaviors:
   are `match{url_regex?, method?}` →
   `action{status?, headers?, body?, delay_ms?, request?, map_local?, map_remote?}`,
   first match wins, max 50; omitted `match` matches everything, `rules: []` is
-  transparent intercept-and-log. See [Security](security.md) for the host-wide
-  warning and consent boundary.
+  transparent intercept-and-log. `net_proxy_start {block_quic: true}` additionally
+  blocks QUIC (UDP/443) via a PF anchor so apps fall back to TCP/TLS through
+  the proxy; the anchor is flushed (and PF restored) on stop. See
+  [Security](security.md) for the host-wide warning and consent boundary.
+- Packet capture: `net_capture_start {lease_id, filter?, snaplen?, interface?}`
+  runs tcpdump on the default-route interface for traffic the HTTP proxy cannot
+  see (raw TCP/UDP sockets, QUIC); `net_capture_stop` is idempotent and returns
+  a per-flow packet/byte summary plus the pcap path (kept on disk until your
+  lease's next capture overwrites it). BPF filters are allowlisted; capturing
+  needs passwordless sudo for tcpdump. TLS payloads stay encrypted — headers
+  and flow sizes only.

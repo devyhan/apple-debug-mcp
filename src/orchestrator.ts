@@ -1,4 +1,5 @@
 import { DebugOps } from "./llmdb.js";
+import { CaptureOps, CaptureStartSpec, CaptureStatus, CaptureStopResult } from "./netcapture.js";
 import { AssertFlowResult, AssertFlowSpec, NetProxyRule, NetProxyStatus, ProxyOps } from "./netproxy.js";
 import { DEFAULT_STREAM_PORT_BASE, StreamOps } from "./servesim.js";
 import { FleetOps, SimDevice } from "./simslim.js";
@@ -100,6 +101,7 @@ export class Orchestrator {
   private readonly streamPortBase: number;
   private readonly debugger?: DebugOps;
   private readonly netProxy?: ProxyOps;
+  private readonly netCapture?: CaptureOps;
   private readonly actions = new Map<string, LeaseAction[]>();
 
   constructor(
@@ -112,6 +114,7 @@ export class Orchestrator {
       streamPortBase?: number;
       debugger?: DebugOps;
       proxy?: ProxyOps;
+      capture?: CaptureOps;
     },
   ) {
     this.fleet = fleet;
@@ -122,6 +125,7 @@ export class Orchestrator {
     this.streamPortBase = opts.streamPortBase ?? DEFAULT_STREAM_PORT_BASE;
     this.debugger = opts.debugger;
     this.netProxy = opts.proxy;
+    this.netCapture = opts.capture;
   }
 
   // ---------- state views (read-only, never mutate) ----------
@@ -333,6 +337,7 @@ export class Orchestrator {
       await this.stopStreamQuiet(removed.udid);
       await this.stopDebugQuiet(removed.debugSessionId);
       await this.stopProxyQuiet(removed.leaseId);
+      await this.stopCaptureQuiet(removed.leaseId);
       const dispatched = await this.dispatchLocked();
       this.actions.delete(leaseId);
       return { released: leaseId, expiredSwept, dispatched };
@@ -397,6 +402,7 @@ export class Orchestrator {
         await this.stopStreamQuiet(lease.udid);
         await this.stopDebugQuiet(lease.debugSessionId);
         await this.stopProxyQuiet(leaseId);
+        await this.stopCaptureQuiet(leaseId);
         await this.dispatchLocked();
       });
       this.actions.delete(leaseId);
@@ -413,6 +419,7 @@ export class Orchestrator {
         await this.stopStreamQuiet(lease.udid);
         await this.stopDebugQuiet(lease.debugSessionId);
         await this.stopProxyQuiet(leaseId);
+        await this.stopCaptureQuiet(leaseId);
         await this.dispatchLocked();
       });
       this.actions.delete(leaseId);
@@ -476,6 +483,7 @@ export class Orchestrator {
     for (const udid of sweptUdids) await this.stopStreamQuiet(udid);
     for (const sessionId of sweptDebugSessions) await this.stopDebugQuiet(sessionId);
     for (const leaseId of sweptLeaseIds) await this.stopProxyQuiet(leaseId);
+    for (const leaseId of sweptLeaseIds) await this.stopCaptureQuiet(leaseId);
     return swept;
   }
 
@@ -786,13 +794,19 @@ export class Orchestrator {
    * Idempotent for the holding lease; a different lease gets a ProxyBusyError
    * naming the holding session (one holder at a time — the host proxy is global).
    */
-  startLeaseProxy(leaseId: string, rules: NetProxyRule[]): Promise<{ lease: Lease; port: number; pid?: number }> {
+  startLeaseProxy(
+    leaseId: string,
+    rules: NetProxyRule[],
+    opts?: { blockQuic?: boolean },
+  ): Promise<{ lease: Lease; port: number; pid?: number; quicBlocked: boolean }> {
     return this.mutex.run(async () => {
       const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
       if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
       if (!this.netProxy) throw new LeaseError("Network proxy is unavailable: no proxy is configured");
-      const { port, pid } = await this.netProxy.startProxy(found.udid, { leaseId, sessionId: found.sessionId }, rules);
-      return { lease: found, port, pid };
+      const { port, pid } = await this.netProxy.startProxy(found.udid, { leaseId, sessionId: found.sessionId }, rules, opts);
+      // Report ACTUAL state, not the request echo: a holding lease's re-start
+      // is idempotent and ignores new opts.
+      return { lease: found, port, pid, quicBlocked: this.netProxy.proxyStatus().quicBlocked === true };
     });
   }
 
@@ -823,6 +837,35 @@ export class Orchestrator {
       if (!this.netProxy) return { lease: found, stopped: false };
       const { stopped } = await this.netProxy.stopProxy(leaseId);
       return { lease: found, stopped };
+    });
+  }
+
+  startLeaseCapture(leaseId: string, spec: CaptureStartSpec): Promise<{ lease: Lease; pid: number; pcapPath: string }> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.netCapture) throw new LeaseError("Packet capture is unavailable: no capture is configured");
+      const { pid, pcapPath } = await this.netCapture.startCapture(leaseId, { ...spec, sessionId: found.sessionId, udid: found.udid });
+      return { lease: found, pid, pcapPath };
+    });
+  }
+
+  stopLeaseCapture(leaseId: string): Promise<{ lease: Lease } & CaptureStopResult> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.netCapture) return { lease: found, stopped: false };
+      const result = await this.netCapture.stopCapture(leaseId);
+      return { lease: found, ...result };
+    });
+  }
+
+  leaseCaptureStatus(leaseId: string): Promise<{ lease: Lease } & CaptureStatus> {
+    return this.mutex.run(async () => {
+      const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
+      if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
+      if (!this.netCapture) return { lease: found, running: false };
+      return { lease: found, ...this.netCapture.captureStatus() };
     });
   }
 
@@ -879,6 +922,24 @@ export class Orchestrator {
       await this.netProxy.stopProxy(leaseId);
     } catch (err) {
       console.error(`[orchestrator] Failed to stop network proxy for ${leaseId}: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Best-effort capture teardown for release/sweep/expire paths; never throws
+   * (and never fails the release). Only the holder's own teardown stops the
+   * capture — other leases' releases leave it running.
+   */
+  private async stopCaptureQuiet(leaseId: string): Promise<void> {
+    if (!this.netCapture) return;
+    const status = this.netCapture.captureStatus();
+    if (!status.running || status.leaseId !== leaseId) return;
+    try {
+      // Skip the readback summary: this runs under the global mutex on every
+      // release path and the result would be discarded anyway.
+      await this.netCapture.stopCapture(leaseId, { summarize: false });
+    } catch (err) {
+      console.error(`[orchestrator] Failed to stop packet capture for ${leaseId}: ${(err as Error).message}`);
     }
   }
 

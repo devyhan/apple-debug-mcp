@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-20
+
+### Added
+
+- QUIC blocking: `net_proxy_start {block_quic: true}` drops UDP/443 via the
+  PF anchor `com.apple/apple-debug-mcp.quicblock` (directly under `com.apple/`
+  so stock pf.conf evaluates it), forcing apps to fall back to TCP/TLS through
+  the proxy. PF is enabled with `pfctl -E` token refcounting (never a global
+  `-d`); stop flushes only our anchor and releases our token. Actual
+  `quic_blocked` state is returned by start and exposed by `net_proxy_status`.
+  Live-verified: 3/3 UDP probes blocked, full restore on stop.
+- Packet capture: new `net_capture_start`/`net_capture_stop`/
+  `net_capture_status` tools (tcpdump on the default-route interface) for
+  traffic the HTTP proxy cannot see: raw TCP/UDP sockets and QUIC. Stop
+  returns a per-flow packet/byte summary plus the pcap path (kept until your
+  lease's next capture). BPF filters are allowlisted, `TCPDUMP_BIN` env added,
+  `doctor` and boot probe cover tcpdump, captures auto-stop on release and
+  daemon shutdown. Live-verified on TCP and UDP traffic.
+- Docs: packet-capture tool rows, `TCPDUMP_BIN` env tables, crash-recovery
+  recipes for a stranded anchor/PF reference/tcpdump, sudo-scope updates.
+
+### Fixed
+
+- `pfctl -E` token is parsed from stderr (macOS prints it there, not stdout).
+- Capture readback uses full `tcpdump -n -r`: the `-q` short form has no
+  Flags/length to parse and summarized every capture as zero packets.
+- A failed rules update now also removes the QUIC block, stops the replacement
+  mitmdump child, and unlinks generated files instead of stranding them.
+- Failure paths unlink generated addon/flow files; QUIC rollback hedges the
+  restore claim when its own cleanup fails.
+
 ## [0.2.0] - 2026-10-20
 
 ### Added

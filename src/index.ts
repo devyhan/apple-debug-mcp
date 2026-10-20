@@ -7,6 +7,7 @@ import { isCliCommand, runCli } from "./cli.js";
 import { loadConfig } from "./config.js";
 import { Llmdb } from "./llmdb.js";
 import { migrateLegacyStateDir } from "./migrate.js";
+import { NetCapture } from "./netcapture.js";
 import { NetProxy } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import { createMcpServer } from "./server.js";
@@ -60,6 +61,7 @@ async function main(): Promise<void> {
     execTimeoutMs: config.execTimeoutMs,
     portBase: config.netProxyPortBase,
   });
+  const netCapture = new NetCapture({ bin: config.tcpdumpBin });
 
   for (const [name, check] of [
     ["simslim", () => simslim.checkAvailable()],
@@ -112,6 +114,19 @@ async function main(): Promise<void> {
     );
   }
 
+  // Optional dependency: the daemon starts without tcpdump; the net_capture_*
+  // tools fail at call time with an install hint. Capturing itself needs
+  // passwordless sudo for tcpdump, gated at call time (see net_capture_start).
+  try {
+    const version = await netCapture.checkAvailable();
+    console.log(`[sim-mcp] tcpdump: ${version.split("\n")[0]}`);
+  } catch {
+    console.warn(
+      `[sim-mcp] WARNING: optional binary "${config.tcpdumpBin}" is not usable; ` +
+        `net_capture_* tools will fail until it is installed`,
+    );
+  }
+
   const store = Store.load(config.stateFile);
   const orchestrator = new Orchestrator(simslim, store, {
     defaultTtlMs: config.leaseTtlMs,
@@ -120,6 +135,7 @@ async function main(): Promise<void> {
     streamPortBase: config.serveSimPortBase,
     debugger: lldmdb,
     proxy: netProxy,
+    capture: netCapture,
   });
   const mcpDeps = { orchestrator, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir: config.screenshotDir };
 
@@ -238,9 +254,11 @@ async function main(): Promise<void> {
   const shutdown = () => {
     clearInterval(sweepTimer);
     removeLock(lockPath);
-    // Never strands the host proxy on: forceStop is best-effort and never throws.
+    // Never strands the host proxy on or a root tcpdump running: both
+    // forceStops are best-effort and never throw.
     void (async () => {
       await netProxy.forceStop();
+      await netCapture.forceStop();
       httpServer.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 2000).unref();
     })();
