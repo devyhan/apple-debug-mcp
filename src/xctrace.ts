@@ -1,7 +1,11 @@
+import { existsSync } from "node:fs";
 import { Runner, defaultRunner } from "./exec.js";
 
 /** Upper bound for a single profile_trace recording (CI-safe). */
 export const MAX_TRACE_SEC = 60;
+
+/** Upper bound for startup grace added on top of the recording (timeout sanity). */
+export const MAX_STARTUP_GRACE_SEC = 600;
 
 export interface TraceOptions {
   /** Template name (e.g. "Time Profiler") or path. Defaults to "Time Profiler". */
@@ -48,9 +52,11 @@ function assertOutputPath(output: string): void {
  */
 export class XCTrace {
   private readonly run: Runner;
+  private readonly exists: (p: string) => boolean;
 
-  constructor(opts: { runner?: Runner } = {}) {
+  constructor(opts: { runner?: Runner; exists?: (p: string) => boolean } = {}) {
     this.run = opts.runner ?? defaultRunner;
+    this.exists = opts.exists ?? existsSync;
   }
 
   async record(udid: string, output: string, opts: TraceOptions = {}): Promise<TraceResult> {
@@ -73,8 +79,10 @@ export class XCTrace {
     if (attach !== undefined) args.push("--attach", String(attach));
     else args.push("--all-processes");
     args.push("--time-limit", `${timeLimitSec}s`, "--no-prompt", "--output", output);
-    const timeoutMs = (timeLimitSec + (opts.startupGraceSec ?? 180)) * 1000;
+    const startupGraceSec = Math.min(opts.startupGraceSec ?? 180, MAX_STARTUP_GRACE_SEC);
+    const timeoutMs = (timeLimitSec + startupGraceSec) * 1000;
     await this.run("xcrun", args, { timeoutMs });
+    if (!this.exists(output)) throw new Error(`xctrace succeeded but output not found: ${output}`);
     return { path: output, template };
   }
 }

@@ -66,15 +66,35 @@ Key behaviors:
   port instead of scanning (and its `:3100` default would collide with this
   daemon).
 - Debugging wraps the llmdb CLI (an lldb-dap wrapper with session JSON):
-  `debug_attach {bundle_id|pid}` (exactly one) or `debug_launch {path, args?}`
+  `debug_attach {bundle_id|pid}` (exactly one) or `debug_launch {path|bundle_id, args?}`
   opens one session per lease, then break/continue/inspect. Needs a debuggable
   (`get-task-allow`) third-party build plus one-time host developer-tools
   authorization — stock Apple apps refuse attach. llmdb 0.2.0 takes `file:line`
   breakpoints only (no symbol breakpoints), `expand` takes a variablesReference
-  number (not an expression), and `launch` takes a binary path (not a bundle ID).
+  number (not an expression), and `launch` takes exactly one of a binary path
+  or a bundle ID (the bundle form launches via simctl, then attaches).
 - `symbolicate` is `atos`-based host-local crash symbolication: `lease_id` is
   optional (validated and logged when given), with no udid/force gates. `binary`
   is effectively required (no live-pid mode).
+- Debug verbs, per-verb args and gotchas (one session per lease; every verb
+  below except `attach`/`launch`/`detach`/`sessions`/`doctor` needs it):
+
+| Verb | Args | Gotcha |
+| --- | --- | --- |
+| `attach` | exactly one of `bundle_id`/`pid` | re-attaching replaces the old session; stock Apple apps refuse |
+| `launch` | exactly one of `path`/`bundle_id` (+`args`) | bundle form = simctl launch + `attach --app`; llmdb CLI itself is path-only |
+| `break` | set `file`+`line` or `breakpoints[]` / list / `delete` id or ids / `exception` filters | `file:line` only, no symbol breakpoints; one op per call (a batch counts as one) |
+| `continue` / `run_until` / `wait` / `interrupt` | `wait_sec` (max 600) | `continue` blocks server-side for the full wait; exec timeout adds grace |
+| `bt` / `threads` | `thread`/`depth` | stopped-thread only; list threads first for multi-threaded stops |
+| `locals` / `scopes` / `expand` | `frame` (default 0) | `expand` takes a variablesReference number, not an expression |
+| `eval` / `set_var` | `expr` (+`frame`); `target`+`value` | evaluated in the stopped frame's context |
+| `output` | `clear?` | captured target stdout/stderr; `clear` drains for the next read |
+| `step` | `over` (default)/`in`/`out` | one source line per call |
+| `detach` | — | idempotent (`stopped=false` when already gone); release/expire also stops it |
+| `sessions` / `doctor` / `symbolicate` | `lease_id` optional for `symbolicate` | cross-lease/host-local diagnostics; `symbolicate` needs `binary` |
+
+  Argv shapes follow llmdb 0.2.0 exactly — if `llmdb --help` drifts,
+  the wrapper and this table need a joint update.
 - Network proxy: `net_proxy_start {lease_id, rules?}` intercepts the lease
   simulator's HTTPS (mitmdump + generated rewrite addon + mitm CA into the
   simulator keychain); `net_proxy_set_rules` swaps rules (restarts only

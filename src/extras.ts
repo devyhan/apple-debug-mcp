@@ -2,8 +2,8 @@ import os from "node:os";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { ExecError } from "./exec.js";
-import { Llmdb, MAX_CONTINUE_WAIT_SEC, STEP_MODES } from "./llmdb.js";
+import { DEFAULT_BOUND_MAX_CHARS, ExecError, tailTruncationMarker } from "./exec.js";
+import { Llmdb, MAX_CONTINUE_WAIT_SEC, STEP_MODES, hintForDebugError, isDebugTimeoutError } from "./llmdb.js";
 import { MAX_ASSERT_FLOW_SEC, MAX_PROXY_RULES } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import { SimApps } from "./simapps.js";
@@ -36,6 +36,24 @@ function fail(message: string): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: message }, null, 2) }], isError: true };
 }
 
+/** Top-level state/stopReason (cont/step/wait). */
+function stopSummary(r: unknown): Record<string, string> {
+  const o = (r ?? {}) as Record<string, unknown>;
+  const s: Record<string, string> = {};
+  if (typeof o["state"] === "string") s["state"] = o["state"];
+  const q = o["stopReason"] ?? o["stop_reason"];
+  if (typeof q === "string") s["stopReason"] = q;
+  return s;
+}
+
+/** Tail-truncated output text (mirrors sim_log). */
+function truncateOutput(result: unknown, maxChars: number): { output: string; truncated: boolean } {
+  const f = (result as { output?: unknown })?.output;
+  const t = typeof result === "string" ? result : typeof f === "string" ? f : JSON.stringify(result);
+  return t.length <= maxChars ? { output: t, truncated: false }
+    : { output: tailTruncationMarker(t.length - maxChars) + t.slice(-maxChars), truncated: true };
+}
+
 /** Missing-binary errors get an install hint; everything else passes through. */
 function serveSimError(err: unknown): string {
   const msg = (err as Error).message;
@@ -57,7 +75,8 @@ function lldmdbError(err: unknown): string {
   if (/llmdb.*(not found|ENOENT)|spawn llmdb/i.test(msg)) {
     return `${msg}. llmdb is not installed; run: brew install alexmx/tools/llmdb (or set LLMDB_BIN)`;
   }
-  return msg;
+  const hint = hintForDebugError(msg);
+  return hint ? `${msg}. Hint: ${hint}` : msg;
 }
 
 /** Missing-binary errors get an install hint; everything else passes through. */
@@ -176,6 +195,32 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       throw new Error(`Lease ${lease.leaseId} has no debug session attached; call debug_attach first.`);
     }
     return lease.debugSessionId;
+  }
+
+  /**
+   * Run a long-blocking debug op; on client timeout best-effort auto-stop the
+   * lease's session (via the orchestrator's shared stop path, never duplicated
+   * here) and rethrow with a re-attach hint. Non-timeout errors pass through.
+   */
+  async function withDebugTimeoutGuard<T>(leaseId: string, sessionId: string, op: () => Promise<T>): Promise<T> {
+    try {
+      return await op();
+    } catch (err) {
+      if (!isDebugTimeoutError(err)) throw err;
+      let stopped = false;
+      let autoId: string | null = null;
+      try {
+        ({ stopped, sessionId: autoId } = await orch.autoStopDebugSession(leaseId, sessionId));
+      } catch {
+        // autoStopDebugSession never throws; the timeout error below is what matters.
+      }
+      const what = stopped
+        ? `debug session ${autoId} auto-stopped`
+        : autoId !== null
+          ? `debug session ${autoId} left attached`
+          : "no debug session remained to auto-stop";
+      throw new Error(`${(err as Error).message}. Hint: client timeout (${what}); call debug_attach to open a new session`);
+    }
   }
 
   /** Mirrors sim_shutdown: leased sims need force=true. Returns the holder (if any). */
@@ -648,13 +693,28 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     "debug_break",
     {
       description:
-        "Manage breakpoints in your lease's debug session. Exactly one op per call: set (file+line, with optional condition/hit_condition), list (list=true), delete (delete=<id>), or exception filters (exception=[...], [] clears).",
+        "Manage breakpoints in your lease's debug session. Exactly one op per call: set (file+line for one, or breakpoints=[...] for several, with optional condition/hit_condition), list (list=true), delete (delete=<id> or [<ids>]), or exception filters (exception=[...], [] clears).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         file: z.string().min(1).optional().describe("Source file path for set, e.g. ./Sources/App/main.swift."),
         line: z.number().int().positive().optional().describe("1-based line number for set."),
+        breakpoints: z
+          .array(
+            z.object({
+              file: z.string().min(1).describe("Source file path, e.g. ./Sources/App/main.swift."),
+              line: z.number().int().positive().describe("1-based line number."),
+              condition: z.string().min(1).optional().describe("Fire only when this expression is true."),
+              hit_condition: z.string().min(1).optional().describe("Fire on a hit-count match, e.g. >5 or 3."),
+            }),
+          )
+          .min(1)
+          .optional()
+          .describe("Set only: set several breakpoints with one call (alternative to file+line)."),
         list: z.boolean().optional().describe("List breakpoints in the session."),
-        delete: z.number().int().positive().optional().describe("Delete the breakpoint with this id."),
+        delete: z
+          .union([z.number().int().positive(), z.array(z.number().int().positive()).min(1)])
+          .optional()
+          .describe("Delete the breakpoint with this id, or several with an array of ids."),
         exception: z
           .array(z.string().min(1))
           .optional()
@@ -663,13 +723,14 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         hit_condition: z.string().min(1).optional().describe("Set only: fire on a hit-count match, e.g. >5 or 3."),
       },
     },
-    async ({ lease_id, file, line, list, delete: del, exception, condition, hit_condition }) => {
+    async ({ lease_id, file, line, breakpoints, list, delete: del, exception, condition, hit_condition }) => {
       try {
         const ops = [
           list === true ? "list" : null,
           del !== undefined ? "delete" : null,
           exception !== undefined ? "exception" : null,
-          file !== undefined || line !== undefined || condition !== undefined || hit_condition !== undefined
+          file !== undefined || line !== undefined || breakpoints !== undefined ||
+            condition !== undefined || hit_condition !== undefined
             ? "set"
             : null,
         ].filter((op): op is string => op !== null);
@@ -688,14 +749,33 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
         }
         if (op === "delete") {
-          const result = await lldmdb.breakDelete(sessionId, del as number);
-          await orch.logAction(lease_id, "debug_break", `break delete ${del}`);
+          const ids = del as number | number[];
+          const result = Array.isArray(ids)
+            ? await lldmdb.breakDeleteMany(sessionId, ids)
+            : await lldmdb.breakDelete(sessionId, ids);
+          await orch.logAction(lease_id, "debug_break", `break delete ${Array.isArray(ids) ? ids.join(",") : ids}`);
           return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
         }
         if (op === "exception") {
           const result = await lldmdb.breakException(sessionId, exception as string[]);
           const summary = (exception as string[]).length === 0 ? "break exception (clear)" : `break exception ${(exception as string[]).join(",")}`;
           await orch.logAction(lease_id, "debug_break", summary.slice(0, 160));
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+        }
+        if (breakpoints !== undefined) {
+          if (file !== undefined || line !== undefined || condition !== undefined || hit_condition !== undefined) {
+            return fail("debug_break set takes either file+line or breakpoints=[...], not both.");
+          }
+          const result = await lldmdb.breakSetMany(
+            sessionId,
+            breakpoints.map((b) => ({
+              file: b.file,
+              line: b.line,
+              ...(b.condition !== undefined ? { condition: b.condition } : {}),
+              ...(b.hit_condition !== undefined ? { hitCondition: b.hit_condition } : {}),
+            })),
+          );
+          await orch.logAction(lease_id, "debug_break", `break set x${breakpoints.length}`.slice(0, 160));
           return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
         }
         if (file === undefined || line === undefined) {
@@ -720,7 +800,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_continue",
     {
-      description: "Resume execution until the next stop (or the wait elapses).",
+      description: "Resume execution until the next stop (or the wait elapses). A client timeout auto-stops the session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         wait_sec: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Block up to this many seconds for the next stop. Default 60, max 600."),
@@ -730,9 +810,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await lldmdb.cont(sessionId, wait_sec ?? 60);
+        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.cont(sessionId, wait_sec ?? 60));
         await orch.logAction(lease_id, "debug_continue", `continue (wait ${wait_sec ?? 60}s)`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), result });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -826,7 +906,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.step(sessionId, mode ?? "over");
         await orch.logAction(lease_id, "debug_step", `step ${mode ?? "over"}`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), result });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -868,17 +948,23 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_sessions",
     {
-      description: "List active llmdb debug sessions across all agents on this host's daemon.",
+      description:
+        "List active llmdb debug sessions across all agents on this host's daemon. lease_id is optional — when given, the lease is validated and the call is logged against it.",
       inputSchema: {
-        lease_id: z.string().describe("Your active lease id."),
+        lease_id: z.string().optional().describe("Your active lease id (validates + logs when given)."),
       },
     },
     async ({ lease_id }) => {
       try {
-        const lease = await orch.resolveLease(lease_id);
+        let udid: string | undefined;
+        if (lease_id !== undefined) {
+          udid = (await orch.resolveLease(lease_id)).udid;
+        }
         const result = await lldmdb.sessions();
-        await orch.logAction(lease_id, "debug_sessions", "sessions");
-        return ok({ lease_id, udid: lease.udid, result });
+        if (lease_id !== undefined) {
+          await orch.logAction(lease_id, "debug_sessions", "sessions");
+        }
+        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), result });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -889,17 +975,41 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     "debug_launch",
     {
       description:
-        "Launch a binary (or .app bundle) under the debugger for your lease (one session per lease; re-launching replaces it). Takes a filesystem path — llmdb has no bundle-id launch, so use app_launch + debug_attach for sim apps by bundle id.",
+        "Launch a target under the debugger for your lease (one session per lease; re-launching replaces it). Exactly one of path or bundle_id: path launches a binary (or .app bundle) via `llmdb launch`; bundle_id launches a sim app via simctl then attaches via `llmdb attach --app` (llmdb 0.2.0 launch takes a filesystem path only — verified `llmdb launch --help` — so the bundle form is composed from existing primitives, never a new flag).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
-        path: z.string().min(1).describe("Path to the binary (or .app bundle) to debug."),
-        args: z.array(z.string()).optional().describe("Argv forwarded to the binary."),
+        path: z.string().min(1).optional().describe("Path to the binary (or .app bundle) to debug (exactly one of path or bundle_id)."),
+        bundle_id: z.string().min(1).optional().describe("Sim app bundle id to launch then attach to (exactly one of path or bundle_id)."),
+        args: z.array(z.string()).optional().describe("Argv forwarded to the binary/app."),
       },
     },
-    async ({ lease_id, path: target, args }) => {
+    async ({ lease_id, path: target, bundle_id, args }) => {
       try {
+        if ((target === undefined) === (bundle_id === undefined)) {
+          return fail("debug_launch needs exactly one of path or bundle_id.");
+        }
         const lease = await orch.resolveLease(lease_id);
-        const { sessionId, response } = await lldmdb.launch(target, args ?? []);
+        if (bundle_id !== undefined) {
+          let pid: number;
+          try {
+            ({ pid } = await simApps.launch(lease.udid, bundle_id, args ?? []));
+          } catch (err) {
+            return fail((err as Error).message);
+          }
+          const { sessionId, response } = await lldmdb.attach({ bundleId: bundle_id });
+          const replaced = await orch.setDebugSession(lease_id, sessionId);
+          if (replaced && replaced !== sessionId) {
+            try {
+              await lldmdb.stop(replaced);
+            } catch {
+              // The replaced session is already gone; the new launch wins regardless.
+            }
+          }
+          await orch.logAction(lease_id, "debug_launch", `launch ${bundle_id} (pid ${pid}, session ${sessionId})`.slice(0, 160));
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, bundle_id, pid, result: response });
+        }
+        const fsPath = target as string; // exactly-one check above guarantees this
+        const { sessionId, response } = await lldmdb.launch(fsPath, args ?? []);
         const replaced = await orch.setDebugSession(lease_id, sessionId);
         if (replaced && replaced !== sessionId) {
           try {
@@ -908,7 +1018,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
             // The replaced session is already gone; the new launch wins regardless.
           }
         }
-        await orch.logAction(lease_id, "debug_launch", `launch ${path.basename(target)} (session ${sessionId})`.slice(0, 160));
+        await orch.logAction(lease_id, "debug_launch", `launch ${path.basename(fsPath)} (session ${sessionId})`.slice(0, 160));
         return ok({ lease_id, udid: lease.udid, session_id: sessionId, result: response });
       } catch (err) {
         return fail(lldmdbError(err));
@@ -919,17 +1029,23 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_doctor",
     {
-      description: "Diagnose the local llmdb environment (lldb-dap, socket dir, daemon reachability).",
+      description:
+        "Diagnose the local llmdb environment (lldb-dap, socket dir, daemon reachability). lease_id is optional — when given, the lease is validated and the call is logged against it.",
       inputSchema: {
-        lease_id: z.string().describe("Your active lease id."),
+        lease_id: z.string().optional().describe("Your active lease id (validates + logs when given)."),
       },
     },
     async ({ lease_id }) => {
       try {
-        const lease = await orch.resolveLease(lease_id);
+        let udid: string | undefined;
+        if (lease_id !== undefined) {
+          udid = (await orch.resolveLease(lease_id)).udid;
+        }
         const result = await lldmdb.doctor();
-        await orch.logAction(lease_id, "debug_doctor", "doctor");
-        return ok({ lease_id, udid: lease.udid, result });
+        if (lease_id !== undefined) {
+          await orch.logAction(lease_id, "debug_doctor", "doctor");
+        }
+        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), result });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -1033,15 +1149,17 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         clear: z.boolean().optional().describe("Drain the buffer so the next call returns only newer output. Default false."),
+        max_chars: z.number().int().positive().optional().describe("Tail-truncate output text. Default 20000."),
       },
     },
-    async ({ lease_id, clear }) => {
+    async ({ lease_id, clear, max_chars }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.output(sessionId, clear ?? false);
         await orch.logAction(lease_id, "debug_output", clear === true ? "output (clear)" : "output");
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        const { output, truncated } = truncateOutput(result, max_chars ?? DEFAULT_BOUND_MAX_CHARS);
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result, output, truncated });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -1051,20 +1169,23 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_run_until",
     {
-      description: "Set a breakpoint at file:line and continue; returns when it hits (or the target terminates).",
+      description: "Set a breakpoint at file:line and continue; returns when it hits (or the target terminates). A client timeout auto-stops the session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         file: z.string().min(1).describe("Source file path, e.g. ./Sources/App/main.swift."),
         line: z.number().int().positive().describe("1-based line number."),
         wait_sec: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Block up to this many seconds. Default 60, max 600."),
+        cleanup: z.boolean().optional().describe("Delete the run-until breakpoint afterwards (best-effort). Default false."),
       },
     },
-    async ({ lease_id, file, line, wait_sec }) => {
+    async ({ lease_id, file, line, wait_sec, cleanup }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await lldmdb.runUntil(sessionId, file, line, wait_sec ?? 60);
-        await orch.logAction(lease_id, "debug_run_until", `run-until ${file}:${line}`.slice(0, 160));
+        const result = await withDebugTimeoutGuard(lease_id, sessionId, () =>
+          lldmdb.runUntil(sessionId, file, line, wait_sec ?? 60, { cleanup: cleanup ?? false }),
+        );
+        await orch.logAction(lease_id, "debug_run_until", `run-until ${file}:${line}${cleanup === true ? " (cleanup)" : ""}`.slice(0, 160));
         return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
       } catch (err) {
         return fail(lldmdbError(err));
@@ -1075,7 +1196,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_wait",
     {
-      description: "Block until your lease's debug session leaves `running` (stops or terminates).",
+      description: "Block until your lease's debug session leaves `running` (stops or terminates). A client timeout auto-stops the session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         timeout: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Timeout in seconds. Default 60, max 600."),
@@ -1085,9 +1206,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await lldmdb.wait(sessionId, timeout ?? 60);
+        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.wait(sessionId, timeout ?? 60));
         await orch.logAction(lease_id, "debug_wait", `wait (timeout ${timeout ?? 60}s)`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), result });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -1097,16 +1218,17 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_interrupt",
     {
-      description: "Pause your lease's running debug session; returns once stopped.",
+      description: "Pause your lease's running debug session; returns once stopped. A client timeout auto-stops the session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
+        wait_sec: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Block up to this many seconds. Default 10, max 600."),
       },
     },
-    async ({ lease_id }) => {
+    async ({ lease_id, wait_sec }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await lldmdb.interrupt(sessionId);
+        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.interrupt(sessionId, wait_sec ?? 10));
         await orch.logAction(lease_id, "debug_interrupt", "interrupt");
         return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
       } catch (err) {
@@ -1119,18 +1241,20 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     "symbolicate",
     {
       description:
-        "Symbolicate hex addresses against a Mach-O binary via atos (host-local, read-only; touches no simulator). lease_id is optional — when given, the lease is validated and the call is logged against it.",
+        "Symbolicate hex addresses against a Mach-O binary via atos (host-local, read-only; touches no simulator). Auto-detects -arch via lipo, a sibling dSYM, and load_addr from images text. lease_id is optional — when given, the lease is validated and the call is logged against it.",
       inputSchema: {
         pcs: z
           .union([z.string().min(1), z.array(z.string().min(1)).min(1).max(100)])
           .describe('Program counters to symbolicate: one hex address or an array (max 100), e.g. "0x100234567".'),
         binary: z.string().min(1).optional().describe("Mach-O binary (or dSYM) the addresses belong to. Required for atos."),
-        arch: z.string().min(1).optional().describe('Slice for universal binaries, e.g. "arm64".'),
-        load_addr: z.string().min(1).optional().describe('Image load address for ASLR\'d addresses, e.g. "0x100000000".'),
+        arch: z.string().min(1).optional().describe('Slice for universal binaries, e.g. "arm64". Omit to auto-detect via lipo.'),
+        load_addr: z.string().min(1).optional().describe('Image load address for ASLR\'d addresses, e.g. "0x100000000". Omit with images to auto-derive it.'),
+        images: z.string().min(1).optional().describe("Crash-log Binary Images text to auto-derive load_addr when load_addr is omitted."),
+        dsym: z.string().min(1).optional().describe("Explicit dSYM bundle (or DWARF file); overrides sibling auto-find."),
         lease_id: z.string().optional().describe("Your active lease id (validates + logs when given)."),
       },
     },
-    async ({ pcs, binary, arch, load_addr, lease_id }) => {
+    async ({ pcs, binary, arch, load_addr, images, dsym, lease_id }) => {
       try {
         let udid: string | undefined;
         if (lease_id !== undefined) {
@@ -1142,6 +1266,8 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           ...(binary !== undefined ? { binary } : {}),
           ...(arch !== undefined ? { arch } : {}),
           ...(load_addr !== undefined ? { loadAddr: load_addr } : {}),
+          ...(images !== undefined ? { images } : {}),
+          ...(dsym !== undefined ? { dsym } : {}),
         });
         if (lease_id !== undefined) {
           await orch.logAction(lease_id, "symbolicate", `symbolicate ${addresses.length} pc(s) ${path.basename(result.binary)}`.slice(0, 160));

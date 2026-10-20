@@ -14,6 +14,7 @@ import { SimApps } from "../src/simapps.js";
 import { SimLog } from "../src/simlog.js";
 import { FleetOps, SimDevice, SlimStatus } from "../src/simslim.js";
 import { Store } from "../src/store.js";
+import { Symbolicator } from "../src/symbolicate.js";
 import { XCTrace } from "../src/xctrace.js";
 
 interface Call {
@@ -124,12 +125,13 @@ describe("Llmdb wrapper", () => {
     await expect(lldmdb.step("sess-1", "sideways")).rejects.toThrow(/Invalid mode/);
   });
 
-  it("stops with optional session and lists sessions", async () => {
+  it("stops with a required session and lists sessions", async () => {
     const run = stubRunner(() => JSON.stringify({ stopped: true }));
     const lldmdb = new Llmdb({ runner: run });
     await lldmdb.stop("sess-1");
-    await lldmdb.stop();
-    expect(run.calls.map((c) => c.args)).toEqual([["stop", "--session", "sess-1"], ["stop"]]);
+    expect(run.calls.map((c) => c.args)).toEqual([["stop", "--session", "sess-1"]]);
+    await expect(lldmdb.stop("  ")).rejects.toThrow(/session_id/);
+    expect(run.calls).toHaveLength(1);
     const run2 = stubRunner(() => JSON.stringify([]));
     await new Llmdb({ runner: run2 }).sessions();
     expect(run2.calls[0]?.args).toEqual(["sessions"]);
@@ -342,7 +344,7 @@ describe("orchestrator debug bookkeeping", () => {
   });
 });
 
-async function makeDebugClient(llmdbrun: Runner & { calls: Call[] }) {
+async function makeDebugClient(llmdbrun: Runner & { calls: Call[] }, atosrun?: Runner) {
   const orch = new Orchestrator(new FakeFleet(), Store.load(tmpState()), { defaultTtlMs: 60_000 });
   const server = new McpServer({ name: "test", version: "0" });
   const noop = async () => ({ stdout: "", stderr: "" });
@@ -353,6 +355,7 @@ async function makeDebugClient(llmdbrun: Runner & { calls: Call[] }) {
     simApps: new SimApps({ runner: noop }),
     xctrace: new XCTrace({ runner: noop }),
     lldmdb: new Llmdb({ runner: llmdbrun }),
+    ...(atosrun ? { symbolicator: new Symbolicator({ runner: atosrun }) } : {}),
   });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
@@ -629,6 +632,33 @@ describe("round-2 debug_* tools", () => {
     expect(run.calls).toHaveLength(0);
   });
 
+describe("debug-ux", () => {
+  it("wait_sec, truncation, stopReason", async () => {
+    const run = stubRunner((_b, args) => {
+      const v = args[0];
+      if (v === "attach") return '{"sessionId":"dbg-9"}';
+      if (v === "output") return '{"output":"abcdef"}';
+      return `{"state":"stopped","stop${v === "step" ? "_reason" : "Reason"}":"bp"}`;
+    });
+    const { client, leaseId } = await makeDebugClient(run);
+    await call(client, "debug_attach", { lease_id: leaseId, pid: 1 });
+    await call(client, "debug_interrupt", { lease_id: leaseId });
+    await call(client, "debug_interrupt", { lease_id: leaseId, wait_sec: 3 });
+    expect(run.calls.slice(1, 3).map((c) => c.args)).toEqual([
+      ["interrupt", "--wait", "10", "--session", "dbg-9"],
+      ["interrupt", "--wait", "3", "--session", "dbg-9"],
+    ]);
+    const full = await call(client, "debug_output", { lease_id: leaseId });
+    expect(full.json).toMatchObject({ output: "abcdef", truncated: false, result: { output: "abcdef" } });
+    const cut = await call(client, "debug_output", { lease_id: leaseId, max_chars: 4 });
+    expect(cut.json).toMatchObject({ output: "…[truncated 2 chars]\ncdef", truncated: true });
+    for (const tool of ["debug_continue", "debug_step", "debug_wait"] as const) {
+      const res = await call(client, tool, { lease_id: leaseId });
+      expect(res.json, tool).toMatchObject({ ok: true, state: "stopped", stopReason: "bp" });
+    }
+  });
+});
+
   it("symbolicate validates the lease, pcs, and binary without spawning", async () => {
     const { client, leaseId } = await makeDebugClient(stubRunner(round2Handler));
     const gated = await call(client, "symbolicate", { pcs: "0x1000", binary: "/bin/ls", lease_id: "lease_nope" });
@@ -642,5 +672,60 @@ describe("round-2 debug_* tools", () => {
     expect(String(badPc.json.error)).toMatch(/pc/);
     const empty = await call(client, "symbolicate", { pcs: [], binary: "/bin/ls" });
     expect(empty.isError).toBe(true);
+  });
+});
+
+describe("failure-tests", () => {
+  type A=Record<string,unknown>;
+  const ATTACH='{"sessionId":"d1"}';
+  const cx=async(run:Runner & {calls:Call[]},atos?:Runner) => {
+    const {client:c,leaseId:id}=await makeDebugClient(run,atos);
+    return (t:string,a:A={}) => call(c,t,{lease_id:id,...a});
+  };
+  const E=(r:{json:A}) => String(r.json.error);
+  it("bad stdout is a parse error", async () => {
+    const C=await cx(stubRunner((_b,a) => (a[0]==="attach" ? ATTACH : "???")));
+    await C("debug_attach",{pid:1});
+    const r=await C("debug_bt");
+    expect(r.isError).toBe(true);
+    expect(E(r)).toMatch(/parse.*JSON/i);
+  });
+  it("exit-1/verb; timeout continue/wait", async () => {
+    const C=await cx((async(b:string,a:string[]) => {
+      if(a[0]==="attach") return {stdout:ATTACH,stderr:""};
+      if(a[0]==="continue"||a[0]==="wait") throw new ExecError(b,a,"ETIMEDOUT","","t/o");
+      throw new ExecError(b,a,1,"",`boom-${a[0]}`);
+    }) as Runner & {calls:Call[]});
+    await C("debug_attach",{pid:1});
+    const verbs:[string,A][]=[["debug_threads",{}],["debug_bt",{}],["debug_locals",{}],["debug_eval",{expr:"x"}],["debug_step",{}],["debug_scopes",{}],["debug_expand",{ref:1}],["debug_set_var",{target:"x",value:"1"}],["debug_output",{}],["debug_run_until",{file:"a",line:1}],["debug_interrupt",{}],["debug_break",{list:true}],["debug_doctor",{}],["debug_sessions",{}]];
+    for(const [t,a] of verbs) {
+      const r=await C(t,a);
+      expect(r.isError,t).toBe(true);
+      expect(E(r),t).toMatch(/boom-/);
+    }
+    for(const [t,a] of [["debug_continue",{wait_sec:60}],["debug_wait",{timeout:60}]]) {
+      const r=await C(t,a);
+      expect(r.isError,t).toBe(true);
+      expect(E(r),t).toMatch(/ETIMEDOUT|timed out/i);
+    }
+  });
+  it("debug_launch bad input; no spawn", async () => {
+    const run=stubRunner(() => ATTACH);
+    const C=await cx(run);
+    const p=await C("debug_launch",{path:"   "});
+    expect(p.isError).toBe(true);
+    expect(E(p)).toMatch(/path/);
+    expect((await C("debug_launch",{path:"/A",args:["ok",123]})).isError).toBe(true);
+    expect(run.calls).toHaveLength(0);
+  });
+  it("atos ENOENT; binary required", async () => {
+    const atos=(() => { throw Object.assign(new Error("ENOENT"),{code:"ENOENT"}); }) as Runner;
+    const C=await cx(stubRunner(() => ATTACH),atos);
+    const m=await C("symbolicate",{pcs:"0x1",binary:"/b"});
+    expect(m.isError).toBe(true);
+    expect(E(m)).toMatch(/xcode-select --install/);
+    const n=await C("symbolicate",{pcs:"0x1"});
+    expect(n.isError).toBe(true);
+    expect(E(n)).toMatch(/binary/);
   });
 });

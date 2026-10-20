@@ -55,7 +55,7 @@ async function makeClient(handler: (bin: string, args: string[]) => { stdout: st
     serveSim: new ServeSim({ runner: run }),
     simLog: new SimLog(),
     simApps: new SimApps({ runner: run }),
-    xctrace: new XCTrace({ runner: run }),
+    xctrace: new XCTrace({ runner: run, exists: () => true }),
   });
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);
@@ -75,7 +75,7 @@ async function call(client: Client, tool: string, args: Record<string, unknown>)
 describe("XCTrace wrapper", () => {
   it("records all-processes with Time Profiler by default", async () => {
     const run = stubRunner(() => ({ stdout: "", stderr: "" }));
-    const res = await new XCTrace({ runner: run }).record("U1", "/tmp/x.trace");
+    const res = await new XCTrace({ runner: run, exists: () => true }).record("U1", "/tmp/x.trace");
     expect(res).toMatchObject({ path: "/tmp/x.trace", template: "Time Profiler" });
     expect(run.calls[0]).toMatchObject({
       bin: "xcrun",
@@ -90,7 +90,7 @@ describe("XCTrace wrapper", () => {
 
   it("passes attach through instead of all-processes", async () => {
     const run = stubRunner(() => ({ stdout: "", stderr: "" }));
-    await new XCTrace({ runner: run }).record("U1", "/tmp/x.trace", {
+    await new XCTrace({ runner: run, exists: () => true }).record("U1", "/tmp/x.trace", {
       attach: 1234,
       template: "System Trace",
       timeLimitSec: 10,

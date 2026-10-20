@@ -154,8 +154,12 @@ export function runBounded(bin: string, args: string[], opts: BoundedOptions): P
 }
 
 export function parseJson<T>(text: string, what: string): T {
+  const brace = text.indexOf("{");
+  const bracket = text.indexOf("[");
+  const start = brace === -1 ? bracket : bracket === -1 ? brace : Math.min(brace, bracket);
+  const json = start > 0 ? text.slice(start) : text;
   try {
-    return JSON.parse(text) as T;
+    return JSON.parse(json) as T;
   } catch (cause) {
     throw new Error(`Failed to parse ${what} as JSON: ${(cause as Error).message}\n${text.slice(0, 500)}`);
   }

@@ -740,6 +740,34 @@ export class Orchestrator {
     );
   }
 
+  /**
+   * Best-effort timeout cleanup for one lease's debug session: stops the
+   * recorded llmdb session via the shared stopDebugQuiet path and clears the
+   * bookkeeping, so a timed-out cont/wait/interrupt never leaks a wedged
+   * session. Never throws: unknown leases, missing sessions, id mismatches,
+   * and a missing debugger report stopped=false and keep the record (nothing
+   * is cleared that was not stopped).
+   */
+  autoStopDebugSession(leaseId: string, sessionId?: string): Promise<{ stopped: boolean; sessionId: string | null }> {
+    return this.mutex.run(async () => {
+      const recorded = await this.store.read(
+        (s) => s.leases.find((l) => l.leaseId === leaseId)?.debugSessionId ?? null,
+      );
+      if (recorded === null) return { stopped: false, sessionId: null };
+      if (sessionId !== undefined && sessionId !== recorded) {
+        return { stopped: false, sessionId: recorded };
+      }
+      if (!this.debugger) return { stopped: false, sessionId: recorded };
+      await this.stopDebugQuiet(recorded);
+      await this.store.mutate((s) => {
+        const rec = s.leases.find((l) => l.leaseId === leaseId);
+        if (rec && rec.debugSessionId === recorded) delete rec.debugSessionId;
+        return { value: undefined, dirty: true };
+      });
+      return { stopped: true, sessionId: recorded };
+    });
+  }
+
   /** Best-effort debug detach for release/sweep/expire paths; never throws. */
   private async stopDebugQuiet(sessionId: string | undefined): Promise<void> {
     if (!sessionId || !this.debugger) return;

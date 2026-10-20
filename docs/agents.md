@@ -11,6 +11,7 @@ are the short form of the README's lease, queue, and proxy sections.
 5. Renew long work with lease_heartbeat before the TTL (default 30 min) expires.
 6. Release with lease_release when done. Release hands the simulator over booted — shut it down with sim_shutdown only if the task needs it stopped.
 7. Turn the proxy and streams off when done: net_proxy_stop, stream_stop. Both cost host-wide resources while on.
+8. One debug session per lease: re-attaching replaces the old session. Call debug_detach when done debugging (even if you keep the lease); release also stops it.
 ```
 
 - There must be exactly one shared daemon. Never start a per-session stdio
@@ -29,3 +30,6 @@ are the short form of the README's lease, queue, and proxy sections.
   booted — shut it down with `sim_shutdown` only if the task needs it stopped.
 - Turn the proxy and streams off when done: `net_proxy_stop`, `stream_stop`.
   Both cost host-wide resources while on.
+- One debug session per lease: re-attaching replaces the old session. Call
+  `debug_detach` when done debugging (even if you keep the lease); release
+  and TTL expiry also stop it.

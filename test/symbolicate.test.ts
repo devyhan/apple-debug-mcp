@@ -66,4 +66,22 @@ describe("Symbolicator wrapper", () => {
     await expect(new Symbolicator({ runner: run }).checkAvailable()).resolves.toBe("Usage: atos [-p pid] ...");
     expect(run.calls[0]?.args).toEqual(["-h"]);
   });
+
+  it("hints install on ENOENT; checks line count; surfaces stderr", async () => {
+    const fail = (e: unknown) =>
+      (async () => {
+        throw e;
+      }) as Runner;
+    const sym = new Symbolicator({ runner: fail(Object.assign(new Error("spawn atos ENOENT"), { code: "ENOENT" })) });
+    await expect(sym.symbolicate(["0x1000"], { binary: "/b" })).rejects.toThrow(/xcode-select --install/);
+    await expect(sym.checkAvailable()).rejects.toThrow(/atos not found/);
+    const short = (async () => ({ stdout: "one\n", stderr: "bad second pc" })) as Runner;
+    await expect(new Symbolicator({ runner: short }).symbolicate(["0x1", "0x2"], { binary: "/b" })).rejects.toThrow(
+      /1!=2.*bad second pc/,
+    );
+    const bad = fail(Object.assign(new Error("exit 1"), { stderr: "cannot open /b" }));
+    await expect(new Symbolicator({ runner: bad }).symbolicate(["0x1"], { binary: "/b" })).rejects.toThrow(
+      /cannot open \/b/,
+    );
+  });
 });
