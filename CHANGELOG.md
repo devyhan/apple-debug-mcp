@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-20
+
+### Added
+
+- Debug reliability: actionable error hints (attach/session/target failures),
+  `stop()` sessionId requirement, per-session op mutex, auto-stop on client
+  timeout, tolerant JSON parsing, xctrace grace clamp + output check.
+- Debug UX: `debug_launch` bundle-id form, leaseless `debug_doctor`/
+  `debug_sessions`, batch breakpoints, `wait_sec`/`max_chars` options,
+  uniform stopReason/state, symbolicate arch/dSYM auto-detect, run-until
+  breakpoint cleanup.
+- Symbolicate hardening: atos install hint, line-count guard, stderr surfacing.
+- Debug docs: walkthrough, per-verb arg/gotcha table, agent session rules.
+- Tests: 59 new tests (348 total), MCP-layer failure coverage.
+
 ## [0.1.0] - 2026-10-19
 
 ### Added
