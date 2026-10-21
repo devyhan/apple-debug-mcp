@@ -6,6 +6,8 @@ import { Axe } from "./axe.js";
 import { compactAxText } from "./ax-prune.js";
 import { registerDeviceExtras } from "./extras.js";
 import { Llmdb } from "./llmdb.js";
+import { appendM4Audit, maybeM4Decide, noteM4Ui } from "./m4.js";
+import type { M4Result } from "./m4.js";
 import { Orchestrator } from "./orchestrator.js";
 import { ServeSim } from "./servesim.js";
 import { SimApps } from "./simapps.js";
@@ -342,6 +344,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const snap = saveDescribeSnapshot({ leaseId: lease_id, ui: payload, format: shape, truncated });
         // M3 shadow (env-gated, default OFF): cache the full payload; no-op when off.
         noteShadowUi(lease_id, payload, snap?.id);
+        // M4 (env-gated, default OFF): cache full-hierarchy payloads only;
+        // point describes return element-only payloads that could false-match.
+        if (x === undefined && y === undefined) noteM4Ui(lease_id, payload, snap?.id);
         await orch.logAction(lease_id, "ui_describe", x !== undefined && y !== undefined ? `describe at (${x},${y})` : "describe full hierarchy",
           { ...(x !== undefined && y !== undefined ? { x, y } : {}), truncated, format: shape, ...(kept !== undefined ? { kept } : {}), ...(snap ? { snapshot_id: snap.id } : {}) });
         return ok({ udid: lease.udid, ui: text, truncated, format: shape, ...(kept !== undefined ? { kept } : {}) });
@@ -364,6 +369,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         value: z.string().optional().describe("Tap element matching AXValue."),
         element_type: z.string().optional().describe("Narrow matches, e.g. Button, TextField."),
         wait_timeout: z.number().optional().describe("Seconds to poll for the element. Default 0."),
+        auto: z.boolean().optional().describe("Request an autonomous allowlisted tap (M4; ignored unless SIM_MCP_M4=1)."),
       },
     },
     async (args) => {
@@ -383,12 +389,28 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         ...(args.label !== undefined ? { label: args.label } : {}),
         ...(args.id !== undefined ? { id: args.id } : {}),
       };
+      // M4 allow-path decision, hoisted so the failure path can audit the
+        // tap that never ran. Null unless auto:true with the gate on.
+        let m4: M4Result | null = null;
       try {
         const lease = await orch.resolveLease(args.lease_id);
+        // M4 (env-gated, default OFF): autonomous-tap pre-tap gate. Null when
+        // manual (auto !== true) or the gate is off -> falls through
+        // byte-identical. Deny -> no tap, audit line, standard deny response.
+        m4 = maybeM4Decide({ leaseId: args.lease_id, query: shadowQuery, auto: args.auto });
+        if (m4 !== null && m4.decision === "deny") {
+          appendM4Audit({ leaseId: args.lease_id, query: shadowQuery, result: m4, tapped: false });
+          await orch.logAction(args.lease_id, "ui_tap", `tap ${target} denied: ${m4.reason}`.slice(0, 160), { ...selectors, m4: `deny:${m4.reason}` });
+          return fail(`m4 denied autonomous tap: ${m4.reason}`);
+        }
         const out = await axe.tap(lease.udid, {
           x: args.x, y: args.y, id: args.id, label: args.label, value: args.value,
           elementType: args.element_type, waitTimeout: args.wait_timeout,
         });
+        // M4 allow path: audit the tap that ran; null unless auto+gate on.
+        if (m4 !== null) {
+          appendM4Audit({ leaseId: args.lease_id, query: shadowQuery, result: m4, tapped: true });
+        }
         // M1 snapshot (env-gated, default OFF): tap resolution echo; null when off.
         const tapExtra = buildTapEchoExtra(out, { leaseId: args.lease_id });
         // M3 shadow (env-gated, default OFF): predict-then-compare after the
@@ -399,6 +421,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
           ...selectors,
           ...(tapExtra ?? {}),
           ...(shadowExtra ?? {}),
+          ...(m4 !== null ? { m4: "allow" } : {}),
         });
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
@@ -408,6 +431,11 @@ export function createMcpServer(deps: ServerDeps): McpServer {
           const failure = buildTapFailureExtra(err, { leaseId: args.lease_id, selectors });
           const shadowExtra = buildShadowExtra({ leaseId: args.lease_id, query: shadowQuery, tapOk: false });
           appendShadowLog({ leaseId: args.lease_id, query: shadowQuery, tapOk: false });
+          // M4 allow-path failure: audit the tap that never ran. No-op unless
+          // an autonomous tap was allowed and axe.tap then threw.
+          if (m4 !== null) {
+            appendM4Audit({ leaseId: args.lease_id, query: shadowQuery, result: m4, tapped: false });
+          }
           if (failure || shadowExtra) {
             await orch.logAction(args.lease_id, "ui_tap", `tap ${target} failed`.slice(0, 160), {
               ...(failure ?? { tap_ok: false, ...selectors }),
