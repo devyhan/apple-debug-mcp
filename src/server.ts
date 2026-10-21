@@ -3,6 +3,7 @@ import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { Axe } from "./axe.js";
+import { compactAxText } from "./ax-prune.js";
 import { registerDeviceExtras } from "./extras.js";
 import { Llmdb } from "./llmdb.js";
 import { Orchestrator } from "./orchestrator.js";
@@ -313,17 +314,31 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         lease_id: z.string().describe("Your active lease id."),
         x: z.number().optional().describe("With y: describe only the element at this point."),
         y: z.number().optional().describe("With x: describe only the element at this point."),
+        format: z.enum(["full", "compact"]).optional().describe("Output shape: full raw AX JSON (default) or compact pruned nodes."),
+        max_depth: z.number().int().nonnegative().optional().describe("Max depth for format=compact (root is 0). Omit for unlimited."),
         max_chars: z.number().int().positive().optional().describe("Truncate output. Default 20000."),
       },
     },
-    async ({ lease_id, x, y, max_chars }) => {
+    async ({ lease_id, x, y, format, max_depth, max_chars }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
         const out = await axe.describeUi(lease.udid, x !== undefined && y !== undefined ? { x, y } : undefined);
-        const { text, truncated } = truncate(out, max_chars ?? 20000);
+        const shape = format ?? "full";
+        let payload = out;
+        let kept: number | undefined;
+        if (shape === "compact") {
+          try {
+            const pruned = compactAxText(out, { maxDepth: max_depth });
+            payload = pruned.text;
+            kept = pruned.kept;
+          } catch (err) {
+            return fail(`compact format failed: ${(err as Error).message}`);
+          }
+        }
+        const { text, truncated } = truncate(payload, max_chars ?? 20000);
         await orch.logAction(lease_id, "ui_describe", x !== undefined && y !== undefined ? `describe at (${x},${y})` : "describe full hierarchy",
-          { ...(x !== undefined && y !== undefined ? { x, y } : {}), truncated });
-        return ok({ udid: lease.udid, ui: text, truncated });
+          { ...(x !== undefined && y !== undefined ? { x, y } : {}), truncated, format: shape, ...(kept !== undefined ? { kept } : {}) });
+        return ok({ udid: lease.udid, ui: text, truncated, format: shape, ...(kept !== undefined ? { kept } : {}) });
       } catch (err) {
         return fail((err as Error).message);
       }

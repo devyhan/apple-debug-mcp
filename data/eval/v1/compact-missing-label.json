@@ -1,0 +1,1 @@
+{"expected":{"kind":"abstain"},"id":"compact-missing-label","query":{"label":"없는항목"},"ui":"[{\"children\":[{\"label\":\"일반\",\"type\":\"Cell\"},{\"id\":\"com.apple.settings.camera\",\"label\":\"카메라\",\"type\":\"Cell\"}],\"type\":\"Application\"}]"}

@@ -1,0 +1,1 @@
+{"expected":{"kind":"tap","match":{"label":"일반"}},"id":"compact-general","query":{"label":"일반"},"ui":"[{\"children\":[{\"frame\":{\"h\":44,\"w\":358,\"x\":22,\"y\":120},\"label\":\"일반\",\"type\":\"Cell\"},{\"label\":\"손쉬운 사용\",\"type\":\"Cell\"},{\"label\":\"카메라\",\"type\":\"Cell\"}],\"frame\":{\"h\":874,\"w\":402,\"x\":0,\"y\":0},\"type\":\"Application\"}]"}
