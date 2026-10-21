@@ -1,0 +1,28 @@
+{"t":1792563650316,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563652918,"leaseId":"lease_1_stdd","tool":"ui_screenshot","summary":"screenshot udid:159040ee4f74-1792563652583.png"}
+{"t":1792563655413,"leaseId":"lease_1_stdd","tool":"ui_button","summary":"button home"}
+{"t":1792563658947,"leaseId":"lease_1_stdd","tool":"app_launch","summary":"launch com.qa.golfzon.app (pid 15756)"}
+{"t":1792563662124,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563664806,"leaseId":"lease_1_stdd","tool":"ui_tap","summary":"tap label=스크린","extra":{"label":"스크린","wait_timeout":5}}
+{"t":1792563667496,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563670151,"leaseId":"lease_1_stdd","tool":"ui_screenshot","summary":"screenshot udid:159040ee4f74-1792563669852.png"}
+{"t":1792563672716,"leaseId":"lease_1_stdd","tool":"app_terminate","summary":"terminate com.qa.golfzon.app"}
+{"t":1792563675393,"leaseId":"lease_1_stdd","tool":"app_launch","summary":"launch com.qa.golfzon.app (pid 18465)"}
+{"t":1792563680192,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563683453,"leaseId":"lease_1_stdd","tool":"ui_tap","summary":"tap label=골프한판","extra":{"label":"골프한판","wait_timeout":5}}
+{"t":1792563686088,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563688640,"leaseId":"lease_1_stdd","tool":"ui_screenshot","summary":"screenshot udid:159040ee4f74-1792563688358.png"}
+{"t":1792563691161,"leaseId":"lease_1_stdd","tool":"app_terminate","summary":"terminate com.qa.golfzon.app"}
+{"t":1792563693738,"leaseId":"lease_1_stdd","tool":"app_launch","summary":"launch com.qa.golfzon.app (pid 19304)"}
+{"t":1792563697697,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563700887,"leaseId":"lease_1_stdd","tool":"ui_tap","summary":"tap label=티타임예약","extra":{"label":"티타임예약","wait_timeout":5}}
+{"t":1792563703535,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563706057,"leaseId":"lease_1_stdd","tool":"ui_screenshot","summary":"screenshot udid:159040ee4f74-1792563705785.png"}
+{"t":1792563708601,"leaseId":"lease_1_stdd","tool":"app_terminate","summary":"terminate com.qa.golfzon.app"}
+{"t":1792563711876,"leaseId":"lease_1_stdd","tool":"app_launch","summary":"launch com.qa.golfzon.app (pid 20159)"}
+{"t":1792563715786,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563718907,"leaseId":"lease_1_stdd","tool":"ui_tap","summary":"tap label=추천","extra":{"label":"추천","wait_timeout":5}}
+{"t":1792563721705,"leaseId":"lease_1_stdd","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":true}}
+{"t":1792563724243,"leaseId":"lease_1_stdd","tool":"ui_screenshot","summary":"screenshot udid:159040ee4f74-1792563723961.png"}
+{"t":1792563726734,"leaseId":"lease_1_stdd","tool":"app_terminate","summary":"terminate com.qa.golfzon.app"}
+{"t":1792563729233,"leaseId":"lease_1_stdd","tool":"ui_button","summary":"button home"}

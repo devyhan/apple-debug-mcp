@@ -22,6 +22,8 @@ export interface Config {
   execTimeoutMs: number;
   bootTimeoutMs: number;
   screenshotDir: string;
+  /** Directory holding the M1 JSONL action/exec trace (trace.jsonl). */
+  traceDir: string;
   /** False disables lease-interference (contamination) detection entirely. */
   contaminationCheck: boolean;
   /** Minimum gap between contamination spawns for one lease. */
@@ -63,6 +65,7 @@ export function loadConfig(): Config {
     execTimeoutMs: num("SIM_MCP_EXEC_TIMEOUT_MS", 60_000),
     bootTimeoutMs: num("SIM_MCP_BOOT_TIMEOUT_MS", 10 * 60_000),
     screenshotDir: str("SIM_MCP_SCREENSHOT_DIR", path.join(os.tmpdir(), "sim-mcp-shots")),
+    traceDir: str("SIM_MCP_TRACE_DIR", path.join(os.tmpdir(), "sim-mcp-traces")),
     contaminationCheck: str("SIM_MCP_CONTAMINATION_CHECK", "true") !== "false",
     contaminationCheckMinIntervalMs: num("SIM_MCP_CONTAMINATION_MIN_INTERVAL_MS", 30_000),
   };

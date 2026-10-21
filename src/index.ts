@@ -139,6 +139,7 @@ async function main(): Promise<void> {
     apps: simApps,
     contaminationCheck: config.contaminationCheck,
     contaminationCheckMinIntervalMs: config.contaminationCheckMinIntervalMs,
+    traceDir: config.traceDir,
   });
   const mcpDeps = { orchestrator, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir: config.screenshotDir };
 

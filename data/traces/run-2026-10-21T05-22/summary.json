@@ -1,0 +1,178 @@
+{
+  "run": "run-2026-10-21T05-22",
+  "out": "/Users/devyhan93/orca/projects/apple-debug-mcp/data/traces/run-2026-10-21T05-22",
+  "total": 32,
+  "ok": 27,
+  "failed": 5,
+  "results": [
+    {
+      "op": "lease_acquire",
+      "ms": 3128,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 3393,
+      "ok": true,
+      "ui_len": 9880
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 3219,
+      "ok": true
+    },
+    {
+      "op": "ui_button",
+      "ms": 4537,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 3659,
+      "ok": true,
+      "ui_len": 9880
+    },
+    {
+      "op": "app_launch",
+      "ms": 7410,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 8810,
+      "ok": true,
+      "ui_len": 11794
+    },
+    {
+      "op": "ui_tap",
+      "ms": 4490,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 8476,
+      "ok": true,
+      "ui_len": 10164
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 7585,
+      "ok": true
+    },
+    {
+      "op": "app_terminate",
+      "ms": 3185,
+      "ok": true
+    },
+    {
+      "op": "app_launch",
+      "ms": 3186,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 5422,
+      "ok": true,
+      "ui_len": 12560
+    },
+    {
+      "op": "ui_tap",
+      "ms": 3702,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 3207,
+      "ok": true,
+      "ui_len": 13145
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 2657,
+      "ok": true
+    },
+    {
+      "op": "app_terminate",
+      "ms": 3976,
+      "ok": true
+    },
+    {
+      "op": "app_launch",
+      "ms": 3079,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 4792,
+      "ok": true,
+      "ui_len": 12560
+    },
+    {
+      "op": "ui_tap",
+      "ms": 3439,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 3026,
+      "ok": true,
+      "ui_len": 14004
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 3721,
+      "ok": true
+    },
+    {
+      "op": "app_terminate",
+      "ms": 3082,
+      "ok": true
+    },
+    {
+      "op": "app_launch",
+      "ms": 3776,
+      "ok": false
+    },
+    {
+      "op": "ui_describe",
+      "ms": 2969,
+      "ok": true,
+      "ui_len": 9880
+    },
+    {
+      "op": "ui_tap",
+      "ms": 6183,
+      "ok": false
+    },
+    {
+      "op": "ui_tap",
+      "ms": 7084,
+      "ok": false
+    },
+    {
+      "op": "ui_tap",
+      "ms": 6447,
+      "ok": false
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 3623,
+      "ok": true
+    },
+    {
+      "op": "app_terminate",
+      "ms": 3110,
+      "ok": false
+    },
+    {
+      "op": "ui_button",
+      "ms": 2562,
+      "ok": true
+    },
+    {
+      "op": "lease_release",
+      "ms": 186,
+      "ok": true
+    }
+  ]
+}

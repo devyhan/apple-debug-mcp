@@ -1,5 +1,8 @@
 import { execFile, spawn } from "node:child_process";
 
+/** M1 exec trace: wrap a Runner so each spawn appends one JSONL line when SIM_MCP_TRACE=1. */
+export { withTrace } from "./trace.js";
+
 export interface ExecResult {
   stdout: string;
   stderr: string;

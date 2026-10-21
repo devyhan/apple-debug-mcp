@@ -1,0 +1,170 @@
+{
+  "run": "run-golfzon-2026-10-21T06-20",
+  "out": "/Users/devyhan93/orca/projects/apple-debug-mcp/data/traces/run-golfzon-2026-10-21T06-20",
+  "udid": "6D00435A-80AC-4D39-A285-C11FC70C7C64",
+  "app": "com.qa.golfzon.app",
+  "total": 30,
+  "ok": 30,
+  "failed": 0,
+  "results": [
+    {
+      "op": "lease_acquire",
+      "ms": 3024,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 3255,
+      "ok": true,
+      "ui_len": 20025
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 2605,
+      "ok": true
+    },
+    {
+      "op": "ui_button",
+      "ms": 2490,
+      "ok": true
+    },
+    {
+      "op": "app_launch",
+      "ms": 3537,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 3174,
+      "ok": true,
+      "ui_len": 20025
+    },
+    {
+      "op": "ui_tap",
+      "ms": 2680,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 2689,
+      "ok": true,
+      "ui_len": 20025
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 2661,
+      "ok": true
+    },
+    {
+      "op": "app_terminate",
+      "ms": 2558,
+      "ok": true
+    },
+    {
+      "op": "app_launch",
+      "ms": 2677,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 4802,
+      "ok": true,
+      "ui_len": 20024
+    },
+    {
+      "op": "ui_tap",
+      "ms": 3258,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 2635,
+      "ok": true,
+      "ui_len": 20025
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 2554,
+      "ok": true
+    },
+    {
+      "op": "app_terminate",
+      "ms": 2518,
+      "ok": true
+    },
+    {
+      "op": "app_launch",
+      "ms": 2577,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 3961,
+      "ok": true,
+      "ui_len": 20024
+    },
+    {
+      "op": "ui_tap",
+      "ms": 3185,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 2648,
+      "ok": true,
+      "ui_len": 20025
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 2525,
+      "ok": true
+    },
+    {
+      "op": "app_terminate",
+      "ms": 2541,
+      "ok": true
+    },
+    {
+      "op": "app_launch",
+      "ms": 3275,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 3912,
+      "ok": true,
+      "ui_len": 20024
+    },
+    {
+      "op": "ui_tap",
+      "ms": 3119,
+      "ok": true
+    },
+    {
+      "op": "ui_describe",
+      "ms": 2798,
+      "ok": true,
+      "ui_len": 20025
+    },
+    {
+      "op": "ui_screenshot",
+      "ms": 2539,
+      "ok": true
+    },
+    {
+      "op": "app_terminate",
+      "ms": 2490,
+      "ok": true
+    },
+    {
+      "op": "ui_button",
+      "ms": 2498,
+      "ok": true
+    },
+    {
+      "op": "lease_release",
+      "ms": 123,
+      "ok": true
+    }
+  ]
+}

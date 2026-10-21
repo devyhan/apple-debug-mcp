@@ -321,7 +321,8 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const lease = await orch.resolveLease(lease_id);
         const out = await axe.describeUi(lease.udid, x !== undefined && y !== undefined ? { x, y } : undefined);
         const { text, truncated } = truncate(out, max_chars ?? 20000);
-        await orch.logAction(lease_id, "ui_describe", x !== undefined && y !== undefined ? `describe at (${x},${y})` : "describe full hierarchy");
+        await orch.logAction(lease_id, "ui_describe", x !== undefined && y !== undefined ? `describe at (${x},${y})` : "describe full hierarchy",
+          { ...(x !== undefined && y !== undefined ? { x, y } : {}), truncated });
         return ok({ udid: lease.udid, ui: text, truncated });
       } catch (err) {
         return fail((err as Error).message);
@@ -353,7 +354,14 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         });
         const target = args.x !== undefined && args.y !== undefined ? `(${args.x},${args.y})`
           : [args.id && `id=${args.id}`, args.label && `label=${args.label}`, args.value && `value=${args.value}`, args.element_type && `type=${args.element_type}`].filter(Boolean).join(" ") || "default";
-        await orch.logAction(args.lease_id, "ui_tap", `tap ${target}`.slice(0, 160));
+        await orch.logAction(args.lease_id, "ui_tap", `tap ${target}`.slice(0, 160), {
+          ...(args.x !== undefined && args.y !== undefined ? { x: args.x, y: args.y } : {}),
+          ...(args.id !== undefined ? { id: args.id } : {}),
+          ...(args.label !== undefined ? { label: args.label } : {}),
+          ...(args.value !== undefined ? { value: args.value } : {}),
+          ...(args.element_type !== undefined ? { element_type: args.element_type } : {}),
+          ...(args.wait_timeout !== undefined ? { wait_timeout: args.wait_timeout } : {}),
+        });
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
         return fail((err as Error).message);

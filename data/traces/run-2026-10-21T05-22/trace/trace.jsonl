@@ -1,0 +1,25 @@
+{"t":1792560156491,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560159672,"leaseId":"lease_1_8oq3","tool":"ui_screenshot","summary":"screenshot udid:8876644b7126-1792560159270.png"}
+{"t":1792560164245,"leaseId":"lease_1_8oq3","tool":"ui_button","summary":"button home"}
+{"t":1792560167907,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560175314,"leaseId":"lease_1_8oq3","tool":"app_launch","summary":"launch com.apple.Preferences (pid 46191)"}
+{"t":1792560184111,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560188609,"leaseId":"lease_1_8oq3","tool":"ui_tap","summary":"tap label=일반","extra":{"label":"일반","wait_timeout":5}}
+{"t":1792560197089,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560204671,"leaseId":"lease_1_8oq3","tool":"ui_screenshot","summary":"screenshot udid:8876644b7126-1792560204102.png"}
+{"t":1792560207866,"leaseId":"lease_1_8oq3","tool":"app_terminate","summary":"terminate com.apple.Preferences"}
+{"t":1792560211050,"leaseId":"lease_1_8oq3","tool":"app_launch","summary":"launch com.apple.Preferences (pid 47192)"}
+{"t":1792560216458,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560220176,"leaseId":"lease_1_8oq3","tool":"ui_tap","summary":"tap label=손쉬운 사용","extra":{"label":"손쉬운 사용","wait_timeout":5}}
+{"t":1792560223383,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560226036,"leaseId":"lease_1_8oq3","tool":"ui_screenshot","summary":"screenshot udid:8876644b7126-1792560225748.png"}
+{"t":1792560230013,"leaseId":"lease_1_8oq3","tool":"app_terminate","summary":"terminate com.apple.Preferences"}
+{"t":1792560233093,"leaseId":"lease_1_8oq3","tool":"app_launch","summary":"launch com.apple.Preferences (pid 47920)"}
+{"t":1792560237882,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560241324,"leaseId":"lease_1_8oq3","tool":"ui_tap","summary":"tap label=카메라","extra":{"label":"카메라","wait_timeout":5}}
+{"t":1792560244353,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560248067,"leaseId":"lease_1_8oq3","tool":"ui_screenshot","summary":"screenshot udid:8876644b7126-1792560247747.png"}
+{"t":1792560251156,"leaseId":"lease_1_8oq3","tool":"app_terminate","summary":"terminate com.apple.Preferences"}
+{"t":1792560257901,"leaseId":"lease_1_8oq3","tool":"ui_describe","summary":"describe full hierarchy","extra":{"truncated":false}}
+{"t":1792560281202,"leaseId":"lease_1_8oq3","tool":"ui_screenshot","summary":"screenshot udid:8876644b7126-1792560280807.png"}
+{"t":1792560286910,"leaseId":"lease_1_8oq3","tool":"ui_button","summary":"button home"}

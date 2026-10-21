@@ -5,6 +5,7 @@ import { DEFAULT_STREAM_PORT_BASE, StreamOps } from "./servesim.js";
 import { SimApps } from "./simapps.js";
 import { FleetOps, SimDevice } from "./simslim.js";
 import { Lease, Requirements, Store, Ticket, nextId } from "./store.js";
+import { traceHook } from "./trace.js";
 
 export class LeaseError extends Error {
   constructor(message: string) {
@@ -129,6 +130,7 @@ export class Orchestrator {
   private readonly apps?: Pick<SimApps, "listRunning">;
   private readonly contaminationCheck: boolean;
   private readonly contaminationCheckMinIntervalMs: number;
+  private readonly traceDir?: string;
   private readonly actions = new Map<string, LeaseAction[]>();
   private readonly contamination = new Map<string, ContaminationState>();
 
@@ -146,6 +148,7 @@ export class Orchestrator {
       apps?: Pick<SimApps, "listRunning">;
       contaminationCheck?: boolean;
       contaminationCheckMinIntervalMs?: number;
+      traceDir?: string;
     },
   ) {
     this.fleet = fleet;
@@ -160,6 +163,7 @@ export class Orchestrator {
     this.apps = opts.apps;
     this.contaminationCheck = opts.contaminationCheck ?? true;
     this.contaminationCheckMinIntervalMs = opts.contaminationCheckMinIntervalMs ?? 30_000;
+    this.traceDir = opts.traceDir;
   }
 
   // ---------- state views (read-only, never mutate) ----------
@@ -484,7 +488,7 @@ export class Orchestrator {
   // ---------- per-lease action ring (in-memory, last 100) ----------
 
   /** Append a one-line action summary; no-op when the lease is unknown. */
-  async logAction(leaseId: string, tool: string, summary: string): Promise<void> {
+  async logAction(leaseId: string, tool: string, summary: string, extra?: unknown): Promise<void> {
     const known = await this.store.read((s) => s.leases.some((l) => l.leaseId === leaseId));
     if (!known) return;
     let ring = this.actions.get(leaseId);
@@ -494,6 +498,7 @@ export class Orchestrator {
     }
     ring.push({ t: Date.now(), tool, summary });
     if (ring.length > MAX_ACTIONS_PER_LEASE) ring.splice(0, ring.length - MAX_ACTIONS_PER_LEASE);
+    traceHook({ leaseId, tool, summary, t: Date.now(), extra }, this.traceDir);
   }
 
   /** Newest-last action history for a lease (empty when unknown), capped at `limit`. */
