@@ -1,0 +1,1 @@
+{"expected":{"kind":"abstain"},"id":"missing-label","query":{"label":"없는항목"},"ui":"[{\"AXLabel\":\"설정\",\"AXUniqueId\":null,\"children\":[{\"AXLabel\":\"일반\",\"AXUniqueId\":null,\"children\":[],\"type\":\"Cell\"},{\"AXLabel\":\"카메라\",\"AXUniqueId\":null,\"children\":[],\"type\":\"Cell\"}],\"type\":\"Application\"}]"}
