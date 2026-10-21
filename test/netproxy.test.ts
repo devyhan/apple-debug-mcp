@@ -261,8 +261,9 @@ describe("buildAddon", () => {
     expect(addon).toContain("resp.content = body");
     expect(addon).toContain('resp.headers.pop("content-encoding", None)');
     expect(addon).toContain('resp.headers["content-length"]');
-    // First match wins: _find returns the first matching rule.
-    expect(addon).toContain("return rule");
+    // First match wins: _find returns the (index, rule) of the first matching rule.
+    expect(addon).toContain("enumerate(RULES)");
+    expect(addon).toContain("return i, rule");
     expect(addon).toContain("example");
   });
 
@@ -469,12 +470,16 @@ describe("NetProxy lifecycle (stubbed)", () => {
     const { proxy } = makeProxy();
     await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, []);
     const status = proxy.proxyStatus();
-    expect(status.flowLogPath).toMatch(/flow-\d+\.jsonl$/);
+    expect(status.flowLogPath).toMatch(/flow-\d+-\d+\.jsonl$/);
     expect(fs.readFileSync(status.flowLogPath!, "utf8")).toBe("");
     expect(fs.readFileSync(status.addonPath!, "utf8")).toContain(`FLOW_LOG = ${JSON.stringify(status.flowLogPath)}`);
-    await proxy.stopProxy("lease_1");
-    expect(fs.existsSync(status.flowLogPath!)).toBe(false);
+    await expect(proxy.stopProxy("lease_1")).resolves.toMatchObject({
+      stopped: true,
+      flowLogPath: status.flowLogPath,
+    });
+    expect(fs.existsSync(status.flowLogPath!)).toBe(true);
     expect(fs.existsSync(status.addonPath!)).toBe(false);
+    expect(proxy.proxyStatus()).toMatchObject({ running: false, lastFlowLogPath: status.flowLogPath });
   });
 
   it("reads rules only for the holder and returns a copy", async () => {
@@ -559,11 +564,13 @@ describe("NetProxy lifecycle (stubbed)", () => {
         JSON.stringify({ ts: 3, method: "GET", url: "https://other.test/c" }),
       ].join("\n") + "\n",
     );
-    await expect(proxy.assertFlow("lease_1", { urlRegex: "example\\.com", timeoutSec: 0 })).resolves.toMatchObject({
+    await expect(
+      proxy.assertFlow("lease_1", { urlRegex: "example\\.com", since: "run", timeoutSec: 0 }),
+    ).resolves.toMatchObject({
       count: 2,
       total: 3,
     });
-    const post = await proxy.assertFlow("lease_1", { urlRegex: "example\\.com", method: "post", timeoutSec: 0 });
+    const post = await proxy.assertFlow("lease_1", { urlRegex: "example\\.com", method: "post", since: "run", timeoutSec: 0 });
     expect(post.count).toBe(1);
     expect(post.matched).toEqual([{ ts: 2, method: "POST", url: "https://example.com/b" }]);
     await expect(
@@ -576,7 +583,10 @@ describe("NetProxy lifecycle (stubbed)", () => {
     await proxy.startProxy("U1", { leaseId: "lease_1", sessionId: "sess-1" }, []);
     const flowLogPath = proxy.proxyStatus().flowLogPath!;
     setTimeout(() => {
-      fs.appendFileSync(flowLogPath, JSON.stringify({ ts: 1, method: "GET", url: "https://late.test/x" }) + "\n");
+      fs.appendFileSync(
+        flowLogPath,
+        JSON.stringify({ ts: Date.now() / 1000, method: "GET", url: "https://late.test/x" }) + "\n",
+      );
     }, 100);
     const res = await proxy.assertFlow("lease_1", { urlRegex: "late\\.test", timeoutSec: 5 });
     expect(res).toMatchObject({ count: 1, total: 1 });
@@ -588,7 +598,7 @@ describe("NetProxy lifecycle (stubbed)", () => {
     const addonPath = proxy.proxyStatus().addonPath!;
     const before = run.calls.length;
 
-    await expect(proxy.stopProxy("lease_1")).resolves.toEqual({ stopped: true });
+    await expect(proxy.stopProxy("lease_1")).resolves.toMatchObject({ stopped: true, flowLogPath: expect.any(String) });
     const restores = run.calls.slice(before).filter((c) => c.bin === "sudo");
     const args = restores.map((c) => c.args.slice(2));
     // SvcA: corporate server/port back, then state back on (http + https).
@@ -602,7 +612,7 @@ describe("NetProxy lifecycle (stubbed)", () => {
     expect(args).toContainEqual(["-setsecurewebproxystate", "SvcB", "off"]);
     expect(children[0]?.kills).toContain("SIGTERM");
     expect(fs.existsSync(addonPath)).toBe(false);
-    expect(proxy.proxyStatus()).toEqual({ running: false });
+    expect(proxy.proxyStatus()).toMatchObject({ running: false, lastFlowLogPath: expect.any(String) });
 
     await expect(proxy.stopProxy("lease_1")).resolves.toEqual({ stopped: false });
     expect(run.calls).toHaveLength(before + restores.length);
@@ -615,7 +625,7 @@ describe("NetProxy lifecycle (stubbed)", () => {
     await expect(proxy.stopProxy("lease_2")).rejects.toThrow(ProxyBusyError);
     await expect(proxy.stopProxy("lease_2")).rejects.toThrow(/sess-1/);
     expect(proxy.proxyStatus().running).toBe(true);
-    await expect(proxy.forceStop()).resolves.toEqual({ stopped: true });
+    await expect(proxy.forceStop()).resolves.toMatchObject({ stopped: true, flowLogPath: expect.any(String) });
     expect(proxy.proxyStatus().running).toBe(false);
   });
 
@@ -781,11 +791,11 @@ class FakeProxy implements ProxyOps {
   async assertFlow(
     leaseId: string,
     spec: { urlRegex: string; method?: string; minCount?: number; timeoutSec?: number },
-  ): Promise<{ count: number; total: number; matched: { ts: number; method: string; url: string }[] }> {
+  ): Promise<{ count: number; total: number; newSinceCall: number; matched: { ts: number; method: string; url: string }[] }> {
     if (!this.holder) throw new Error("No network proxy is running; call net_proxy_start first.");
     if (this.holder.leaseId !== leaseId) throw new ProxyBusyError({ ...this.holder, port: 3240 }, "assert flow");
     void spec;
-    return { count: 0, total: 0, matched: [] };
+    return { count: 0, total: 0, newSinceCall: 0, matched: [] };
   }
 
   async upsertMapRule(leaseId: string, rule: NetProxyRule): Promise<number> {
@@ -1190,20 +1200,24 @@ describe("net_assert_flow / map_* tools (stubbed real proxy)", () => {
         JSON.stringify({ ts: 3, method: "POST", url: "https://api.example.com/submit" }),
       ].join("\n") + "\n",
     );
-    const hit = await call(client, "net_assert_flow", { lease_id: a.leaseId, url_regex: "cdn\\.example\\.com" });
+    const hit = await call(client, "net_assert_flow", { lease_id: a.leaseId, url_regex: "cdn\\.example\\.com", since: "run" });
     expect(hit.json).toMatchObject({ ok: true, count: 2, total: 3 });
     const miss = await call(client, "net_assert_flow", {
       lease_id: a.leaseId,
       url_regex: "cdn\\.example\\.com",
       min_count: 5,
       timeout_sec: 0,
+      since: "run",
     });
     expect(miss.isError).toBe(true);
     expect(JSON.stringify(miss.json)).toMatch(/saw 2 matching flow\(s\).*needed 5/);
 
     const stop = await call(client, "net_proxy_stop", { lease_id: a.leaseId });
-    expect(stop.json).toMatchObject({ ok: true, stopped: true });
-    expect(fs.existsSync(flowLogPath)).toBe(false);
+    expect(stop.json).toMatchObject({ ok: true, stopped: true, flow_log_path: flowLogPath });
+    expect(fs.existsSync(flowLogPath)).toBe(true);
+
+    const after = await call(client, "net_proxy_status", { lease_id: a.leaseId });
+    expect(after.json).toMatchObject({ ok: true, running: false, last_flow_log_path: flowLogPath });
 
     const tools = orch.leaseActions(a.leaseId).map((e) => e.tool);
     expect(tools).toEqual(["net_proxy_start", "map_local", "map_remote", "net_assert_flow", "net_proxy_stop"]);
@@ -1330,7 +1344,7 @@ describe("startProxy with blockQuic", () => {
     await proxy.stopProxy("l1");
     expect(pfctlCalls().slice(3)).toEqual([`-a ${QUIC_BLOCK_ANCHOR} -F all`, "-X 4242"]);
     expect(fs.existsSync(rulesPath)).toBe(false);
-    expect(proxy.proxyStatus()).toEqual({ running: false });
+    expect(proxy.proxyStatus()).toMatchObject({ running: false, lastFlowLogPath: expect.any(String) });
   });
 
   it("flushes only the anchor on stop when PF was already on", async () => {

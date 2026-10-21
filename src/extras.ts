@@ -1376,9 +1376,14 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        const { stopped } = await orch.stopLeaseProxy(lease_id);
+        const { stopped, flowLogPath } = await orch.stopLeaseProxy(lease_id);
         await orch.logAction(lease_id, "net_proxy_stop", stopped ? "proxy stopped" : "proxy already stopped");
-        return ok({ lease_id, udid: lease.udid, stopped });
+        return ok({
+          lease_id,
+          udid: lease.udid,
+          stopped,
+          ...(flowLogPath !== undefined ? { flow_log_path: flowLogPath } : {}),
+        });
       } catch (err) {
         return fail(netProxyError(err));
       }
@@ -1396,8 +1401,20 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ lease_id }) => {
       try {
-        const { lease, running, port, pid, leaseId, sessionId, udid, ruleCount, quicBlocked, addonPath, flowLogPath } =
-          await orch.leaseProxyStatus(lease_id);
+        const {
+          lease,
+          running,
+          port,
+          pid,
+          leaseId,
+          sessionId,
+          udid,
+          ruleCount,
+          quicBlocked,
+          addonPath,
+          flowLogPath,
+          lastFlowLogPath,
+        } = await orch.leaseProxyStatus(lease_id);
         return ok({
           lease_id,
           udid: lease.udid,
@@ -1411,6 +1428,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           ...(ruleCount !== undefined ? { rule_count: ruleCount } : {}),
           ...(addonPath !== undefined ? { addon_path: addonPath } : {}),
           ...(flowLogPath !== undefined ? { flow_log_path: flowLogPath } : {}),
+          ...(lastFlowLogPath !== undefined ? { last_flow_log_path: lastFlowLogPath } : {}),
         });
       } catch (err) {
         return fail(netProxyError(err));
@@ -1546,25 +1564,55 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           .max(MAX_ASSERT_FLOW_SEC)
           .optional()
           .describe("Poll up to this many seconds. Default 5, max 120."),
+        since: z
+          .enum(["call", "run"])
+          .optional()
+          .describe("Match only flows starting after this call ('call', default) or every flow of this proxy run ('run')."),
+        status: z.number().int().min(100).max(599).optional().describe("Only flows whose response status equals this."),
+        min_bytes: z.number().int().min(0).optional().describe("Only flows with at least this many response bytes."),
+        body_regex: z
+          .string()
+          .min(1)
+          .refine(
+            (s) => {
+              try {
+                void new RegExp(s);
+                return true;
+              } catch {
+                return false;
+              }
+            },
+            "body_regex must be a valid regular expression",
+          )
+          .optional()
+          .describe("Regex matched (search) against the response body (needs body capture)."),
+        rewritten: z.boolean().optional().describe("Only flows the proxy rewrote (true) or passed through untouched (false)."),
+        rule: z.number().int().min(0).optional().describe("Only flows handled by this rule index."),
       },
     },
-    async ({ lease_id, url_regex, method, min_count, timeout_sec }) => {
+    async ({ lease_id, url_regex, method, min_count, timeout_sec, since, status, min_bytes, body_regex, rewritten, rule }) => {
       try {
-        const { lease, count, total, matched } = await orch.assertLeaseFlow(lease_id, {
+        const { lease, count, total, newSinceCall, matched } = await orch.assertLeaseFlow(lease_id, {
           urlRegex: url_regex,
           ...(method !== undefined ? { method } : {}),
           ...(min_count !== undefined ? { minCount: min_count } : {}),
           ...(timeout_sec !== undefined ? { timeoutSec: timeout_sec } : {}),
+          ...(since !== undefined ? { since } : {}),
+          ...(status !== undefined ? { status } : {}),
+          ...(min_bytes !== undefined ? { minBytes: min_bytes } : {}),
+          ...(body_regex !== undefined ? { bodyRegex: body_regex } : {}),
+          ...(rewritten !== undefined ? { rewritten } : {}),
+          ...(rule !== undefined ? { rule } : {}),
         });
         const needed = min_count ?? 1;
         if (count < needed) {
           return fail(
             `net_assert_flow: saw ${count} matching flow(s) for ${JSON.stringify(url_regex)} ` +
-              `(needed ${needed}) out of ${total} total within ${timeout_sec ?? 5}s.`,
+              `(needed ${needed}) out of ${total} total (${newSinceCall} new since call) within ${timeout_sec ?? 5}s.`,
           );
         }
         await orch.logAction(lease_id, "net_assert_flow", `assert ${JSON.stringify(url_regex)}: ${count}/${total}`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, count, total, matched });
+        return ok({ lease_id, udid: lease.udid, count, total, new_since_call: newSinceCall, matched });
       } catch (err) {
         return fail(netProxyError(err));
       }

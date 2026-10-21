@@ -969,13 +969,13 @@ export class Orchestrator {
    * Only the holding lease may stop — anything else gets a ProxyBusyError
    * naming the holder.
    */
-  stopLeaseProxy(leaseId: string): Promise<{ lease: Lease; stopped: boolean }> {
+  stopLeaseProxy(leaseId: string): Promise<{ lease: Lease; stopped: boolean; flowLogPath?: string }> {
     return this.mutex.run(async () => {
       const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
       if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
       if (!this.netProxy) return { lease: found, stopped: false };
-      const { stopped } = await this.netProxy.stopProxy(leaseId);
-      return { lease: found, stopped };
+      const { stopped, flowLogPath } = await this.netProxy.stopProxy(leaseId);
+      return { lease: found, stopped, ...(flowLogPath !== undefined ? { flowLogPath } : {}) };
     });
   }
 

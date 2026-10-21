@@ -73,13 +73,49 @@ export interface NetProxyStatus {
   quicBlocked?: boolean;
   addonPath?: string;
   flowLogPath?: string;
+  /** Most recent preserved flow log, reported after the proxy stops (P1b). */
+  lastFlowLogPath?: string;
 }
 
-/** One JSONL row of the proxy flow log (written by the generated addon). */
+/** Which hook wrote a flow-log row: request(), response(), or error(). Old rows predate phases. */
+export type FlowPhase = "request" | "response" | "error";
+
+/**
+ * One JSONL row of the proxy flow log (written by the generated addon).
+ * Only ts/method/url are guaranteed (old 3-field rows); every enriched
+ * field is optional and parsed tolerantly (P1a).
+ */
 export interface FlowRecord {
   ts: number;
   method: string;
   url: string;
+  phase?: FlowPhase;
+  /** Correlates a request row with its response/error row (flow.id). */
+  flowId?: string;
+  /** Rule generation that wrote the row (bumped on every set_rules/map restart; P2). */
+  gen?: number;
+  statusCode?: number;
+  reqBytes?: number;
+  respBytes?: number;
+  contentType?: string;
+  /** Index into the active rules of the rule that fired (null = passthrough). */
+  matchedRule?: number | null;
+  /** Which action fields fired (status/headers/body/map_local/map_remote/request.*). */
+  applied?: string[];
+  rewritten?: boolean;
+  /** Allowlisted header values (content-type, content-length, cache-control, etag, location). */
+  headers?: Record<string, string>;
+  /** Names of the remaining non-sensitive headers (values withheld). */
+  headerNames?: string[];
+  /** Denylisted header names present on the message (values always redacted). */
+  redactedHeaders?: string[];
+  reqBody?: string;
+  reqBodyTruncated?: boolean;
+  reqBodySha?: string;
+  respBody?: string;
+  respBodyTruncated?: boolean;
+  respBodySha?: string;
+  error?: string;
 }
 
 export interface AssertFlowSpec {
@@ -91,6 +127,22 @@ export interface AssertFlowSpec {
   minCount?: number;
   /** Poll the flow log up to this many seconds. Default 5. */
   timeoutSec?: number;
+  /**
+   * Watermark scope. 'call' (default) matches only flows that started after
+   * this call began and under the current rule generation; 'run' matches
+   * every flow logged by this proxy run (pre-call opt-out).
+   */
+  since?: "call" | "run";
+  /** Only flows whose response status equals this. Requires a response row. */
+  status?: number;
+  /** Only flows with at least this many response bytes. Requires a response row. */
+  minBytes?: number;
+  /** Regex matched (search) against the response body. Requires a response row with a captured body. */
+  bodyRegex?: string;
+  /** Only flows the proxy rewrote (true) or passed through untouched (false). Requires a response row. */
+  rewritten?: boolean;
+  /** Only flows handled by this rule index. Requires a response row. */
+  rule?: number;
 }
 
 export interface AssertFlowResult {
@@ -98,6 +150,8 @@ export interface AssertFlowResult {
   count: number;
   /** Total flows logged for this proxy run. */
   total: number;
+  /** Request rows that started after this call began (match or not). */
+  newSinceCall: number;
   /** The most recent matching flows (at most 10, oldest first). */
   matched: FlowRecord[];
 }
@@ -111,7 +165,7 @@ export interface ProxyOps {
     opts?: { blockQuic?: boolean },
   ): Promise<{ port: number; pid?: number }>;
   setProxyRules(leaseId: string, rules: NetProxyRule[]): Promise<void>;
-  stopProxy(leaseId: string): Promise<{ stopped: boolean }>;
+  stopProxy(leaseId: string): Promise<{ stopped: boolean; flowLogPath?: string }>;
   proxyStatus(): NetProxyStatus;
   proxyRules(leaseId: string): NetProxyRule[];
   assertFlow(leaseId: string, spec: AssertFlowSpec): Promise<AssertFlowResult>;
@@ -372,26 +426,94 @@ function normalizeAction(action: unknown, what: string): NetProxyAction {
   return out;
 }
 
+/** Env gate for proxy body capture (P1a). Default OFF (PII risk); metadata rows are always on. */
+export const PROXY_CAPTURE_BODIES_ENV = "SIM_MCP_PROXY_CAPTURE_BODIES";
+/** Per-body capture cap embedded in the addon (larger bodies set truncated). */
+export const FLOW_BODY_CAP_BYTES = 8192;
+/** Addon-side flow-log size cap: past this, bodies stop but metadata rows continue. */
+export const FLOW_LOG_MAX_BYTES = 10 * 1024 * 1024;
+/** Per-run flow logs retained per port (P1b rotation). */
+export const FLOW_LOG_KEEP_PER_PORT = 5;
+
+/** True only when the body-capture gate is explicitly enabled. Never throws. */
+export function proxyCaptureBodiesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    return env[PROXY_CAPTURE_BODIES_ENV] === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Per-run flow-log name: `flow-{port}-{runId}.jsonl` where runId is the start timestamp (P1b). */
+export function flowLogFileName(port: number, runId: number): string {
+  return `flow-${port}-${runId}.jsonl`;
+}
+
+/** Delete all but the newest `keep` per-run flow logs for a port. Never throws. */
+export function rotateFlowLogs(workDir: string, port: number, keep: number = FLOW_LOG_KEEP_PER_PORT): void {
+  try {
+    const prefix = `flow-${port}-`;
+    const names = fs.readdirSync(workDir).filter((f) => f.startsWith(prefix) && f.endsWith(".jsonl"));
+    if (names.length <= keep) return;
+    const runIdOf = (name: string): number => {
+      const n = Number(name.slice(prefix.length, -".jsonl".length));
+      return Number.isFinite(n) ? n : 0;
+    };
+    names.sort((a, b) => runIdOf(a) - runIdOf(b));
+    for (const stale of names.slice(0, names.length - keep)) {
+      try {
+        fs.unlinkSync(path.join(workDir, stale));
+      } catch {
+        // Best-effort.
+      }
+    }
+  } catch {
+    // Rotation must never break proxy start.
+  }
+}
+
 /**
  * Generate the mitmdump addon for normalized rules. The rules are embedded as
  * a doubly-encoded JSON string literal (valid Python: JSON escapes are a
  * subset of Python string escapes), so rule bodies need no Python escaping.
- * Semantics: every request is appended to the flow log; the first matching
- * rule may rewrite the request (method/url/headers/body, map_remote), serve a
- * local file instead of upstream (map_local), delay the request, and mutate
- * the response (status/headers/body).
+ * Semantics: every request is appended to the flow log as a {"phase":
+ * "request"} row and every response as a {"phase": "response"} row, correlated
+ * by "flow_id" (flow.id, with a method+url fallback); failed flows get a
+ * {"phase": "error"} row. The first matching rule may rewrite the request
+ * (method/url/headers/body, map_remote), serve a local file instead of
+ * upstream (map_local), delay the request, and mutate the response
+ * (status/headers/body).
+ *
+ * Body capture is OFF by default and, when enabled, is embedded as a
+ * CAPTURE_BODIES literal (RULES/FLOW_LOG precedent): defaultSpawn inherits
+ * process.env into mitmdump, but the SpawnFn seam cannot carry env, so a
+ * template literal is the deterministic plumbing. The rule generation rides
+ * the same precedent (GEN literal, stamped on every row for the P2
+ * generation watermark).
  */
-export function buildAddon(rules: NetProxyRule[], opts: { flowLogPath?: string } = {}): string {
+export function buildAddon(
+  rules: NetProxyRule[],
+  opts: { flowLogPath?: string; captureBodies?: boolean; generation?: number } = {},
+): string {
   const embedded = JSON.stringify(JSON.stringify(rules));
   const flowLog = opts.flowLogPath !== undefined ? JSON.stringify(opts.flowLogPath) : "None";
+  const captureBodies = opts.captureBodies === true ? "True" : "False";
+  const generation = opts.generation !== undefined && Number.isInteger(opts.generation) && opts.generation >= 0
+    ? opts.generation
+    : 0;
   return `# Generated by apple-debug-mcp NetProxy - do not edit.
 """Per-lease rewrite rules (first match wins per request).
 
-Every request is appended to the flow log; the matched rule may rewrite the
-request, serve a local file (map_local), delay, and mutate the response.
+Every request is appended to the flow log as a {"phase": "request"} row and
+every response as a {"phase": "response"} row, correlated by "flow_id"
+(flow.id, with a method+url fallback); failed flows get a {"phase": "error"}
+row. The matched rule may rewrite the request, serve a local file
+(map_local), delay, and mutate the response.
 Regenerated on every net_proxy_start / net_proxy_set_rules / map_*.
 """
+import hashlib
 import json
+import os
 import re
 import time
 
@@ -399,19 +521,194 @@ from mitmproxy import http
 
 RULES = json.loads(${embedded})
 FLOW_LOG = ${flowLog}
+CAPTURE_BODIES = ${captureBodies}
+GEN = ${generation}
+BODY_CAP = 8192
+FLOW_LOG_MAX_BYTES = 10485760
+HEADER_VALUE_ALLOW = {"content-type", "content-length", "cache-control", "etag", "location"}
+HEADER_REDACT_EXACT = {"authorization", "cookie", "set-cookie"}
+HEADER_REDACT_SUFFIX = ("-token", "-secret")
+JSON_SCRUB_SUBSTR = ("password", "passwd", "secret", "token", "authorization", "cookie", "session", "ssn")
+TEXT_CONTENT_TYPES = {"application/json", "application/xml", "application/javascript",
+                      "application/ecmascript", "application/x-www-form-urlencoded"}
+
+_PENDING = {}
+_PENDING_MAX = 4096
 
 
-def _log(flow):
+def _flow_key(flow):
+    try:
+        fid = getattr(flow, "id", "")
+        if fid:
+            return str(fid)
+    except Exception:
+        pass
+    # Degenerate fallback (flow.id is standard on HTTPFlow): stable across
+    # the request/response hooks so rows still correlate; concurrent
+    # identical requests may share it. TS-side joins on (method,url,ts).
+    try:
+        return "%s %s" % (flow.request.method, flow.request.pretty_url)
+    except Exception:
+        return ""
+
+
+def _bodies_ok():
+    if not CAPTURE_BODIES or not FLOW_LOG:
+        return False
+    try:
+        return os.path.getsize(FLOW_LOG) <= FLOW_LOG_MAX_BYTES
+    except OSError:
+        return True
+
+
+def _content_type(headers):
+    try:
+        return str(headers.get("content-type", ""))
+    except Exception:
+        return ""
+
+
+def _headers_split(headers):
+    values = {}
+    names = []
+    redacted = []
+    try:
+        items = list(headers.items())
+    except Exception:
+        return values, names, redacted
+    for k, v in items:
+        try:
+            name = str(k).lower()
+        except Exception:
+            continue
+        if name in HEADER_REDACT_EXACT or name.endswith(HEADER_REDACT_SUFFIX):
+            redacted.append(name)
+        elif name in HEADER_VALUE_ALLOW:
+            try:
+                values[name] = str(v)
+            except Exception:
+                pass
+        else:
+            names.append(name)
+    return values, names, redacted
+
+
+def _is_text(content_type):
+    ct = content_type.split(";")[0].strip().lower()
+    if ct.startswith("text/") or ct in TEXT_CONTENT_TYPES:
+        return True
+    return ct.endswith("+json") or ct.endswith("+xml")
+
+
+def _scrub_json(text):
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return text
+
+    def scrub(value):
+        if isinstance(value, dict):
+            out = {}
+            for k, v in value.items():
+                if any(s in str(k).lower() for s in JSON_SCRUB_SUBSTR):
+                    out[k] = "***"
+                else:
+                    out[k] = scrub(v)
+            return out
+        if isinstance(value, list):
+            return [scrub(v) for v in value]
+        return value
+
+    try:
+        return json.dumps(scrub(obj), ensure_ascii=False)
+    except Exception:
+        return text
+
+
+def _body_fields(content, content_type, bodies_ok):
+    size = len(content) if content else 0
+    fields = {}
+    if not bodies_ok or not content:
+        return size, fields
+    try:
+        raw = bytes(content)
+    except Exception:
+        return size, fields
+    if not _is_text(content_type):
+        fields["sha"] = hashlib.sha256(raw).hexdigest()
+        return size, fields
+    try:
+        text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return size, fields
+    ct = content_type.split(";")[0].strip().lower()
+    if ct == "application/json" or ct.endswith("+json"):
+        text = _scrub_json(text)
+    encoded = text.encode("utf-8")
+    if len(encoded) > BODY_CAP:
+        text = encoded[:BODY_CAP].decode("utf-8", errors="replace")
+        fields["truncated"] = True
+    fields["text"] = text
+    return size, fields
+
+
+def _write(row):
     if not FLOW_LOG:
         return
     try:
         with open(FLOW_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "ts": time.time(),
-                "method": flow.request.method,
-                "url": flow.request.pretty_url,
-            }) + "\\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\\n")
     except OSError:
+        pass
+
+
+def _remember(flow, rule_index, applied):
+    try:
+        if len(_PENDING) >= _PENDING_MAX:
+            _PENDING.pop(next(iter(_PENDING)), None)
+        _PENDING[_flow_key(flow)] = {"rule": rule_index, "applied": applied}
+    except Exception:
+        pass
+
+
+def _take_pending(flow):
+    try:
+        found = _PENDING.pop(_flow_key(flow), None)
+    except Exception:
+        return None
+    if isinstance(found, dict) and isinstance(found.get("applied"), list):
+        return found
+    return None
+
+
+def _log(flow):
+    try:
+        bodies_ok = _bodies_ok()
+        try:
+            content = flow.request.content
+        except Exception:
+            content = None
+        size, bf = _body_fields(content, _content_type(flow.request.headers), bodies_ok)
+        values, names, redacted = _headers_split(flow.request.headers)
+        row = {
+            "phase": "request",
+            "flow_id": _flow_key(flow),
+            "ts": time.time(),
+            "gen": GEN,
+            "method": flow.request.method,
+            "url": flow.request.pretty_url,
+            "req_bytes": size,
+            "headers": values,
+            "header_names": names,
+            "redacted_headers": redacted,
+        }
+        if "text" in bf:
+            row["req_body"] = bf["text"]
+            row["req_body_truncated"] = bool(bf.get("truncated"))
+        elif "sha" in bf:
+            row["req_body_sha"] = bf["sha"]
+        _write(row)
+    except Exception:
         pass
 
 
@@ -431,63 +728,204 @@ def _match(rule, flow):
 
 
 def _find(flow):
-    for rule in RULES:
+    for i, rule in enumerate(RULES):
         if _match(rule, flow):
-            return rule
-    return None
+            return i, rule
+    return None, None
 
 
 def request(flow):
     _log(flow)
-    rule = _find(flow)
-    if rule is None:
-        return
-    action = rule.get("action") or {}
-    delay = action.get("delay_ms")
-    if delay:
-        time.sleep(delay / 1000.0)
-    req = action.get("request") or {}
-    if req.get("method"):
-        flow.request.method = req["method"]
-    if req.get("url"):
-        flow.request.url = req["url"]
-    for k, v in (req.get("headers") or {}).items():
-        flow.request.headers[k] = v
-    if req.get("body") is not None:
-        body = req["body"].encode("utf-8")
-        flow.request.content = body
-        flow.request.headers.pop("content-encoding", None)
-        flow.request.headers["content-length"] = str(len(body))
-    if action.get("map_remote"):
-        flow.request.url = action["map_remote"]
-    if action.get("map_local"):
-        try:
-            with open(action["map_local"], "rb") as f:
-                content = f.read()
-            flow.response = http.Response.make(200, content)
-        except OSError as e:
-            flow.response = http.Response.make(502, ("map_local failed: %s" % e).encode("utf-8"))
+    try:
+        _request_inner(flow)
+    except Exception:
+        pass
+
+
+def _request_inner(flow):
+    index, rule = _find(flow)
+    applied = []
+    if rule is not None:
+        action = rule.get("action") or {}
+        delay = action.get("delay_ms")
+        if delay:
+            time.sleep(delay / 1000.0)
+        req = action.get("request") or {}
+        if req.get("method"):
+            flow.request.method = req["method"]
+            applied.append("request.method")
+        if req.get("url"):
+            flow.request.url = req["url"]
+            applied.append("request.url")
+        req_headers = req.get("headers") or {}
+        if req_headers:
+            for k, v in req_headers.items():
+                flow.request.headers[k] = v
+            applied.append("request.headers")
+        if req.get("body") is not None:
+            body = req["body"].encode("utf-8")
+            flow.request.content = body
+            flow.request.headers.pop("content-encoding", None)
+            flow.request.headers["content-length"] = str(len(body))
+            applied.append("request.body")
+        if action.get("map_remote"):
+            flow.request.url = action["map_remote"]
+            applied.append("map_remote")
+        if action.get("map_local"):
+            try:
+                with open(action["map_local"], "rb") as f:
+                    content = f.read()
+                flow.response = http.Response.make(200, content)
+            except OSError as e:
+                flow.response = http.Response.make(502, ("map_local failed: %s" % e).encode("utf-8"))
+            applied.append("map_local")
+    _remember(flow, index, applied)
 
 
 def response(flow):
-    rule = _find(flow)
-    if rule is None:
-        return
-    action = rule.get("action") or {}
-    resp = flow.response
-    if action.get("status") is not None:
-        resp.status_code = int(action["status"])
-    for k, v in (action.get("headers") or {}).items():
-        resp.headers[k] = v
-    if action.get("body") is not None:
-        body = action["body"].encode("utf-8")
-        resp.content = body
-        resp.headers.pop("content-encoding", None)
-        resp.headers["content-length"] = str(len(body))
+    try:
+        _response_inner(flow)
+    except Exception:
+        pass
+
+
+def _response_inner(flow):
+    index, rule = _find(flow)
+    applied = []
+    pend = _take_pending(flow)
+    if pend is not None:
+        applied.extend([a for a in pend["applied"] if isinstance(a, str)])
+        if index is None and isinstance(pend.get("rule"), int):
+            index = pend["rule"]
+    if rule is not None:
+        try:
+            action = rule.get("action") or {}
+            resp = flow.response
+            if action.get("status") is not None:
+                resp.status_code = int(action["status"])
+                applied.append("status")
+            resp_headers = action.get("headers") or {}
+            if resp_headers:
+                for k, v in resp_headers.items():
+                    resp.headers[k] = v
+                applied.append("headers")
+            if action.get("body") is not None:
+                body = action["body"].encode("utf-8")
+                resp.content = body
+                resp.headers.pop("content-encoding", None)
+                resp.headers["content-length"] = str(len(body))
+                applied.append("body")
+        except Exception:
+            pass
+    try:
+        resp = flow.response
+    except Exception:
+        resp = None
+    try:
+        status_code = resp.status_code if resp is not None else None
+    except Exception:
+        status_code = None
+    bodies_ok = _bodies_ok()
+    try:
+        content = resp.content if resp is not None else None
+    except Exception:
+        content = None
+    ctype = _content_type(resp.headers) if resp is not None else ""
+    size, bf = _body_fields(content, ctype, bodies_ok)
+    try:
+        req_content = flow.request.content
+    except Exception:
+        req_content = None
+    if resp is not None:
+        values, names, redacted = _headers_split(resp.headers)
+    else:
+        values, names, redacted = {}, [], []
+    row = {
+        "phase": "response",
+        "flow_id": _flow_key(flow),
+        "ts": time.time(),
+        "gen": GEN,
+        "method": flow.request.method,
+        "url": flow.request.pretty_url,
+        "status_code": status_code,
+        "content_type": ctype,
+        "req_bytes": len(req_content) if req_content else 0,
+        "resp_bytes": size,
+        "matched_rule": index,
+        "applied": applied,
+        "rewritten": len(applied) > 0,
+        "headers": values,
+        "header_names": names,
+        "redacted_headers": redacted,
+    }
+    if "text" in bf:
+        row["resp_body"] = bf["text"]
+        row["resp_body_truncated"] = bool(bf.get("truncated"))
+    elif "sha" in bf:
+        row["resp_body_sha"] = bf["sha"]
+    _write(row)
+
+
+def error(flow):
+    try:
+        _take_pending(flow)
+        try:
+            method = flow.request.method
+        except Exception:
+            method = ""
+        try:
+            url = flow.request.pretty_url
+        except Exception:
+            url = ""
+        try:
+            message = str(flow.error)
+        except Exception:
+            message = ""
+        _write({
+            "phase": "error",
+            "flow_id": _flow_key(flow),
+            "ts": time.time(),
+            "gen": GEN,
+            "method": method,
+            "url": url,
+            "error": message,
+        })
+    except Exception:
+        pass
 `;
 }
 
-/** Parse flow-log JSONL, skipping malformed rows (a partial last line while mitmdump writes). */
+function asFlowString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function asFlowNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asFlowBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function asFlowStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+function asFlowStringMap(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string") out[key] = entry;
+  }
+  return out;
+}
+
+/**
+ * Parse flow-log JSONL, skipping malformed rows (a partial last line while
+ * mitmdump writes). Old 3-field rows still parse; enriched optional fields
+ * are picked up only when correctly typed (tolerant parsing, P1a).
+ */
 export function parseFlowLog(text: string): FlowRecord[] {
   const out: FlowRecord[] = [];
   for (const line of text.split("\n")) {
@@ -495,9 +933,54 @@ export function parseFlowLog(text: string): FlowRecord[] {
     if (!trimmed) continue;
     try {
       const row = JSON.parse(trimmed) as Record<string, unknown>;
-      if (typeof row["method"] === "string" && typeof row["url"] === "string") {
-        out.push({ ts: typeof row["ts"] === "number" ? row["ts"] : 0, method: row["method"], url: row["url"] });
-      }
+      if (typeof row["method"] !== "string" || typeof row["url"] !== "string") continue;
+      const record: FlowRecord = {
+        ts: typeof row["ts"] === "number" ? row["ts"] : 0,
+        method: row["method"],
+        url: row["url"],
+      };
+      const phase = asFlowString(row["phase"]);
+      if (phase === "request" || phase === "response" || phase === "error") record.phase = phase;
+      const flowId = asFlowString(row["flow_id"]);
+      if (flowId !== undefined) record.flowId = flowId;
+      const gen = asFlowNumber(row["gen"]);
+      if (gen !== undefined) record.gen = gen;
+      const statusCode = asFlowNumber(row["status_code"]);
+      if (statusCode !== undefined) record.statusCode = statusCode;
+      const reqBytes = asFlowNumber(row["req_bytes"]);
+      if (reqBytes !== undefined) record.reqBytes = reqBytes;
+      const respBytes = asFlowNumber(row["resp_bytes"]);
+      if (respBytes !== undefined) record.respBytes = respBytes;
+      const contentType = asFlowString(row["content_type"]);
+      if (contentType !== undefined) record.contentType = contentType;
+      const matchedRule = row["matched_rule"];
+      if (typeof matchedRule === "number" && Number.isFinite(matchedRule)) record.matchedRule = matchedRule;
+      else if (matchedRule === null) record.matchedRule = null;
+      const applied = asFlowStringArray(row["applied"]);
+      if (applied !== undefined) record.applied = applied;
+      const rewritten = asFlowBoolean(row["rewritten"]);
+      if (rewritten !== undefined) record.rewritten = rewritten;
+      const headers = asFlowStringMap(row["headers"]);
+      if (headers !== undefined) record.headers = headers;
+      const headerNames = asFlowStringArray(row["header_names"]);
+      if (headerNames !== undefined) record.headerNames = headerNames;
+      const redactedHeaders = asFlowStringArray(row["redacted_headers"]);
+      if (redactedHeaders !== undefined) record.redactedHeaders = redactedHeaders;
+      const reqBody = asFlowString(row["req_body"]);
+      if (reqBody !== undefined) record.reqBody = reqBody;
+      const reqBodyTruncated = asFlowBoolean(row["req_body_truncated"]);
+      if (reqBodyTruncated !== undefined) record.reqBodyTruncated = reqBodyTruncated;
+      const reqBodySha = asFlowString(row["req_body_sha"]);
+      if (reqBodySha !== undefined) record.reqBodySha = reqBodySha;
+      const respBody = asFlowString(row["resp_body"]);
+      if (respBody !== undefined) record.respBody = respBody;
+      const respBodyTruncated = asFlowBoolean(row["resp_body_truncated"]);
+      if (respBodyTruncated !== undefined) record.respBodyTruncated = respBodyTruncated;
+      const respBodySha = asFlowString(row["resp_body_sha"]);
+      if (respBodySha !== undefined) record.respBodySha = respBodySha;
+      const error = asFlowString(row["error"]);
+      if (error !== undefined) record.error = error;
+      out.push(record);
     } catch {
       // Skip torn writes.
     }
@@ -519,6 +1002,31 @@ function readFlowLog(flowLogPath: string): FlowRecord[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Overlay a request row with its correlated response row (same flow_id), so
+ * response-side assert filters see completed-flow state. Request-identity
+ * fields (method/url/ts/headers/reqBytes) always stay the request row's;
+ * only response-specific fields are overlaid, and only when defined (a null
+ * matched_rule is meaningful: passthrough). Rows without a correlated
+ * response row pass through unchanged.
+ */
+function mergeFlowResponse(request: FlowRecord, responseById: Map<string, FlowRecord>): FlowRecord {
+  if (request.flowId === undefined) return request;
+  const response = responseById.get(request.flowId);
+  if (!response) return request;
+  const merged: FlowRecord = { ...request };
+  if (response.statusCode !== undefined) merged.statusCode = response.statusCode;
+  if (response.respBytes !== undefined) merged.respBytes = response.respBytes;
+  if (response.contentType !== undefined) merged.contentType = response.contentType;
+  if (response.matchedRule !== undefined) merged.matchedRule = response.matchedRule;
+  if (response.applied !== undefined) merged.applied = response.applied;
+  if (response.rewritten !== undefined) merged.rewritten = response.rewritten;
+  if (response.respBody !== undefined) merged.respBody = response.respBody;
+  if (response.respBodyTruncated !== undefined) merged.respBodyTruncated = response.respBodyTruncated;
+  if (response.respBodySha !== undefined) merged.respBodySha = response.respBodySha;
+  return merged;
 }
 
 /** Injectable mitmdump child handle (node:child_process ChildProcess satisfies this). */
@@ -646,6 +1154,10 @@ interface ActiveProxy {
   flowLogPath: string;
   child: MitmChild;
   quicBlocked: boolean;
+  /** Resolved once per run at start; reused across rule restarts so the flag cannot flip mid-run. */
+  captureBodies: boolean;
+  /** Rule generation for the P2 watermark: 0 at start, ++ on every applyRules restart. */
+  ruleGeneration: number;
   /** Enable-reference token from `pfctl -E`; present only when WE enabled PF. */
   pfEnableToken?: string;
   pfRulesPath?: string;
@@ -680,7 +1192,9 @@ export class NetProxy implements ProxyOps {
   private readonly caPemPath: string;
   private readonly workDir: string;
   private readonly waitReady: WaitReadyFn;
+  private readonly captureBodiesOverride: boolean | undefined;
   private active: ActiveProxy | null = null;
+  private lastRun: { flowLogPath: string } | null = null;
 
   constructor(
     opts: {
@@ -693,10 +1207,12 @@ export class NetProxy implements ProxyOps {
       workDir?: string;
       readyTimeoutMs?: number;
       waitReady?: WaitReadyFn;
+      captureBodies?: boolean;
     } = {},
   ) {
     this.bin = opts.bin ?? DEFAULT_MITMDUMP_BIN;
     this.run = opts.runner ?? defaultRunner;
+    this.captureBodiesOverride = opts.captureBodies;
     this.spawnFn = opts.spawnFn ?? defaultSpawn;
     this.execTimeoutMs = opts.execTimeoutMs ?? 60_000;
     this.portBase = opts.portBase ?? DEFAULT_NETPROXY_PORT_BASE;
@@ -712,7 +1228,9 @@ export class NetProxy implements ProxyOps {
 
   proxyStatus(): NetProxyStatus {
     const active = this.active;
-    if (!active) return { running: false };
+    if (!active) {
+      return this.lastRun ? { running: false, lastFlowLogPath: this.lastRun.flowLogPath } : { running: false };
+    }
     return {
       running: true,
       port: active.port,
@@ -757,9 +1275,11 @@ export class NetProxy implements ProxyOps {
       timeoutMs: this.execTimeoutMs,
     });
     fs.mkdirSync(this.workDir, { recursive: true });
+    rotateFlowLogs(this.workDir, port);
     const addonPath = path.join(this.workDir, `addon-${port}.py`);
-    const flowLogPath = path.join(this.workDir, `flow-${port}.jsonl`);
-    fs.writeFileSync(addonPath, buildAddon(normalized, { flowLogPath }));
+    const flowLogPath = path.join(this.workDir, flowLogFileName(port, Date.now()));
+    const captureBodies = this.captureBodiesOverride ?? proxyCaptureBodiesEnabled();
+    fs.writeFileSync(addonPath, buildAddon(normalized, { flowLogPath, captureBodies, generation: 0 }));
     fs.writeFileSync(flowLogPath, "");
     const child = this.spawnFn(this.bin, ["-p", String(port), "-s", addonPath], {});
     let spawnError: Error | null = null;
@@ -828,6 +1348,8 @@ export class NetProxy implements ProxyOps {
       flowLogPath,
       child,
       quicBlocked: blockQuic,
+      captureBodies,
+      ruleGeneration: 0,
       pfEnableToken,
       pfRulesPath,
     };
@@ -877,9 +1399,16 @@ export class NetProxy implements ProxyOps {
   }
 
   /**
-   * Poll the proxy flow log for requests matching urlRegex (+method). Fails
-   * cleanly when the lease holds no running proxy. Returns the counts; the
-   * caller decides pass/fail against minCount.
+   * Poll the proxy flow log for requests matching urlRegex (+method and the
+   * response-side filters). Fails cleanly when the lease holds no running
+   * proxy. Returns the counts; the caller decides pass/fail against minCount.
+   *
+   * Watermarks (P2): under the default since:'call', only rows that started
+   * after this call began (ts) and under the current rule generation match,
+   * so stale flows from before the call or before a set_rules restart never
+   * match; since:'run' matches every flow of this proxy run. Both watermarks
+   * anchor at call start. Rows without a gen stamp (pre-P2 logs) pass the
+   * generation check; the ts check still excludes them when stale.
    */
   async assertFlow(leaseId: string, spec: AssertFlowSpec): Promise<AssertFlowResult> {
     const active = this.requireHolder(leaseId, "assert flow");
@@ -904,14 +1433,68 @@ export class NetProxy implements ProxyOps {
     if (!Number.isFinite(timeoutSec) || timeoutSec < 0 || timeoutSec > MAX_ASSERT_FLOW_SEC) {
       throw new Error(`Invalid timeout_sec ${String(spec.timeoutSec)} (expected a number in 0..${MAX_ASSERT_FLOW_SEC})`);
     }
-    const deadline = Date.now() + timeoutSec * 1000;
+    const since = spec.since ?? "call";
+    if (since !== "call" && since !== "run") {
+      throw new Error(`Invalid since ${JSON.stringify(since)} (expected "call" or "run")`);
+    }
+    const status = spec.status;
+    if (status !== undefined && (!Number.isInteger(status) || status < 100 || status > 599)) {
+      throw new Error(`Invalid status ${String(spec.status)} (expected an integer in 100..599)`);
+    }
+    const minBytes = spec.minBytes;
+    if (minBytes !== undefined && (!Number.isInteger(minBytes) || minBytes < 0)) {
+      throw new Error(`Invalid min_bytes ${String(spec.minBytes)} (expected an integer >= 0)`);
+    }
+    let bodyPattern: RegExp | undefined;
+    if (spec.bodyRegex !== undefined) {
+      if (typeof spec.bodyRegex !== "string" || spec.bodyRegex.length === 0) {
+        throw new Error("Invalid body_regex (expected a non-empty string)");
+      }
+      try {
+        bodyPattern = new RegExp(spec.bodyRegex);
+      } catch {
+        throw new Error(`Invalid body_regex ${JSON.stringify(spec.bodyRegex)} (not a valid regular expression)`);
+      }
+    }
+    const rewritten = spec.rewritten;
+    if (rewritten !== undefined && typeof rewritten !== "boolean") {
+      throw new Error(`Invalid rewritten ${String(spec.rewritten)} (expected a boolean)`);
+    }
+    const rule = spec.rule;
+    if (rule !== undefined && (!Number.isInteger(rule) || rule < 0)) {
+      throw new Error(`Invalid rule ${String(spec.rule)} (expected an integer >= 0)`);
+    }
+    const sinceRun = since === "run";
+    const startTs = Date.now();
+    const startGen = active.ruleGeneration;
+    const isNew = (f: FlowRecord): boolean =>
+      f.ts * 1000 >= startTs && (sinceRun || f.gen === undefined || f.gen === startGen);
+    const deadline = startTs + timeoutSec * 1000;
     for (;;) {
-      const flows = readFlowLog(active.flowLogPath);
-      const matched = flows.filter(
-        (f) => (method === undefined || f.method === method) && pattern.test(f.url),
-      );
+      const rows = readFlowLog(active.flowLogPath);
+      const responseById = new Map<string, FlowRecord>();
+      for (const row of rows) {
+        if (row.phase === "response" && row.flowId !== undefined) responseById.set(row.flowId, row);
+      }
+      // Two-phase logs carry one request row plus one response/error row per
+      // flow: count request rows only (phaseless old rows count as requests)
+      // so one flow still counts once.
+      const flows = rows.filter((f) => f.phase === undefined || f.phase === "request");
+      const newSinceCall = flows.filter(isNew).length;
+      const candidates = sinceRun ? flows : flows.filter(isNew);
+      const matched = candidates
+        .filter((f) => (method === undefined || f.method === method) && pattern.test(f.url))
+        .map((f) => mergeFlowResponse(f, responseById))
+        .filter(
+          (f) =>
+            (status === undefined || f.statusCode === status) &&
+            (minBytes === undefined || (f.respBytes !== undefined && f.respBytes >= minBytes)) &&
+            (bodyPattern === undefined || (f.respBody !== undefined && bodyPattern.test(f.respBody))) &&
+            (rewritten === undefined || f.rewritten === rewritten) &&
+            (rule === undefined || f.matchedRule === rule),
+        );
       if (matched.length >= minCount || Date.now() >= deadline) {
-        return { count: matched.length, total: flows.length, matched: matched.slice(-10) };
+        return { count: matched.length, total: flows.length, newSinceCall, matched: matched.slice(-10) };
       }
       await sleep(250);
     }
@@ -931,7 +1514,15 @@ export class NetProxy implements ProxyOps {
    * it against a dead port.
    */
   private async applyRules(active: ActiveProxy, normalized: NetProxyRule[], failurePrefix: string): Promise<void> {
-    fs.writeFileSync(active.addonPath, buildAddon(normalized, { flowLogPath: active.flowLogPath }));
+    active.ruleGeneration += 1;
+    fs.writeFileSync(
+      active.addonPath,
+      buildAddon(normalized, {
+        flowLogPath: active.flowLogPath,
+        captureBodies: active.captureBodies,
+        generation: active.ruleGeneration,
+      }),
+    );
     await stopChildQuiet(active.child);
     const child = this.spawnFn(this.bin, ["-p", String(active.port), "-s", active.addonPath], {});
     let spawnError: Error | null = null;
@@ -977,23 +1568,28 @@ export class NetProxy implements ProxyOps {
    * stop — anything else gets a ProxyBusyError naming the holder. The
    * teardown itself never throws.
    */
-  async stopProxy(leaseId: string): Promise<{ stopped: boolean }> {
+  async stopProxy(leaseId: string): Promise<{ stopped: boolean; flowLogPath?: string }> {
     const active = this.active;
     if (!active) return { stopped: false };
     if (active.leaseId !== leaseId) throw new ProxyBusyError(active, "stop");
-    await this.teardown(active);
-    return { stopped: true };
+    const flowLogPath = await this.teardown(active);
+    return { stopped: true, flowLogPath };
   }
 
   /** Unconditional best-effort stop for daemon shutdown (never throws, never rejects holders). */
-  async forceStop(): Promise<{ stopped: boolean }> {
+  async forceStop(): Promise<{ stopped: boolean; flowLogPath?: string }> {
     const active = this.active;
     if (!active) return { stopped: false };
-    await this.teardown(active);
-    return { stopped: true };
+    const flowLogPath = await this.teardown(active);
+    return { stopped: true, flowLogPath };
   }
 
-  private async teardown(active: ActiveProxy): Promise<void> {
+  /**
+   * Restore the host, stop the child, and archive the run: the addon is
+   * deleted but the per-run flow log stays on disk (like the pcap pattern)
+   * and its path is recorded for status. Returns the archived path.
+   */
+  private async teardown(active: ActiveProxy): Promise<string> {
     this.active = null;
     await this.restoreSnapshot(active.snapshot);
     if (active.quicBlocked) {
@@ -1002,13 +1598,13 @@ export class NetProxy implements ProxyOps {
       });
     }
     await stopChildQuiet(active.child);
-    for (const generated of [active.addonPath, active.flowLogPath]) {
-      try {
-        fs.unlinkSync(generated);
-      } catch {
-        // Best-effort.
-      }
+    try {
+      fs.unlinkSync(active.addonPath);
+    } catch {
+      // Best-effort.
     }
+    this.lastRun = { flowLogPath: active.flowLogPath };
+    return active.flowLogPath;
   }
 
   /** Read PF enabled-state (needs sudo; pfctl refuses /dev/pf for mortals). */
