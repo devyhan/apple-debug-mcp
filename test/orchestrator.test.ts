@@ -227,3 +227,17 @@ describe("tickets", () => {
     await expect(orch.queueStatus(w.ticket.ticketId)).rejects.toThrow(/unknown ticket/i);
   });
 });
+
+describe("contamination bookkeeping", () => {
+  it("tracks lease-launched bundles and drops the state on release", async () => {
+    const { orch } = makeOrch([sim("UDID-1", "iPhone 17 Pro", "Booted")]);
+    const res = await orch.acquire({ sessionId: "a", autoBoot: false });
+    if (!res.ok || res.queued) throw new Error("expected lease");
+    const leaseId = res.lease.leaseId;
+    expect(orch.contaminationStatus(leaseId)).toEqual({ contended: false, contendedSince: null });
+    orch.markAppLaunched(leaseId, "com.example.Mine");
+    await orch.release(leaseId, "a");
+    expect(orch.contaminationStatus(leaseId)).toEqual({ contended: false, contendedSince: null });
+    expect(orch.contaminationStatus("lease_unknown")).toEqual({ contended: false, contendedSince: null });
+  });
+});

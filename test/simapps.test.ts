@@ -126,6 +126,33 @@ describe("SimApps wrapper", () => {
     await new SimApps({ runner: run }).terminate("U1", "com.apple.Preferences");
     expect(run.calls[0]).toMatchObject({ bin: "xcrun", args: ["simctl", "terminate", "U1", "com.apple.Preferences"] });
   });
+
+  it("listRunning parses UIKitApplication labels from launchctl list", async () => {
+    const run = stubRunner(() => ({
+      stdout: "PID\tStatus\tLabel\n-\t0\tcom.apple.springboard\n1234\t0\tUIKitApplication:com.example.MyApp[0x1a2b]\n567\t0\tUIKitApplication:com.other.App\n",
+      stderr: "",
+    }));
+    const running = await new SimApps({ runner: run }).listRunning("U1");
+    expect(run.calls[0]).toMatchObject({ bin: "xcrun", args: ["simctl", "spawn", "U1", "launchctl", "list"] });
+    expect([...running].sort()).toEqual(["com.example.MyApp", "com.other.App"]);
+  });
+
+  it("listRunning tolerates garbage lines and empty output", async () => {
+    const run = stubRunner(() => ({ stdout: "garbage\n\t\t\nnot a label: [::]\n", stderr: "" }));
+    expect(await new SimApps({ runner: run }).listRunning("U1")).toEqual(new Set());
+    const empty = stubRunner(() => ({ stdout: "", stderr: "" }));
+    expect(await new SimApps({ runner: empty }).listRunning("U1")).toEqual(new Set());
+  });
+
+  it("listRunning rejects a blank udid without spawning and propagates spawn failures", async () => {
+    const run = stubRunner(() => ({ stdout: "", stderr: "" }));
+    await expect(new SimApps({ runner: run }).listRunning("  ")).rejects.toThrow(/udid/i);
+    expect(run.calls).toHaveLength(0);
+    const failing: Runner = async (bin, args) => {
+      throw new ExecError(bin, args, 1, "", "Unable to boot device");
+    };
+    await expect(new SimApps({ runner: failing }).listRunning("U1")).rejects.toThrow(ExecError);
+  });
 });
 
 describe("extras app tools", () => {

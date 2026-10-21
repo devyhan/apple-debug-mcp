@@ -608,6 +608,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         const { pid, output } = await simApps.launch(lease.udid, bundle_id, args ?? []);
+        orch.markAppLaunched(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_launch", `launch ${bundle_id} (pid ${pid})`);
         return ok({ lease_id, udid: lease.udid, bundle_id, pid, output });
       } catch (err) {
@@ -629,6 +630,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         await simApps.terminate(lease.udid, bundle_id);
+        orch.markAppTerminated(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_terminate", `terminate ${bundle_id}`);
         return ok({ lease_id, udid: lease.udid, bundle_id });
       } catch (err) {

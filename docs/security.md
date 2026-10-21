@@ -34,5 +34,13 @@
   and is unverifiable in unattended environments, so only host mode ships.
 - **Localhost only by default.** The daemon binds `127.0.0.1:3100`; the MCP
   endpoint has no authentication, so do not rebind it to a shared interface.
+- **Contamination detection, not enforcement.** A lease snapshots the sim's
+  running apps at acquire and flags foreign (non-`com.apple.*`, non-baseline,
+  non-lease-launched) bundles as `contended` in `pool_status`/`lease_list`
+  plus one `EXTERNAL` entry in `lease_actions`. Nothing is blocked or thrown:
+  another local process can always `simctl launch` onto your sim — the flag
+  tells you your results may be tainted, nothing more. `com.apple.*` bundles
+  are never flagged (launchctl output cannot attribute them, so stock daemons
+  would false-positive).
 
 To report a vulnerability privately, see [SECURITY.md](../SECURITY.md).

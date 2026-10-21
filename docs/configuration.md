@@ -76,4 +76,6 @@ different daemons and split the pool — one shared daemon is the premise.
 | `SIM_MCP_EXEC_TIMEOUT_MS` | `60000` (60 s) | Helper child-process timeout |
 | `SIM_MCP_BOOT_TIMEOUT_MS` | `600000` (10 min) | Simulator boot timeout |
 | `SIM_MCP_SCREENSHOT_DIR` | `$TMPDIR/sim-mcp-shots` | Screenshot storage |
+| `SIM_MCP_CONTAMINATION_CHECK` | `true` | Lease-interference detection on/off (`false` disables) |
+| `SIM_MCP_CONTAMINATION_MIN_INTERVAL_MS` | `30000` (30 s) | Minimum gap between contamination spawns per lease |
 | `SIM_MCP_DAEMON_PATH` | _(unset)_ | Override the daemon entry the plist launches |

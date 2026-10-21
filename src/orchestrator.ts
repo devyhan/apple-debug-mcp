@@ -2,6 +2,7 @@ import { DebugOps } from "./llmdb.js";
 import { CaptureOps, CaptureStartSpec, CaptureStatus, CaptureStopResult } from "./netcapture.js";
 import { AssertFlowResult, AssertFlowSpec, NetProxyRule, NetProxyStatus, ProxyOps } from "./netproxy.js";
 import { DEFAULT_STREAM_PORT_BASE, StreamOps } from "./servesim.js";
+import { SimApps } from "./simapps.js";
 import { FleetOps, SimDevice } from "./simslim.js";
 import { Lease, Requirements, Store, Ticket, nextId } from "./store.js";
 
@@ -62,7 +63,30 @@ export interface PoolSimulator extends SimDevice {
   slim: boolean | null;
   slimDetail: { managedDisabled: number; managedTotal: number } | null;
   ramBytes: number | null;
-  lease: Pick<Lease, "leaseId" | "sessionId" | "client" | "task" | "streamUrl" | "streamPort"> | null;
+  lease: Pick<Lease, "leaseId" | "sessionId" | "client" | "task" | "streamUrl" | "streamPort" | "contended" | "contendedSince"> | null;
+}
+
+/**
+ * Bundles running that the lease neither inherited (baseline) nor launched
+ * itself. `com.apple.*` system bundles are ignored — launchctl output cannot
+ * attribute them to a lease, so flagging them would false-positive on stock
+ * daemons (documented limitation: a foreign com.apple.* launch goes unseen).
+ */
+export function findForeignApps(running: Set<string>, baseline: Set<string>, launched: Set<string>): string[] {
+  return [...running]
+    .filter((b) => !b.startsWith("com.apple.") && !baseline.has(b) && !launched.has(b))
+    .sort();
+}
+
+/** Per-lease contamination (lease-interference) tracking, in-memory only. */
+interface ContaminationState {
+  /** Apps already running when the lease started (not the lease's doing). */
+  baseline: Set<string>;
+  /** Bundles this lease launched via app_launch and has not terminated. */
+  launched: Set<string>;
+  contended: boolean;
+  contendedSince: number | null;
+  lastCheck: number;
 }
 
 function matches(dev: SimDevice, req: Requirements): boolean {
@@ -102,7 +126,11 @@ export class Orchestrator {
   private readonly debugger?: DebugOps;
   private readonly netProxy?: ProxyOps;
   private readonly netCapture?: CaptureOps;
+  private readonly apps?: Pick<SimApps, "listRunning">;
+  private readonly contaminationCheck: boolean;
+  private readonly contaminationCheckMinIntervalMs: number;
   private readonly actions = new Map<string, LeaseAction[]>();
+  private readonly contamination = new Map<string, ContaminationState>();
 
   constructor(
     fleet: FleetOps,
@@ -115,6 +143,9 @@ export class Orchestrator {
       debugger?: DebugOps;
       proxy?: ProxyOps;
       capture?: CaptureOps;
+      apps?: Pick<SimApps, "listRunning">;
+      contaminationCheck?: boolean;
+      contaminationCheckMinIntervalMs?: number;
     },
   ) {
     this.fleet = fleet;
@@ -126,6 +157,9 @@ export class Orchestrator {
     this.debugger = opts.debugger;
     this.netProxy = opts.proxy;
     this.netCapture = opts.capture;
+    this.apps = opts.apps;
+    this.contaminationCheck = opts.contaminationCheck ?? true;
+    this.contaminationCheckMinIntervalMs = opts.contaminationCheckMinIntervalMs ?? 30_000;
   }
 
   // ---------- state views (read-only, never mutate) ----------
@@ -173,6 +207,8 @@ export class Orchestrator {
             task: lease.task,
             streamUrl: lease.streamUrl,
             streamPort: lease.streamPort,
+            contended: this.contamination.get(lease.leaseId)?.contended ?? false,
+            contendedSince: this.contamination.get(lease.leaseId)?.contendedSince ?? null,
           }
           : null,
       };
@@ -189,7 +225,14 @@ export class Orchestrator {
   async leasesList(): Promise<{ leases: (Lease & { expired: boolean })[] }> {
     const now = Date.now();
     const leases = await this.store.read((s) => s.leases);
-    return { leases: leases.map((l) => ({ ...l, expired: isExpired(l, now) })) };
+    return {
+      leases: leases.map((l) => ({
+        ...l,
+        expired: isExpired(l, now),
+        contended: this.contamination.get(l.leaseId)?.contended ?? false,
+        contendedSince: this.contamination.get(l.leaseId)?.contendedSince ?? null,
+      })),
+    };
   }
 
   async sessionsList(): Promise<{
@@ -279,6 +322,7 @@ export class Orchestrator {
           if (warn) warnings.push(warn);
         }
         const lease = await this.createLease(target.udid, input, client);
+        await this.captureBaseline(lease.leaseId, target.udid);
         await this.maybeStartStream(lease, input.stream === true, warnings);
         return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
       }
@@ -307,6 +351,7 @@ export class Orchestrator {
               if (warn) warnings.push(warn);
             }
             const lease = await this.createLease(target.udid, input, client);
+            await this.captureBaseline(lease.leaseId, target.udid);
             await this.maybeStartStream(lease, input.stream === true, warnings);
             return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
           }
@@ -340,6 +385,7 @@ export class Orchestrator {
       await this.stopCaptureQuiet(removed.leaseId);
       const dispatched = await this.dispatchLocked();
       this.actions.delete(leaseId);
+      this.contamination.delete(leaseId);
       return { released: leaseId, expiredSwept, dispatched };
     });
   }
@@ -406,6 +452,7 @@ export class Orchestrator {
         await this.dispatchLocked();
       });
       this.actions.delete(leaseId);
+      this.contamination.delete(leaseId);
       throw new LeaseError(`Lease ${leaseId} expired and was released`);
     }
     const devices = await this.fleet.list();
@@ -423,8 +470,10 @@ export class Orchestrator {
         await this.dispatchLocked();
       });
       this.actions.delete(leaseId);
+      this.contamination.delete(leaseId);
       throw new LeaseError(`Simulator ${lease.udid} is no longer booted; lease ${leaseId} was released`);
     }
+    await this.checkContamination(lease);
     return lease;
   }
 
@@ -454,6 +503,84 @@ export class Orchestrator {
     return ring.slice(Math.max(0, ring.length - Math.max(1, Math.floor(limit))));
   }
 
+  // ---------- contamination (lease-interference) detection, in-memory ----------
+
+  /**
+   * Contamination flag for a lease (uncontended when unknown). Detection only:
+   * nothing is blocked or thrown — see docs/security.md.
+   */
+  contaminationStatus(leaseId: string): { contended: boolean; contendedSince: number | null } {
+    const state = this.contamination.get(leaseId);
+    return { contended: state?.contended ?? false, contendedSince: state?.contendedSince ?? null };
+  }
+
+  /** Record a bundle this lease launched (app_launch); it is never foreign. */
+  markAppLaunched(leaseId: string, bundleId: string): void {
+    this.ensureContamination(leaseId).launched.add(bundleId);
+  }
+
+  /** Forget a bundle this lease terminated (app_terminate). */
+  markAppTerminated(leaseId: string, bundleId: string): void {
+    this.contamination.get(leaseId)?.launched.delete(bundleId);
+  }
+
+  private ensureContamination(leaseId: string): ContaminationState {
+    let state = this.contamination.get(leaseId);
+    if (!state) {
+      state = { baseline: new Set(), launched: new Set(), contended: false, contendedSince: null, lastCheck: 0 };
+      this.contamination.set(leaseId, state);
+    }
+    return state;
+  }
+
+  /**
+   * Snapshot the apps already running on a fresh lease's sim. Best-effort and
+   * async: runs AFTER lease creation (never inside a sync mutate), and a
+   * failed snapshot leaves an empty baseline plus an action note — the acquire
+   * still succeeds.
+   */
+  private async captureBaseline(leaseId: string, udid: string): Promise<void> {
+    const state = this.ensureContamination(leaseId);
+    if (!this.contaminationCheck || !this.apps) return;
+    try {
+      state.baseline = await this.apps.listRunning(udid);
+      state.lastCheck = Date.now();
+    } catch (err) {
+      state.baseline = new Set();
+      await this.logAction(leaseId, "contamination", `baseline snapshot failed, using empty baseline: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * One throttled contamination check for a held lease. Never throws: a failed
+   * spawn means unknown (not contended) and is skipped silently. On the first
+   * foreign bundle the lease flips contended and logs ONE `EXTERNAL` action
+   * entry (transition only, never per-check spam).
+   */
+  private async checkContamination(lease: Lease): Promise<void> {
+    try {
+      if (!this.contaminationCheck || !this.apps) return;
+      const state = this.contamination.get(lease.leaseId);
+      if (!state) return;
+      if (Date.now() - state.lastCheck < this.contaminationCheckMinIntervalMs) return;
+      let running: Set<string>;
+      try {
+        running = await this.apps.listRunning(lease.udid);
+      } catch {
+        return; // Unknown, not contended.
+      }
+      state.lastCheck = Date.now();
+      const foreign = findForeignApps(running, state.baseline, state.launched);
+      if (foreign.length > 0 && !state.contended) {
+        state.contended = true;
+        state.contendedSince = Date.now();
+        await this.logAction(lease.leaseId, "EXTERNAL", `foreign app activity detected: ${foreign.join(", ")}`);
+      }
+    } catch {
+      // Detection must never break the gated operation it rides along with.
+    }
+  }
+
   // ---------- internals (caller must hold the mutex) ----------
 
   private async sweepLocked(): Promise<string[]> {
@@ -476,7 +603,10 @@ export class Orchestrator {
       s.tickets = s.tickets.filter(
         (t) => t.status === "waiting" || now - t.createdAt < ASSIGNED_RETENTION_MS,
       );
-      for (const id of ids) this.actions.delete(id);
+      for (const id of ids) {
+        this.actions.delete(id);
+        this.contamination.delete(id);
+      }
       return { value: ids, dirty: ids.length > 0 };
     });
     // Callers dispatch after sweeping, so stopping here never kills a new lease's stream.
@@ -484,6 +614,9 @@ export class Orchestrator {
     for (const sessionId of sweptDebugSessions) await this.stopDebugQuiet(sessionId);
     for (const leaseId of sweptLeaseIds) await this.stopProxyQuiet(leaseId);
     for (const leaseId of sweptLeaseIds) await this.stopCaptureQuiet(leaseId);
+    // Periodic contamination check over surviving held leases (post-mutate: spawns).
+    const survivors = await this.store.read((s) => s.leases.filter((l) => !isExpired(l, Date.now())));
+    for (const lease of survivors) await this.checkContamination(lease);
     return swept;
   }
 
@@ -558,6 +691,7 @@ export class Orchestrator {
         leaseId,
         udid: target.udid,
       };
+      await this.captureBaseline(leaseId, target.udid);
       if (ticket.stream === true) await this.startDispatchedStream(leaseId, target.udid, assignment);
       assigned.push(assignment);
     }

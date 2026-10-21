@@ -30,6 +30,13 @@ export interface Lease {
   streamPort?: number;
   /** Active llmdb debug session id, present only while debug-attached. */
   debugSessionId?: string;
+  /**
+   * Contamination overlay (in-memory only, never persisted meaningfully):
+   * foreign app activity was detected on the leased sim. Views fill these
+   * from the orchestrator's per-lease state; absent means uncontended.
+   */
+  contended?: boolean;
+  contendedSince?: number | null;
 }
 
 export type TicketStatus = "waiting" | "assigned" | "cancelled";

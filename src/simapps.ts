@@ -81,4 +81,22 @@ export class SimApps {
     assertBundleId(bundleId);
     await this.run("xcrun", ["simctl", "terminate", udid, bundleId], { timeoutMs: this.execTimeoutMs });
   }
+
+  /**
+   * Bundle ids of apps currently running on the simulator, via
+   * `simctl spawn <udid> launchctl list` (UIKitApplication:<bundle> labels).
+   * Garbage lines are ignored; empty output yields an empty set.
+   */
+  async listRunning(udid: string): Promise<Set<string>> {
+    assertUdid(udid);
+    const { stdout } = await this.run("xcrun", ["simctl", "spawn", udid, "launchctl", "list"], {
+      timeoutMs: this.execTimeoutMs,
+    });
+    const running = new Set<string>();
+    for (const line of stdout.split("\n")) {
+      const match = /UIKitApplication:([A-Za-z0-9._-]+)/.exec(line);
+      if (match?.[1]) running.add(match[1]);
+    }
+    return running;
+  }
 }

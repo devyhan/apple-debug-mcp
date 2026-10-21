@@ -25,6 +25,10 @@ Common failures:
   without it otherwise.
 - `debug_attach` refused: the build needs `get-task-allow`, the host needs its
   one-time developer-tools approval, and stock Apple apps always refuse.
+- Lease shows `contended: true` in `pool_status`/`lease_list`: another process
+  launched a foreign app onto your sim — check `lease_actions` for the
+  `EXTERNAL` entry naming the bundle. Re-run the test on a quiet sim; if the
+  flag is noise for your workflow, set `SIM_MCP_CONTAMINATION_CHECK=false`.
 - Host proxy left on after a daemon crash (SIGKILL skips cleanup): kill
   mitmdump and switch every service off by hand:
 

@@ -136,6 +136,9 @@ async function main(): Promise<void> {
     debugger: lldmdb,
     proxy: netProxy,
     capture: netCapture,
+    apps: simApps,
+    contaminationCheck: config.contaminationCheck,
+    contaminationCheckMinIntervalMs: config.contaminationCheckMinIntervalMs,
   });
   const mcpDeps = { orchestrator, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir: config.screenshotDir };
 
