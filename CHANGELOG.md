@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-21
+
+### Added
+
+- M1 trace collection: `SIM_MCP_TRACE=1` writes one JSONL line per tool action
+  with UDID/text scrubbing and size caps. Off by default, zero behavior change
+  when unset.
+- M1 describe snapshots: `SIM_MCP_SNAPSHOT=1` saves describe payloads, tap
+  resolution echoes, and screenshot sidecars per action for offline replay.
+- Offline eval harness (`npm run eval:baseline`, `eval-cli`): ExactMatch
+  baseline over `data/eval/v1` (10 synthetic cases) and `data/eval/v2`
+  (17 real-device cases collected on iPhone 17 / 17 Pro Max).
+- OPT1 compact describe: `ui_describe {format: "compact"}` prunes the AX tree
+  (interactive-first, depth-capped) before truncation — 24.7% of full size on
+  the measured screen with tap grounding preserved. `format: "full"` default
+  is unchanged.
+- M3 shadow mode: `SIM_MCP_SHADOW=1` predicts every `ui_tap` target from the
+  last describe and logs prediction-vs-outcome agreement to `shadow.jsonl`
+  without affecting the tap.
+- M4 gated autonomous taps: `ui_tap {auto: true}` behind `SIM_MCP_M4=1` with a
+  fail-fast gate chain (fresh describe, predictor non-abstain, explicit
+  allowlist, dry-run). Dry-run is ON by default so enabling the gate alone can
+  never tap; every decision is audited to `m4-audit.jsonl`. Verified live on
+  iPhone 17 Pro Max (dry-run): allow-path and all deny paths, zero real taps.
+- Lease contamination detection: out-of-band app launches on a leased device
+  are detected and reported instead of silently skewing automation.
+
 ## [0.3.0] - 2026-10-20
 
 ### Added
