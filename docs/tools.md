@@ -1,6 +1,6 @@
 # Tools
 
-65 tools across 10 groups. Tools marked \* require a `lease_id` and accept only
+66 tools across 10 groups. Tools marked \* require a `lease_id` and accept only
 the holding lease.
 
 | Group | Tools |
@@ -10,7 +10,7 @@ the holding lease.
 | UI automation (8) \* | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch` |
 | Device extras (5) | `sim_rotate`, `sim_ca_debug`, `sim_memory_warning`, `sim_log_stream`, `sim_log_show` |
 | Synthetic camera (5) | `camera_start`, `camera_switch`, `camera_mirror`, `camera_status`, `camera_stop` |
-| App lifecycle (5) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_launch`, `app_terminate` |
+| App lifecycle (6) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_launch`, `app_terminate`, `app_cache_clear` |
 | Profiling (1) \* | `profile_trace` |
 | Live streaming (2) \* | `stream_start`, `stream_stop` |
 | Debugging (20) \* | `debug_attach`, `debug_launch`, `debug_break`, `debug_continue`, `debug_run_until`, `debug_wait`, `debug_interrupt`, `debug_bt`, `debug_threads`, `debug_locals`, `debug_scopes`, `debug_expand`, `debug_eval`, `debug_set_var`, `debug_output`, `debug_step`, `debug_detach`, `debug_sessions`, `debug_doctor`, `symbolicate` (lease optional) |

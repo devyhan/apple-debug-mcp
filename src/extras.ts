@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { DEFAULT_BOUND_MAX_CHARS, ExecError, tailTruncationMarker } from "./exec.js";
 import { Llmdb, MAX_CONTINUE_WAIT_SEC, STEP_MODES, hintForDebugError, isDebugTimeoutError } from "./llmdb.js";
+import { DebugStateTracker, alreadyStoppedResult, debugRobustnessEnabled, isAlreadyStoppedError, isAlreadyStoppedResponse, isWaitElapsedError, isWaitElapsedResponse, waitElapsedResult } from "./debug-robustness.js";
 import { MAX_ASSERT_FLOW_SEC, MAX_PROXY_RULES } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import { SimApps } from "./simapps.js";
@@ -189,7 +190,7 @@ const netProxyRulesSchema = z
  * Phase-1 device extras: serve-sim one-shots (rotate, CoreAnimation debug
  * flags, memory warnings), synthetic camera (start/switch/mirror/status/stop),
  * unified-log capture, app lifecycle (openurl/install/uninstall/launch/
- * terminate), xctrace profiling, llmdb debugging (attach/launch/break/
+ * terminate/cache-clear), xctrace profiling, llmdb debugging (attach/launch/break/
  * continue/run-until/wait/interrupt/bt/threads/locals/scopes/expand/eval/
  * set-var/output/step/detach/sessions/doctor, all lease-gated), atos crash
  * symbolication (optional lease), mitm network proxying (net_proxy_start/
@@ -199,6 +200,7 @@ const netProxyRulesSchema = z
 export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void {
   const { orchestrator: orch, serveSim, simLog, simApps, xctrace, lldmdb } = deps;
   const symbolicator = deps.symbolicator ?? new Symbolicator();
+  const debugStates = new DebugStateTracker();
 
   /** Leases carry at most one llmdb session; every debug verb except attach/detach needs it. */
   function requireDebugSession(lease: Lease): string {
@@ -213,10 +215,27 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
    * lease's session (via the orchestrator's shared stop path, never duplicated
    * here) and rethrow with a re-attach hint. Non-timeout errors pass through.
    */
-  async function withDebugTimeoutGuard<T>(leaseId: string, sessionId: string, op: () => Promise<T>): Promise<T> {
+  async function withDebugTimeoutGuard<T>(leaseId: string, sessionId: string, op: () => Promise<T>, opName = "debug"): Promise<T> {
     try {
       return await op();
     } catch (err) {
+      // D1.1 (gated): wait-elapsed / already-stopped are structured ok, never auto-stop.
+      try {
+        if (debugRobustnessEnabled()) {
+          if (isAlreadyStoppedError(err)) {
+            const skipped = alreadyStoppedResult();
+            debugStates.updateFromResult(sessionId, skipped);
+            return skipped as unknown as T;
+          }
+          if (isWaitElapsedError(err)) {
+            const synth = waitElapsedResult(opName, (err as Error)?.message);
+            debugStates.updateFromResult(sessionId, synth);
+            return synth as unknown as T;
+          }
+        }
+      } catch {
+        // fall through to legacy handling.
+      }
       if (!isDebugTimeoutError(err)) throw err;
       let stopped = false;
       let autoId: string | null = null;
@@ -224,6 +243,11 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         ({ stopped, sessionId: autoId } = await orch.autoStopDebugSession(leaseId, sessionId));
       } catch {
         // autoStopDebugSession never throws; the timeout error below is what matters.
+      }
+      try {
+        debugStates.clear(sessionId);
+      } catch {
+        // tracking must never break the tool path.
       }
       const what = stopped
         ? `debug session ${autoId} auto-stopped`
@@ -640,6 +664,49 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   );
 
   server.registerTool(
+    "app_cache_clear",
+    {
+      description:
+        "Clear an app's Library/Caches on your leased simulator without logging out (terminates the app first; never touches Documents/Keychain; relaunch left to caller).",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        bundle_id: z.string().min(1).describe("Bundle id whose caches to clear, e.g. com.example.App."),
+        plist_keys: z
+          .array(
+            z.object({
+              plist: z.string().min(1).describe("Plist path relative to the app data container, e.g. Library/Preferences/com.example.plist."),
+              keys: z.array(z.string().min(1)).min(1).describe("Keys to remove from the plist."),
+            }),
+          )
+          .optional()
+          .describe("Optional targeted plist keys (e.g. throttle state). Documents/Keychain targets are refused."),
+      },
+    },
+    async ({ lease_id, bundle_id, plist_keys }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const r = await simApps.clearCache(lease.udid, bundle_id, { plistKeys: plist_keys });
+        orch.markAppTerminated(lease_id, bundle_id);
+        await orch.logAction(lease_id, "app_cache_clear", `cache-clear ${bundle_id} (${r.deletedCount} removed)`);
+        return ok({
+          lease_id,
+          udid: lease.udid,
+          bundle_id,
+          container: r.container,
+          caches_dir: r.cachesDir,
+          deleted: r.deleted,
+          deleted_count: r.deletedCount,
+          plist_keys_removed: r.plistKeysRemoved,
+          terminated: r.terminated,
+          errors: r.errors,
+        });
+      } catch (err) {
+        return fail((err as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
     "profile_trace",
     {
       description:
@@ -685,8 +752,18 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         const { sessionId, response } = await lldmdb.attach({ bundleId: bundle_id, pid });
+        try {
+          if (debugRobustnessEnabled()) debugStates.markAttached(sessionId, response);
+        } catch {
+          // tracking must never break the tool path.
+        }
         const replaced = await orch.setDebugSession(lease_id, sessionId);
         if (replaced && replaced !== sessionId) {
+          try {
+            debugStates.clear(replaced);
+          } catch {
+            // tracking must never break the tool path.
+          }
           try {
             await lldmdb.stop(replaced);
           } catch {
@@ -823,9 +900,18 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.cont(sessionId, wait_sec ?? 60));
+        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.cont(sessionId, wait_sec ?? 60), "continue");
+        let waitElapsed = false;
+        try {
+          if (debugRobustnessEnabled()) {
+            debugStates.updateFromResult(sessionId, result);
+            waitElapsed = isWaitElapsedResponse(result);
+          }
+        } catch {
+          // tracking must never break the tool path.
+        }
         await orch.logAction(lease_id, "debug_continue", `continue (wait ${wait_sec ?? 60}s)`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), ...(waitElapsed ? { wait_elapsed: true } : {}), result });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -918,6 +1004,11 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.step(sessionId, mode ?? "over");
+        try {
+          if (debugRobustnessEnabled()) debugStates.updateFromResult(sessionId, result);
+        } catch {
+          // tracking must never break the tool path.
+        }
         await orch.logAction(lease_id, "debug_step", `step ${mode ?? "over"}`);
         return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), result });
       } catch (err) {
@@ -942,11 +1033,21 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         try {
           const result = await lldmdb.stop(sessionId);
           await orch.clearDebugSession(lease_id);
+          try {
+            debugStates.clear(sessionId);
+          } catch {
+            // tracking must never break the tool path.
+          }
           await orch.logAction(lease_id, "debug_detach", `detach session ${sessionId}`);
           return ok({ lease_id, udid: lease.udid, session_id: sessionId, stopped: true, result });
         } catch (err) {
           if (/no session with id/i.test((err as Error).message)) {
             await orch.clearDebugSession(lease_id);
+            try {
+              debugStates.clear(sessionId);
+            } catch {
+              // tracking must never break the tool path.
+            }
             await orch.logAction(lease_id, "debug_detach", `detach session ${sessionId} (already gone)`);
             return ok({ lease_id, udid: lease.udid, session_id: sessionId, stopped: false });
           }
@@ -1010,8 +1111,18 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
             return fail((err as Error).message);
           }
           const { sessionId, response } = await lldmdb.attach({ bundleId: bundle_id });
+          try {
+            if (debugRobustnessEnabled()) debugStates.markAttached(sessionId, response);
+          } catch {
+            // tracking must never break the tool path.
+          }
           const replaced = await orch.setDebugSession(lease_id, sessionId);
           if (replaced && replaced !== sessionId) {
+            try {
+              debugStates.clear(replaced);
+            } catch {
+              // tracking must never break the tool path.
+            }
             try {
               await lldmdb.stop(replaced);
             } catch {
@@ -1023,8 +1134,18 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         }
         const fsPath = target as string; // exactly-one check above guarantees this
         const { sessionId, response } = await lldmdb.launch(fsPath, args ?? []);
+        try {
+          if (debugRobustnessEnabled()) debugStates.markLaunched(sessionId, response);
+        } catch {
+          // tracking must never break the tool path.
+        }
         const replaced = await orch.setDebugSession(lease_id, sessionId);
         if (replaced && replaced !== sessionId) {
+          try {
+            debugStates.clear(replaced);
+          } catch {
+            // tracking must never break the tool path.
+          }
           try {
             await lldmdb.stop(replaced);
           } catch {
@@ -1197,7 +1318,12 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const sessionId = requireDebugSession(lease);
         const result = await withDebugTimeoutGuard(lease_id, sessionId, () =>
           lldmdb.runUntil(sessionId, file, line, wait_sec ?? 60, { cleanup: cleanup ?? false }),
-        );
+        "run-until");
+        try {
+          if (debugRobustnessEnabled()) debugStates.updateFromResult(sessionId, result);
+        } catch {
+          // tracking must never break the tool path.
+        }
         await orch.logAction(lease_id, "debug_run_until", `run-until ${file}:${line}${cleanup === true ? " (cleanup)" : ""}`.slice(0, 160));
         return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
       } catch (err) {
@@ -1219,9 +1345,18 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.wait(sessionId, timeout ?? 60));
+        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.wait(sessionId, timeout ?? 60), "wait");
+        let waitElapsed = false;
+        try {
+          if (debugRobustnessEnabled()) {
+            debugStates.updateFromResult(sessionId, result);
+            waitElapsed = isWaitElapsedResponse(result);
+          }
+        } catch {
+          // tracking must never break the tool path.
+        }
         await orch.logAction(lease_id, "debug_wait", `wait (timeout ${timeout ?? 60}s)`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), ...(waitElapsed ? { wait_elapsed: true } : {}), result });
       } catch (err) {
         return fail(lldmdbError(err));
       }
@@ -1241,9 +1376,29 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = requireDebugSession(lease);
-        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.interrupt(sessionId, wait_sec ?? 10));
+        // D1.1 (gated): skip llmdb when the session is already stopped.
+        try {
+          if (debugRobustnessEnabled() && debugStates.get(sessionId) === "stopped") {
+            await orch.logAction(lease_id, "debug_interrupt", "interrupt (already stopped, skipped)");
+            return ok({ lease_id, udid: lease.udid, session_id: sessionId, state: "stopped", already_stopped: true, result: alreadyStoppedResult() });
+          }
+        } catch {
+          // fall through to llmdb.
+        }
+        const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.interrupt(sessionId, wait_sec ?? 10), "interrupt");
+        let waitElapsed = false;
+        let alreadyStopped = false;
+        try {
+          if (debugRobustnessEnabled()) {
+            debugStates.updateFromResult(sessionId, result);
+            waitElapsed = isWaitElapsedResponse(result);
+            alreadyStopped = isAlreadyStoppedResponse(result);
+          }
+        } catch {
+          // tracking must never break the tool path.
+        }
         await orch.logAction(lease_id, "debug_interrupt", "interrupt");
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...(waitElapsed ? { wait_elapsed: true } : {}), ...(alreadyStopped ? { already_stopped: true } : {}), result });
       } catch (err) {
         return fail(lldmdbError(err));
       }

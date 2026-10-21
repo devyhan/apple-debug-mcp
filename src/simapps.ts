@@ -1,3 +1,4 @@
+import { AppCacheClearer, CacheClearOptions, CacheClearResult } from "./appcache.js";
 import { Runner, defaultRunner } from "./exec.js";
 
 export interface LaunchResult {
@@ -80,6 +81,19 @@ export class SimApps {
     assertUdid(udid);
     assertBundleId(bundleId);
     await this.run("xcrun", ["simctl", "terminate", udid, bundleId], { timeoutMs: this.execTimeoutMs });
+  }
+
+  /**
+   * Clear bundleId's Library/Caches without logging out: terminate first,
+   * resolve the data container, delete Caches entries, optionally remove
+   * targeted plist keys. Never touches Documents/Keychain. Reports deleted
+   * paths/count; relaunch is left to the caller.
+   */
+  async clearCache(udid: string, bundleId: string, opts: CacheClearOptions = {}): Promise<CacheClearResult> {
+    assertUdid(udid);
+    assertBundleId(bundleId);
+    const clearer = new AppCacheClearer({ runner: this.run, execTimeoutMs: this.execTimeoutMs });
+    return clearer.clear(udid, bundleId, opts);
   }
 
   /**
