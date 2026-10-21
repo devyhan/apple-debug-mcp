@@ -11,6 +11,7 @@ import { ServeSim } from "./servesim.js";
 import { SimApps } from "./simapps.js";
 import { SimLog } from "./simlog.js";
 import { Simslim } from "./simslim.js";
+import { buildTapEchoExtra, buildTapFailureExtra, saveDescribeSnapshot, saveShotLink } from "./snapshot.js";
 import { getServerInfo, getVersion } from "./version.js";
 import { XCTrace } from "./xctrace.js";
 
@@ -336,8 +337,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
           }
         }
         const { text, truncated } = truncate(payload, max_chars ?? 20000);
+        // M1 snapshot (env-gated, default OFF): persist the full payload; null when off.
+        const snap = saveDescribeSnapshot({ leaseId: lease_id, ui: payload, format: shape, truncated });
         await orch.logAction(lease_id, "ui_describe", x !== undefined && y !== undefined ? `describe at (${x},${y})` : "describe full hierarchy",
-          { ...(x !== undefined && y !== undefined ? { x, y } : {}), truncated, format: shape, ...(kept !== undefined ? { kept } : {}) });
+          { ...(x !== undefined && y !== undefined ? { x, y } : {}), truncated, format: shape, ...(kept !== undefined ? { kept } : {}), ...(snap ? { snapshot_id: snap.id } : {}) });
         return ok({ udid: lease.udid, ui: text, truncated, format: shape, ...(kept !== undefined ? { kept } : {}) });
       } catch (err) {
         return fail((err as Error).message);
@@ -361,24 +364,38 @@ export function createMcpServer(deps: ServerDeps): McpServer {
       },
     },
     async (args) => {
+      const target = args.x !== undefined && args.y !== undefined ? `(${args.x},${args.y})`
+        : [args.id && `id=${args.id}`, args.label && `label=${args.label}`, args.value && `value=${args.value}`, args.element_type && `type=${args.element_type}`].filter(Boolean).join(" ") || "default";
+      const selectors = {
+        ...(args.x !== undefined && args.y !== undefined ? { x: args.x, y: args.y } : {}),
+        ...(args.id !== undefined ? { id: args.id } : {}),
+        ...(args.label !== undefined ? { label: args.label } : {}),
+        ...(args.value !== undefined ? { value: args.value } : {}),
+        ...(args.element_type !== undefined ? { element_type: args.element_type } : {}),
+        ...(args.wait_timeout !== undefined ? { wait_timeout: args.wait_timeout } : {}),
+      };
       try {
         const lease = await orch.resolveLease(args.lease_id);
         const out = await axe.tap(lease.udid, {
           x: args.x, y: args.y, id: args.id, label: args.label, value: args.value,
           elementType: args.element_type, waitTimeout: args.wait_timeout,
         });
-        const target = args.x !== undefined && args.y !== undefined ? `(${args.x},${args.y})`
-          : [args.id && `id=${args.id}`, args.label && `label=${args.label}`, args.value && `value=${args.value}`, args.element_type && `type=${args.element_type}`].filter(Boolean).join(" ") || "default";
+        // M1 snapshot (env-gated, default OFF): tap resolution echo; null when off.
+        const tapExtra = buildTapEchoExtra(out, { leaseId: args.lease_id });
         await orch.logAction(args.lease_id, "ui_tap", `tap ${target}`.slice(0, 160), {
-          ...(args.x !== undefined && args.y !== undefined ? { x: args.x, y: args.y } : {}),
-          ...(args.id !== undefined ? { id: args.id } : {}),
-          ...(args.label !== undefined ? { label: args.label } : {}),
-          ...(args.value !== undefined ? { value: args.value } : {}),
-          ...(args.element_type !== undefined ? { element_type: args.element_type } : {}),
-          ...(args.wait_timeout !== undefined ? { wait_timeout: args.wait_timeout } : {}),
+          ...selectors,
+          ...(tapExtra ?? {}),
         });
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
+        // M1 snapshot failure echo (env-gated, default OFF): null when off, so
+        // the failure path is unchanged unless snapshots are on. Never masks.
+        try {
+          const failure = buildTapFailureExtra(err, { leaseId: args.lease_id, selectors });
+          if (failure) await orch.logAction(args.lease_id, "ui_tap", `tap ${target} failed`.slice(0, 160), failure);
+        } catch {
+          // Never mask the original tap error.
+        }
         return fail((err as Error).message);
       }
     },
@@ -489,7 +506,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const file = path.join(screenshotDir, `${lease.udid}-${Date.now()}.png`);
         await axe.screenshot(lease.udid, file);
         const data = fs.readFileSync(file).toString("base64");
-        await orch.logAction(lease_id, "ui_screenshot", `screenshot ${path.basename(file)}`);
+        // M1 snapshot (env-gated, default OFF): shot->describe link; null when off.
+        const shot = saveShotLink({ leaseId: lease_id, shotPath: file });
+        await orch.logAction(lease_id, "ui_screenshot", `screenshot ${path.basename(file)}`, shot ?? undefined);
         return ok({ udid: lease.udid, path: file }, [{ type: "image", data, mimeType: "image/png" }]);
       } catch (err) {
         return fail((err as Error).message);
