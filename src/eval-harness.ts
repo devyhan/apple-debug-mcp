@@ -20,6 +20,8 @@ export interface HarnessOptions {
 
 export interface CaseResult {
   caseId: string;
+  /** Provenance tag copied from the case (v2 datasets). */
+  source?: string;
   predicted: BaselinePrediction;
   /** True when the prediction was demoted by tau. */
   tauAbstained: boolean;
@@ -69,7 +71,14 @@ export class EvalHarness {
       const effective: BaselinePrediction = tauAbstained
         ? { decision: "abstain", reason: "no-match", confidence: 0 }
         : predicted;
-      results.push({ caseId: c.id, predicted: effective, tauAbstained, correct: isCorrect(c, effective), latencyMs });
+      results.push({
+        caseId: c.id,
+        ...(c.source !== undefined ? { source: c.source } : {}),
+        predicted: effective,
+        tauAbstained,
+        correct: isCorrect(c, effective),
+        latencyMs,
+      });
     }
     const correct = results.filter((r) => r.correct).length;
     const abstained = results.filter((r) => r.predicted.decision === "abstain").length;

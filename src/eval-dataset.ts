@@ -7,11 +7,13 @@ import { z } from "zod";
  *
  * Each case pairs a ui_describe AX hierarchy text (`ui`, the raw JSON text
  * from `axe describe-ui`) with a tap query and the expected outcome. Case
- * files live under `data/eval/v1/` with one case per file; every file stays
- * below 4096 bytes (same bound as the M1 trace line cap).
+ * files live under `data/eval/v1/` (synthetic) or `data/eval/v2/` (distilled
+ * from real collected trace artifacts) with one case per file; every file
+ * stays below 4096 bytes (same bound as the M1 trace line cap). V2 cases
+ * carry a `source` tag naming the artifact file they were distilled from.
  */
 
-export const EVAL_DATASET_VERSION = 1;
+export const EVAL_DATASET_VERSION = 2;
 export const EVAL_CASE_MAX_BYTES = 4096;
 
 export const EvalQuerySchema = z
@@ -43,10 +45,12 @@ export const EvalCaseSchema = z.object({
   ui: z.string().min(1),
   query: EvalQuerySchema,
   expected: EvalExpectedSchema,
+  /** Provenance tag: collected artifact file the case was distilled from (v2). */
+  source: z.string().min(1).optional(),
 });
 
 export const EvalManifestSchema = z.object({
-  version: z.literal(EVAL_DATASET_VERSION),
+  version: z.union([z.literal(1), z.literal(2)]),
   cases: z.array(z.string().min(1)).min(1),
 });
 
