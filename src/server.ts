@@ -11,6 +11,7 @@ import { ServeSim } from "./servesim.js";
 import { SimApps } from "./simapps.js";
 import { SimLog } from "./simlog.js";
 import { Simslim } from "./simslim.js";
+import { appendShadowLog, buildShadowExtra, noteShadowUi } from "./shadow.js";
 import { buildTapEchoExtra, buildTapFailureExtra, saveDescribeSnapshot, saveShotLink } from "./snapshot.js";
 import { getServerInfo, getVersion } from "./version.js";
 import { XCTrace } from "./xctrace.js";
@@ -339,6 +340,8 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const { text, truncated } = truncate(payload, max_chars ?? 20000);
         // M1 snapshot (env-gated, default OFF): persist the full payload; null when off.
         const snap = saveDescribeSnapshot({ leaseId: lease_id, ui: payload, format: shape, truncated });
+        // M3 shadow (env-gated, default OFF): cache the full payload; no-op when off.
+        noteShadowUi(lease_id, payload, snap?.id);
         await orch.logAction(lease_id, "ui_describe", x !== undefined && y !== undefined ? `describe at (${x},${y})` : "describe full hierarchy",
           { ...(x !== undefined && y !== undefined ? { x, y } : {}), truncated, format: shape, ...(kept !== undefined ? { kept } : {}), ...(snap ? { snapshot_id: snap.id } : {}) });
         return ok({ udid: lease.udid, ui: text, truncated, format: shape, ...(kept !== undefined ? { kept } : {}) });
@@ -374,6 +377,12 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         ...(args.element_type !== undefined ? { element_type: args.element_type } : {}),
         ...(args.wait_timeout !== undefined ? { wait_timeout: args.wait_timeout } : {}),
       };
+      // M3 shadow query: request selectors only (label/id); coord-only taps
+      // carry neither, so the predictor input is an empty query (skipped).
+      const shadowQuery = {
+        ...(args.label !== undefined ? { label: args.label } : {}),
+        ...(args.id !== undefined ? { id: args.id } : {}),
+      };
       try {
         const lease = await orch.resolveLease(args.lease_id);
         const out = await axe.tap(lease.udid, {
@@ -382,9 +391,14 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         });
         // M1 snapshot (env-gated, default OFF): tap resolution echo; null when off.
         const tapExtra = buildTapEchoExtra(out, { leaseId: args.lease_id });
+        // M3 shadow (env-gated, default OFF): predict-then-compare after the
+        // tap resolves; null/no-op when off. MCP response untouched.
+        const shadowExtra = buildShadowExtra({ leaseId: args.lease_id, query: shadowQuery, tapOk: true });
+        appendShadowLog({ leaseId: args.lease_id, query: shadowQuery, tapOk: true });
         await orch.logAction(args.lease_id, "ui_tap", `tap ${target}`.slice(0, 160), {
           ...selectors,
           ...(tapExtra ?? {}),
+          ...(shadowExtra ?? {}),
         });
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
@@ -392,7 +406,14 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         // the failure path is unchanged unless snapshots are on. Never masks.
         try {
           const failure = buildTapFailureExtra(err, { leaseId: args.lease_id, selectors });
-          if (failure) await orch.logAction(args.lease_id, "ui_tap", `tap ${target} failed`.slice(0, 160), failure);
+          const shadowExtra = buildShadowExtra({ leaseId: args.lease_id, query: shadowQuery, tapOk: false });
+          appendShadowLog({ leaseId: args.lease_id, query: shadowQuery, tapOk: false });
+          if (failure || shadowExtra) {
+            await orch.logAction(args.lease_id, "ui_tap", `tap ${target} failed`.slice(0, 160), {
+              ...(failure ?? { tap_ok: false, ...selectors }),
+              ...(shadowExtra ?? {}),
+            });
+          }
         } catch {
           // Never mask the original tap error.
         }
