@@ -9,9 +9,32 @@ import { ExecError, Runner, defaultRunner } from "./exec.js";
 /** Install command for go-ios, confirmed from the go-ios README (npm distribution). */
 export const GO_IOS_INSTALL_HINT = "npm install -g go-ios";
 
-/** Error detail for the two app verbs with no real-device CLI transport (P2). */
-export const APP_REAL_NO_TRANSPORT_DETAIL =
-  "no CLI transport exists for open-url/cache-clear (neither devicectl nor go-ios provides one)";
+/** Safari bundle id (verified live: `devicectl device info apps` lists Safari as this). */
+const SAFARI_BUNDLE_ID = "com.apple.mobilesafari";
+
+/**
+ * Error detail for non-http(s) open-url on real hardware (P2): no
+ * stock-handler dispatch CLI exists. Measured: `devicectl device process
+ * launch --help` (518.33) documents `--payload-url` but requires an
+ * explicit target bundle, so only http(s) via Safari is wired; go-ios
+ * 1.3.2 has no openurl verb (only Remote-Automation-gated
+ * `webinspector launch <url>`).
+ */
+export const APP_OPEN_URL_NON_HTTP_DETAIL =
+  "no stock-handler open-url transport on real hardware (devicectl process launch --payload-url needs an explicit target bundle — only http(s) via Safari is wired; go-ios has no openurl verb, only Remote-Automation-gated webinspector launch)";
+
+/**
+ * Error detail for cache-clear on real hardware (P2): no container-delete
+ * transport for third-party apps. Measured live on a paired iPhone 16 Pro
+ * Max: `ios file ls --app=<3rd-party>` → ContainerLookupErrorDomain/3,
+ * `ios fsync tree` → VendContainer denied (full container access needs a
+ * developer-profile install), `devicectl device info files --domain-type
+ * appDataContainer` → CoreDevice.ActionError 3, and `devicectl device copy`
+ * is to/from only (no delete). Uninstall+reinstall would wipe Documents
+ * and log out, violating the no-logout contract.
+ */
+export const APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL =
+  "no container-delete transport for third-party apps (measured on a paired iPhone: ios file ls → ContainerLookupErrorDomain/3, ios fsync → VendContainer denied — full container access needs a developer-profile install; devicectl copy has no delete; uninstall+reinstall would wipe Documents and log out)";
 
 function assertUdid(udid: string): void {
   if (udid.trim().length === 0) throw new Error("Invalid udid (expected a non-empty string)");
@@ -23,6 +46,13 @@ function assertBundleId(bundleId: string): void {
 
 function assertAppPath(appPath: string): void {
   if (appPath.trim().length === 0) throw new Error("Invalid app_path (expected a non-empty string)");
+}
+
+function assertUrl(url: string): void {
+  if (url.trim().length === 0) throw new Error("Invalid url (expected a non-empty string)");
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url.trim())) {
+    throw new Error(`Invalid url ${JSON.stringify(url)} (expected a scheme, e.g. "https://…")`);
+  }
 }
 
 /**
@@ -191,10 +221,11 @@ interface DevicectlAppsJson {
 
 /**
  * App lifecycle on a real device: go-ios (`ios`) backend for
- * install/uninstall/launch/terminate, devicectl join for listRunning.
- * Argv confirmed against go-ios main-branch source (`ios install
- * --path=<p>`, `ios uninstall <bundleID>`, `ios launch <bundleID>
- * [--arg=<a>]…`, `ios kill <bundleID>…`, global `--udid=<udid>`).
+ * install/uninstall/launch/terminate, devicectl for openUrl (http(s) via
+ * Safari `--payload-url`) and the listRunning join. Argv confirmed against
+ * go-ios main-branch source (`ios install --path=<p>`, `ios uninstall
+ * <bundleID>`, `ios launch <bundleID> [--arg=<a>]…`, `ios kill
+ * <bundleID>…`, global `--udid=<udid>`).
  */
 export class RealDeviceApps implements AppOps {
   private readonly run: Runner;
@@ -213,8 +244,28 @@ export class RealDeviceApps implements AppOps {
     return stdout.trim();
   }
 
-  async openUrl(_udid: string, _url: string): Promise<void> {
-    throw new Error(`app_open_url does not support real-device leases yet: real-device support lands in P2 (${APP_REAL_NO_TRANSPORT_DETAIL}).`);
+  /**
+   * Open an http(s) URL in Safari via `devicectl device process launch
+   * --payload-url` (default --activate foregrounds it, like simctl
+   * openurl). Non-http(s) schemes stay P2: hardware has no stock-handler
+   * dispatch CLI. Argv from `devicectl device process launch --help`
+   * (518.33); live-verified 2026-10-22 on a paired iPhone 16 Pro Max
+   * (openUrl https://www.apple.com → devicectl success, Safari running).
+   */
+  async openUrl(udid: string, url: string): Promise<void> {
+    assertUdid(udid);
+    assertUrl(url);
+    if (!/^https?:/i.test(url.trim())) {
+      throw new Error(`app_open_url does not support real-device leases yet for non-http(s) URLs: real-device support lands in P2 (${APP_OPEN_URL_NON_HTTP_DETAIL}).`);
+    }
+    // Options precede the bundle positional: trailing positionals are app
+    // argv, which would swallow a --payload-url placed after the bundle.
+    const args = ["device", "process", "launch", "--device", udid, "--payload-url", url, SAFARI_BUNDLE_ID];
+    try {
+      await this.run("xcrun", ["devicectl", ...args], { timeoutMs: this.execTimeoutMs });
+    } catch (err) {
+      throw devicectlError(args, err);
+    }
   }
 
   async install(udid: string, appPath: string): Promise<void> {
@@ -252,8 +303,15 @@ export class RealDeviceApps implements AppOps {
     await this.ios(["kill", bundleId, `--udid=${udid}`], "terminate", udid);
   }
 
-  async clearCache(_udid: string, _bundleId: string, _opts: CacheClearOptions = {}): Promise<CacheClearResult> {
-    throw new Error(`app_cache_clear does not support real-device leases yet: real-device support lands in P2 (${APP_REAL_NO_TRANSPORT_DETAIL}).`);
+  /**
+   * Still P2: no honest non-destructive container-delete transport exists
+   * for third-party apps (see APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL). Inputs
+   * are validated first so malformed calls fail identically on both kinds.
+   */
+  async clearCache(udid: string, bundleId: string, _opts: CacheClearOptions = {}): Promise<CacheClearResult> {
+    assertUdid(udid);
+    assertBundleId(bundleId);
+    throw new Error(`app_cache_clear does not support real-device leases yet: real-device support lands in P2 (${APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL}).`);
   }
 
   /**

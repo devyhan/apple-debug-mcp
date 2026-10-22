@@ -13,6 +13,7 @@ import type { LogOps } from "../src/logops.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import type { PoolDevice } from "../src/realdevices.js";
 import type { RealDevices } from "../src/realdevices.js";
+import { APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL } from "../src/realdevices.js";
 import { RealSyslog } from "../src/realsyslog.js";
 import { ServeSim } from "../src/servesim.js";
 import { SimApps } from "../src/simapps.js";
@@ -60,8 +61,10 @@ class FakeRealApps implements AppOps {
   async terminate(udid: string, bundleId: string): Promise<void> {
     this.calls.push(`terminate ${udid} ${bundleId}`);
   }
-  async clearCache(_udid: string, _bundleId: string, _opts: CacheClearOptions = {}): Promise<CacheClearResult> {
-    throw new Error("unreachable in these tests");
+  async clearCache(udid: string, bundleId: string, _opts: CacheClearOptions = {}): Promise<CacheClearResult> {
+    this.calls.push(`clearCache ${udid} ${bundleId}`);
+    // Mirrors RealDeviceApps.clearCache: inputs validated, then measured P2.
+    throw new Error(`app_cache_clear does not support real-device leases yet: real-device support lands in P2 (${APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL}).`);
   }
   async listRunning(_udid: string): Promise<Set<string>> {
     return new Set();
@@ -178,15 +181,32 @@ describe("app verb dispatch by lease kind", () => {
     ]);
   });
 
-  it("keeps app_open_url/app_cache_clear fail-fast P2 on real leases", async () => {
-    const { client, realLeaseId } = await makeClient();
-    const open = await call(client, "app_open_url", { lease_id: realLeaseId, url: "https://x.test" });
-    expect(open.isError).toBe(true);
-    expect(String(open.json.error)).toContain("P2");
-    expect(String(open.json.error)).toContain("no CLI transport");
+  it("routes real app_open_url to realApps with logging", async () => {
+    const { client, orch, realApps, realLeaseId } = await makeClient();
+    const res = await call(client, "app_open_url", { lease_id: realLeaseId, url: "https://x.test" });
+    expect(res.isError).toBe(false);
+    expect(res.json).toMatchObject({ udid: "R1", url: "https://x.test" });
+    expect(realApps.calls).toEqual(["openUrl R1 https://x.test"]);
+    const actions = orch.leaseActions(realLeaseId).map((a) => `${a.tool} ${a.summary}`);
+    expect(actions.join("\n")).toContain("app_open_url open https://x.test");
+  });
+
+  it("routes sim app_open_url to simctl (sim path unchanged)", async () => {
+    const { client, run, realApps, simLeaseId } = await makeClient();
+    const res = await call(client, "app_open_url", { lease_id: simLeaseId, url: "https://x.test" });
+    expect(res.isError).toBe(false);
+    expect(res.json).toMatchObject({ udid: "U1", url: "https://x.test" });
+    expect(realApps.calls).toHaveLength(0);
+    expect(run.calls[0]).toMatchObject({ bin: "xcrun", args: ["simctl", "openurl", "U1", "https://x.test"] });
+  });
+
+  it("keeps app_cache_clear fail-fast P2 on real leases with the measured detail", async () => {
+    const { client, realApps, realLeaseId } = await makeClient();
     const clear = await call(client, "app_cache_clear", { lease_id: realLeaseId, bundle_id: "com.example.App" });
     expect(clear.isError).toBe(true);
     expect(String(clear.json.error)).toContain("P2");
+    expect(String(clear.json.error)).toContain("container-delete");
+    expect(realApps.calls).toEqual(["clearCache R1 com.example.App"]);
   });
 
   it("fails real app verbs with a missing-transport error when realApps is absent", async () => {

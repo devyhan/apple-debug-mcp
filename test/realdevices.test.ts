@@ -23,6 +23,7 @@ interface Call {
  */
 function stubRunner(opts: {
   devicectl?: (args: string[]) => string;
+  devicectlRaw?: (args: string[]) => { stdout: string; stderr: string };
   ios?: (args: string[]) => { stdout: string; stderr: string };
 }): Runner & { calls: Call[] } {
   const calls: Call[] = [];
@@ -30,6 +31,10 @@ function stubRunner(opts: {
     calls.push({ bin, args: [...args] });
     if (bin === "xcrun" && args[0] === "devicectl") {
       if (args[1] === "--version") return { stdout: "devicectl 518.33\n", stderr: "" };
+      if (!args.includes("-j")) {
+        if (!opts.devicectlRaw) throw new Error(`unexpected non-JSON devicectl call: ${args.join(" ")}`);
+        return opts.devicectlRaw(args);
+      }
       const file = args[args.indexOf("-j") + 1]!;
       fs.writeFileSync(file, opts.devicectl!(args));
       return { stdout: "", stderr: "" };
@@ -199,10 +204,72 @@ describe("RealDeviceApps", () => {
     );
   });
 
-  it("openUrl/clearCache stay P2 with the no-transport detail", async () => {
-    const apps = new RealDeviceApps({ runner: stubRunner({}) });
-    await expect(apps.openUrl("R1", "https://x.test")).rejects.toThrow(/P2.*no CLI transport/s);
-    await expect(apps.clearCache("R1", "com.example.App")).rejects.toThrow(/P2.*no CLI transport/s);
+  it("openUrl opens http(s) via devicectl Safari launch with --payload-url", async () => {
+    const run = stubRunner({ devicectlRaw: () => ({ stdout: "", stderr: "" }) });
+    const apps = new RealDeviceApps({ runner: run });
+    await apps.openUrl("R1", "https://www.apple.com");
+    await apps.openUrl("R1", "http://x.test/a?b=c");
+    expect(run.calls).toEqual([
+      { bin: "xcrun", args: ["devicectl", "device", "process", "launch", "--device", "R1", "--payload-url", "https://www.apple.com", "com.apple.mobilesafari"] },
+      { bin: "xcrun", args: ["devicectl", "device", "process", "launch", "--device", "R1", "--payload-url", "http://x.test/a?b=c", "com.apple.mobilesafari"] },
+    ]);
+  });
+
+  it("openUrl rejects blank udid / invalid url without spawning", async () => {
+    const run = stubRunner({});
+    const apps = new RealDeviceApps({ runner: run });
+    await expect(apps.openUrl("", "https://x.test")).rejects.toThrow(/udid/i);
+    await expect(apps.openUrl("R1", "  ")).rejects.toThrow(/url/i);
+    await expect(apps.openUrl("R1", "not-a-url")).rejects.toThrow(/scheme/i);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("openUrl refuses non-http(s) schemes with a precise P2 (no stock-handler dispatch)", async () => {
+    const run = stubRunner({});
+    const apps = new RealDeviceApps({ runner: run });
+    await expect(apps.openUrl("R1", "myapp://open")).rejects.toThrow(/P2.*stock-handler/s);
+    await expect(apps.openUrl("R1", "tel:+15550001111")).rejects.toThrow(/P2/);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("openUrl device failures keep device text + pairing checklist, never a missing-binary claim", async () => {
+    const fail = (stderr: string) =>
+      stubRunner({
+        devicectlRaw: () => {
+          throw new ExecError("xcrun", ["devicectl"], 1, "", stderr);
+        },
+      });
+    const paired = await new RealDeviceApps({ runner: fail("device not paired") })
+      .openUrl("R1", "https://x.test").catch((e) => e as Error);
+    expect(paired.message).toMatch(/paired.*Checklist/s);
+    const other = await new RealDeviceApps({ runner: fail("some device failure") })
+      .openUrl("R1", "https://x.test").catch((e) => e as Error);
+    expect(other.message).toContain("some device failure");
+    expect(other.message).not.toContain("is not installed");
+  });
+
+  it("openUrl without Xcode names devicectl install steps", async () => {
+    const run = stubRunner({
+      devicectlRaw: () => {
+        throw new ExecError("xcrun", ["devicectl"], "ENOENT", "", "spawn xcrun ENOENT");
+      },
+    });
+    await expect(new RealDeviceApps({ runner: run }).openUrl("R1", "https://x.test")).rejects.toThrow(
+      /devicectl is not installed/,
+    );
+  });
+
+  it("clearCache validates inputs without spawning, then fails with a precise measured P2", async () => {
+    const run = stubRunner({});
+    const apps = new RealDeviceApps({ runner: run });
+    await expect(apps.clearCache("R1", "")).rejects.toThrow(/bundle_id/i);
+    await expect(apps.clearCache("", "com.example.App")).rejects.toThrow(/udid/i);
+    expect(run.calls).toHaveLength(0);
+    const err = await apps.clearCache("R1", "com.example.App").catch((e) => e as Error);
+    expect(err.message).toMatch(/P2/);
+    expect(err.message).toMatch(/container-delete/);
+    expect(err.message).toMatch(/developer.profile/);
+    expect(err.message).toMatch(/ContainerLookupErrorDomain/);
   });
 
   it("checkAvailable resolves with the ios version", async () => {

@@ -10,7 +10,6 @@ import { MAX_ASSERT_FLOW_SEC, MAX_PROXY_RULES } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import type { AppOps } from "./appops.js";
 import type { LogOps } from "./logops.js";
-import { APP_REAL_NO_TRANSPORT_DETAIL } from "./realdevices.js";
 import { Lease } from "./store.js";
 import { Symbolicator } from "./symbolicate.js";
 import { CA_DEBUG_OPTIONS, CAMERA_MIRROR_MODES, CAMERA_SOURCES, ORIENTATIONS, ServeSim } from "./servesim.js";
@@ -213,7 +212,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   const symbolicator = deps.symbolicator ?? new Symbolicator();
   const debugStates = new DebugStateTracker();
 
-  /** App backend for a resolved lease: simctl for sims, go-ios for real devices. */
+  /** App backend for a resolved lease: simctl for sims, go-ios + devicectl for real devices. */
   function appsFor(lease: Lease, verb: string): AppOps {
     if (!isRealLease(lease)) return simApps;
     if (!deps.realApps) {
@@ -608,7 +607,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_open_url",
     {
-      description: "Open a URL on your leased simulator (xcrun simctl openurl; stock handler, e.g. Safari for https:).",
+      description: "Open a URL on your lease (xcrun simctl openurl stock handler on a simulator; http(s) via Safari on a real-device lease, other schemes stay P2).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         url: z.string().min(1).describe("URL to open, e.g. https://www.apple.com."),
@@ -617,8 +616,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, url }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "app_open_url", phase: "P2", detail: APP_REAL_NO_TRANSPORT_DETAIL });
-        await simApps.openUrl(lease.udid, url);
+        await appsFor(lease, "app_open_url").openUrl(lease.udid, url);
         await orch.logAction(lease_id, "app_open_url", `open ${url.slice(0, 120)}`);
         return ok({ lease_id, udid: lease.udid, url });
       } catch (err) {
@@ -718,7 +716,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     "app_cache_clear",
     {
       description:
-        "Clear an app's Library/Caches on your leased simulator without logging out (terminates the app first; never touches Documents/Keychain; relaunch left to caller).",
+        "Clear an app's Library/Caches on your leased simulator without logging out (terminates the app first; never touches Documents/Keychain; relaunch left to caller). Real-device leases fail fast (P2: no container-delete transport for third-party apps).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id whose caches to clear, e.g. com.example.App."),
@@ -736,8 +734,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id, plist_keys }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "app_cache_clear", phase: "P2", detail: APP_REAL_NO_TRANSPORT_DETAIL });
-        const r = await simApps.clearCache(lease.udid, bundle_id, { plistKeys: plist_keys });
+        const r = await appsFor(lease, "app_cache_clear").clearCache(lease.udid, bundle_id, { plistKeys: plist_keys });
         orch.markAppTerminated(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_cache_clear", `cache-clear ${bundle_id} (${r.deletedCount} removed)`);
         return ok({

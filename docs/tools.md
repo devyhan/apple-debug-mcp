@@ -51,7 +51,11 @@ Key behaviors:
 - App lifecycle is `xcrun simctl`-based with no extra dependencies:
   `app_launch` returns `{pid}`; `terminate` fails on a non-running app ("found
   nothing to terminate"); `uninstall` quietly succeeds on a missing bundle
-  (idempotent). Every call is recorded in `lease_actions`.
+  (idempotent). Every call is recorded in `lease_actions`. On real-device
+  leases `app_install`/`app_uninstall`/`app_launch`/`app_terminate` use
+  go-ios, `app_open_url` uses devicectl (http(s) via Safari; other schemes
+  stay P2), and `app_cache_clear` stays P2 (no container-delete transport
+  for third-party apps).
 - `profile_trace` records with `xcrun xctrace record --device` into a `.trace`
   file (default template "Time Profiler", default 5s, max 60s). `--attach`
   often cannot find the simulator process ("Cannot find process"), so
