@@ -147,14 +147,14 @@ async function main(): Promise<void> {
   }
 
   // Optional dependency: the daemon starts without go-ios; the real-lease
-  // app verbs, syslog relay and ui_screenshot fail at call time with an install hint.
+  // app verbs, syslog relay and ui_* fail at call time with an install hint.
   try {
     const version = await realApps.checkAvailable();
     console.log(`[sim-mcp] ios: ${version.split("\n")[0]}`);
   } catch {
     console.warn(
       `[sim-mcp] WARNING: optional binary "${config.iosBin}" is not usable; ` +
-        `app_install/app_uninstall/app_launch/app_terminate, sim_log_stream and ui_screenshot/ui_describe/ui_tap on real-device leases ` +
+        `app_install/app_uninstall/app_launch/app_terminate, sim_log_stream and ui_screenshot/ui_describe/ui_tap/ui_type/ui_swipe/ui_button/ui_batch on real-device leases ` +
         `will fail until it is installed (${GO_IOS_INSTALL_HINT}, or set IOS_BIN)`,
     );
   }

@@ -10,7 +10,7 @@ import { Llmdb } from "../src/llmdb.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { GO_IOS_INSTALL_HINT } from "../src/realdevices.js";
 import type { PoolDevice, RealDevices } from "../src/realdevices.js";
-import { REAL_UI_WDA_DETAIL, RealUiDriver } from "../src/realui.js";
+import { RealUiDriver } from "../src/realui.js";
 import { createMcpServer } from "../src/server.js";
 import { ServeSim } from "../src/servesim.js";
 import { SimApps } from "../src/simapps.js";
@@ -97,6 +97,19 @@ const DK_SOURCE = JSON.stringify({
 /** Canned `ios ui tap` output (measured live 2026-10-22). */
 const DK_TAP = '{"id":1,"jsonrpc":"2.0","result":{"success":true}}';
 
+/**
+ * Canned `ios ui type` / `swipe` / `button` outputs. Shape mirrors the
+ * live tap envelope (`{"id","jsonrpc","result"}`); success envelopes
+ * resolve trimmed, while envelopes with a non-null `error` member reject
+ * (exit-0 fake-ok is a live-measured failure mode, see the envelope
+ * tests). Live-verified 2026-10-22: empty `--text=` fails
+ * `--text is required`; the CLI fromX swipe shape fails DeviceKit
+ * `-32602 Invalid parameters` (the runner wants x1/y1/x2/y2).
+ */
+const DK_TYPE = '{"id":1,"jsonrpc":"2.0","result":{"success":true}}';
+const DK_SWIPE = '{"id":1,"jsonrpc":"2.0","result":{"success":true}}';
+const DK_BUTTON = '{"id":1,"jsonrpc":"2.0","result":{"success":true}}';
+
 /** Canned `axe describe-ui` output (sim path, byte-identity reference). */
 const AX_FULL = JSON.stringify([
   {
@@ -111,8 +124,8 @@ const AX_FULL = JSON.stringify([
   },
 ]);
 
-/** Fake `ios` covering screenshot + `ui source` + `ui tap`, like the real CLI. */
-function iosUiRunner(opts: { source?: string; tap?: string } = {}): Runner & { calls: { bin: string; args: string[] }[] } {
+/** Fake `ios` covering screenshot + `ui source`/`tap`/`type`/`swipe`/`button`, like the real CLI. */
+function iosUiRunner(opts: { source?: string; tap?: string; type?: string; swipe?: string; button?: string } = {}): Runner & { calls: { bin: string; args: string[] }[] } {
   return stubRunner((bin, args) => {
     if (bin === "ios" && args[0] === "--version") return { stdout: "go-ios local-build\n", stderr: "" };
     if (bin === "ios" && args[0] === "ui" && args[1] === "source") {
@@ -121,17 +134,31 @@ function iosUiRunner(opts: { source?: string; tap?: string } = {}): Runner & { c
     if (bin === "ios" && args[0] === "ui" && args[1] === "tap") {
       return { stdout: opts.tap ?? DK_TAP, stderr: "" };
     }
+    if (bin === "ios" && args[0] === "ui" && args[1] === "type") {
+      return { stdout: opts.type ?? DK_TYPE, stderr: "" };
+    }
+    if (bin === "ios" && args[0] === "ui" && args[1] === "api" && args.includes("--rpc-method=device.io.swipe")) {
+      return { stdout: opts.swipe ?? DK_SWIPE, stderr: "" };
+    }
+    if (bin === "ios" && args[0] === "ui" && args[1] === "button") {
+      return { stdout: opts.button ?? DK_BUTTON, stderr: "" };
+    }
     const out = args.find((a) => a.startsWith("--output="))?.slice("--output=".length);
     if (bin === "ios" && args[0] === "screenshot" && out) fs.writeFileSync(out, PNG_BYTES);
     return { stdout: '{"level":"INFO","msg":"File saved successfully"}', stderr: "" };
   });
 }
 
-/** Fake `axe` covering screenshot + describe-ui + tap. */
+/** Fake `axe` covering screenshot + describe-ui + tap + type + swipe + button + batch. */
 function axeUiRunner(): Runner & { calls: { bin: string; args: string[] }[] } {
   return stubRunner((bin, args) => {
     if (bin === "axe" && args[0] === "describe-ui") return { stdout: AX_FULL, stderr: "" };
     if (bin === "axe" && args[0] === "tap") return { stdout: "tapped label=Go\n", stderr: "" };
+    if (bin === "axe" && args[0] === "type") return { stdout: "typed\n", stderr: "" };
+    if (bin === "axe" && args[0] === "swipe") return { stdout: "swiped\n", stderr: "" };
+    if (bin === "axe" && args[0] === "button") return { stdout: "pressed\n", stderr: "" };
+    if (bin === "axe" && args[0] === "batch") return { stdout: "batched\n", stderr: "" };
+    if (bin === "axe" && args[0] === "gesture") return { stdout: "gestured\n", stderr: "" };
     const flag = args.indexOf("--output");
     if (bin === "axe" && args[0] === "screenshot" && flag !== -1 && args[flag + 1]) {
       fs.writeFileSync(args[flag + 1]!, PNG_BYTES);
@@ -209,16 +236,14 @@ describe("RealUiDriver", () => {
     expect(String(err.message)).not.toMatch(/not installed/);
   });
 
-  it("throws P2-style errors for the remaining WDA-gated verbs (describe+tap are wired)", async () => {
-    const run = iosShotRunner();
+  it("no longer throws P2 stubs: type/swipe/button/batch are wired, gesture is a precise limit", async () => {
+    const run = iosUiRunner();
     const driver = new RealUiDriver({ runner: run });
-    expect(REAL_UI_WDA_DETAIL).toContain("WebDriverAgent");
-    await expect(driver.typeText("R1", "hi")).rejects.toThrow(/P2/);
-    await expect(driver.swipe("R1", { x: 0, y: 0 }, { x: 1, y: 1 })).rejects.toThrow(/P2/);
-    await expect(driver.gesture("R1", "scroll-up")).rejects.toThrow(/P2/);
-    await expect(driver.button("R1", "home")).rejects.toThrow(/P2/);
-    await expect(driver.batch("R1", ["tap --label OK"])).rejects.toThrow(/P2/);
-    expect(run.calls).toHaveLength(0);
+    await expect(driver.typeText("R1", "hi")).resolves.toBe(DK_TYPE);
+    await expect(driver.swipe("R1", { x: 0, y: 0 }, { x: 1, y: 1 })).resolves.toBe(DK_SWIPE);
+    await expect(driver.button("R1", "home")).resolves.toBe(DK_BUTTON);
+    await expect(driver.batch("R1", ["type 'hi'"])).resolves.toContain("success");
+    await expect(driver.gesture("R1", "scroll-up")).rejects.toThrow(/no.*CLI equivalent|not supported/i);
   });
 });
 
@@ -419,6 +444,319 @@ describe("RealUiDriver.tap", () => {
     expect(String(err.message)).toContain("tap outside screen");
     expect(String(err.message)).not.toMatch(/not installed/);
   });
+
+  it("rejects exit-0 error envelopes loudly with verbatim text (never fake-ok)", async () => {
+    const run = iosUiRunner({ tap: '{"id":1,"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid parameters"}}' });
+    const err = await new RealUiDriver({ runner: run }).tap("R1", { x: 1, y: 2 }).catch((e: Error) => e);
+    expect(String(err.message)).toContain("-32602");
+    expect(String(err.message)).toContain("R1");
+    expect(String(err.message)).not.toMatch(/not installed/);
+  });
+});
+
+describe("RealUiDriver.typeText", () => {
+  it("types via ios ui type with --text and returns the backend text trimmed", async () => {
+    const run = iosUiRunner();
+    const out = await new RealUiDriver({ runner: run }).typeText("R1", "hello world");
+    expect(run.calls).toEqual([{ bin: "ios", args: ["ui", "type", "--text=hello world", "--udid=R1"] }]);
+    expect(out).toBe(DK_TYPE);
+  });
+
+  it("validates udid and non-empty text without spawning", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    await expect(driver.typeText("", "hi")).rejects.toThrow(/Invalid udid/);
+    await expect(driver.typeText("  ", "hi")).rejects.toThrow(/Invalid udid/);
+    await expect(driver.typeText("R1", "")).rejects.toThrow(/Invalid text/);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("names the install hint only on ENOENT", async () => {
+    const run = stubRunner(() => {
+      throw new ExecError("ios", ["ui", "type"], "ENOENT", "", "spawn ios ENOENT");
+    });
+    await expect(new RealUiDriver({ runner: run }).typeText("R1", "hi")).rejects.toThrow(
+      GO_IOS_INSTALL_HINT,
+    );
+  });
+
+  it("keeps device failures verbatim (never reframed as a missing binary)", async () => {
+    const run = stubRunner(() => {
+      throw new ExecError("ios", ["ui", "type"], 1, "", '{"level":"ERROR","msg":"no focused field"}');
+    });
+    const err = await new RealUiDriver({ runner: run }).typeText("R1", "hi").catch((e: Error) => e);
+    expect(String(err.message)).toContain("no focused field");
+    expect(String(err.message)).not.toMatch(/not installed/);
+  });
+});
+
+describe("RealUiDriver.swipe", () => {
+  it("swipes via ios ui api device.io.swipe with x1/y1/x2/y2 (the runner rejects the CLI fromX shape)", async () => {
+    const run = iosUiRunner();
+    const out = await new RealUiDriver({ runner: run }).swipe("R1", { x: 10, y: 20 }, { x: 30, y: 40 });
+    expect(run.calls).toEqual([{
+      bin: "ios",
+      args: ["ui", "api", "--rpc-method=device.io.swipe", '--params={"x1":10,"y1":20,"x2":30,"y2":40}', "--udid=R1"],
+    }]);
+    expect(out).toBe(DK_SWIPE);
+  });
+
+  it("maps duration into the rpc params, omitting it when undefined", async () => {
+    const run = iosUiRunner();
+    await new RealUiDriver({ runner: run }).swipe("R1", { x: 10, y: 20 }, { x: 30, y: 40 }, { duration: 1.5 });
+    expect(run.calls).toEqual([{
+      bin: "ios",
+      args: ["ui", "api", "--rpc-method=device.io.swipe", '--params={"x1":10,"y1":20,"x2":30,"y2":40,"duration":1.5}', "--udid=R1"],
+    }]);
+  });
+
+  it("ignores delta/preDelay/postDelay (tap-modifier precedent, documented limits)", async () => {
+    const run = iosUiRunner();
+    await new RealUiDriver({ runner: run }).swipe(
+      "R1", { x: 10, y: 20 }, { x: 30, y: 40 }, { duration: 1, delta: 5, preDelay: 0.5, postDelay: 0.5 },
+    );
+    expect(run.calls[0]?.args).not.toContain("--delta=5");
+    expect(run.calls).toHaveLength(1);
+  });
+
+  it("validates udid and finite coords/duration without spawning", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    await expect(driver.swipe("", { x: 1, y: 2 }, { x: 3, y: 4 })).rejects.toThrow(/Invalid udid/);
+    await expect(driver.swipe("R1", { x: NaN, y: 2 }, { x: 3, y: 4 })).rejects.toThrow(/Invalid from/);
+    await expect(driver.swipe("R1", { x: 1, y: 2 }, { x: 3, y: Number.POSITIVE_INFINITY })).rejects.toThrow(/Invalid to/);
+    await expect(
+      driver.swipe("R1", { x: 1, y: 2 }, { x: 3, y: 4 }, { duration: NaN }),
+    ).rejects.toThrow(/Invalid duration/);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("names the install hint only on ENOENT", async () => {
+    const run = stubRunner(() => {
+      throw new ExecError("ios", ["ui", "api"], "ENOENT", "", "spawn ios ENOENT");
+    });
+    await expect(
+      new RealUiDriver({ runner: run }).swipe("R1", { x: 1, y: 2 }, { x: 3, y: 4 }),
+    ).rejects.toThrow(GO_IOS_INSTALL_HINT);
+  });
+
+  it("rejects exit-0 error envelopes loudly with verbatim text (never fake-ok)", async () => {
+    const envelope = '{"id":1,"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid parameters"}}';
+    const run = iosUiRunner({ swipe: envelope });
+    const err = await new RealUiDriver({ runner: run })
+      .swipe("R1", { x: 1, y: 2 }, { x: 3, y: 4 })
+      .catch((e: Error) => e);
+    expect(String(err.message)).toContain("-32602");
+    expect(String(err.message)).toContain("R1");
+    expect(String(err.message)).not.toMatch(/not installed/);
+  });
+
+  it("resolves null-error and non-JSON output trimmed (no false positives)", async () => {
+    const runNull = iosUiRunner({ swipe: '{"id":1,"jsonrpc":"2.0","result":{"success":true},"error":null}' });
+    await expect(
+      new RealUiDriver({ runner: runNull }).swipe("R1", { x: 1, y: 2 }, { x: 3, y: 4 }),
+    ).resolves.toContain('"success":true');
+    const runPlain = iosUiRunner({ swipe: "  ok-plain\n" });
+    await expect(
+      new RealUiDriver({ runner: runPlain }).swipe("R1", { x: 1, y: 2 }, { x: 3, y: 4 }),
+    ).resolves.toBe("ok-plain");
+  });
+
+  it("keeps device failures verbatim (never reframed as a missing binary)", async () => {
+    const run = stubRunner(() => {
+      throw new ExecError("ios", ["ui", "api"], 1, "", '{"error":{"code":-32602,"msg":"Invalid parameters"}}');
+    });
+    const err = await new RealUiDriver({ runner: run })
+      .swipe("R1", { x: 1, y: 2 }, { x: 3, y: 4 })
+      .catch((e: Error) => e);
+    expect(String(err.message)).toContain("Invalid parameters");
+    expect(String(err.message)).not.toMatch(/not installed/);
+  });
+});
+
+describe("RealUiDriver.gesture", () => {
+  it("fails every preset with a precise no-CLI-equivalent error (zero spawns)", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    for (const preset of [
+      "scroll-up", "scroll-down", "scroll-left", "scroll-right",
+      "swipe-from-left-edge", "swipe-from-right-edge", "swipe-from-top-edge", "swipe-from-bottom-edge",
+    ]) {
+      const err = await driver.gesture("R1", preset).catch((e: Error) => e);
+      expect(String(err.message)).toContain(preset);
+      expect(String(err.message)).toMatch(/no.*CLI equivalent|not supported/i);
+      expect(String(err.message)).toMatch(/ui_swipe|swipe/i);
+    }
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("validates udid without spawning", async () => {
+    const run = iosUiRunner();
+    await expect(new RealUiDriver({ runner: run }).gesture("", "scroll-up")).rejects.toThrow(/Invalid udid/);
+    expect(run.calls).toHaveLength(0);
+  });
+});
+
+describe("RealUiDriver.button", () => {
+  it.each(["home", "lock", "volumeUp", "volumeDown"])(
+    "presses %s via ios ui button with the name positional",
+    async (button) => {
+      const run = iosUiRunner();
+      const out = await new RealUiDriver({ runner: run }).button("R1", button);
+      expect(run.calls).toEqual([{ bin: "ios", args: ["ui", "button", button, "--udid=R1"] }]);
+      expect(out).toBe(DK_BUTTON);
+    },
+  );
+
+  it("fails siri/side-button/apple-pay/unknown with a precise unsupported error (zero spawns)", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    for (const button of ["siri", "side-button", "apple-pay", "frobnicate"]) {
+      const err = await driver.button("R1", button).catch((e: Error) => e);
+      expect(String(err.message)).toContain(button);
+      expect(String(err.message)).toMatch(/not supported|no.*equivalent/i);
+    }
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("fails a hold duration with a precise error (no --duration flag; never faked as a tap)", async () => {
+    const run = iosUiRunner();
+    await expect(new RealUiDriver({ runner: run }).button("R1", "home", 2)).rejects.toThrow(/duration/i);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("validates udid without spawning", async () => {
+    const run = iosUiRunner();
+    await expect(new RealUiDriver({ runner: run }).button("", "home")).rejects.toThrow(/Invalid udid/);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("names the install hint only on ENOENT", async () => {
+    const run = stubRunner(() => {
+      throw new ExecError("ios", ["ui", "button"], "ENOENT", "", "spawn ios ENOENT");
+    });
+    await expect(new RealUiDriver({ runner: run }).button("R1", "home")).rejects.toThrow(
+      GO_IOS_INSTALL_HINT,
+    );
+  });
+
+  it("keeps device failures verbatim (never reframed as a missing binary)", async () => {
+    const run = stubRunner(() => {
+      throw new ExecError("ios", ["ui", "button"], 1, "", '{"error":{"code":-32602,"msg":"Invalid parameters"}}');
+    });
+    const err = await new RealUiDriver({ runner: run }).button("R1", "home").catch((e: Error) => e);
+    expect(String(err.message)).toContain("Invalid parameters");
+    expect(String(err.message)).not.toMatch(/not installed/);
+  });
+});
+
+describe("RealUiDriver.batch", () => {
+  it("fans out tap/type/swipe/button/sleep steps per-step via the wired verbs", async () => {
+    const run = iosUiRunner();
+    const out = await new RealUiDriver({ runner: run }).batch("R1", [
+      "tap -x 74 -y 33",
+      "type 'hi'",
+      "swipe --start-x 10 --start-y 20 --end-x 30 --end-y 40 --duration 1",
+      "button home",
+      "sleep 0.01",
+    ]);
+    expect(run.calls).toEqual([
+      { bin: "ios", args: ["ui", "tap", "--x=74", "--y=33", "--udid=R1"] },
+      { bin: "ios", args: ["ui", "type", "--text=hi", "--udid=R1"] },
+      { bin: "ios", args: ["ui", "api", "--rpc-method=device.io.swipe", '--params={"x1":10,"y1":20,"x2":30,"y2":40,"duration":1}', "--udid=R1"] },
+      { bin: "ios", args: ["ui", "button", "home", "--udid=R1"] },
+    ]);
+    expect(out).toContain("success");
+    expect(out).toContain("slept 0.01s");
+  });
+
+  it("rejects screenshot and unknown heads like Axe (zero spawns)", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    await expect(driver.batch("R1", ["screenshot --output x.png"])).rejects.toThrow(/unsupported batch step/i);
+    await expect(driver.batch("R1", ["frobnicate now"])).rejects.toThrow(/unsupported batch step/i);
+    await expect(driver.batch("R1", [""])).rejects.toThrow(/unsupported batch step/i);
+    // A bad head anywhere poisons the whole batch before anything spawns.
+    await expect(driver.batch("R1", ["tap -x 1 -y 2", "screenshot x"])).rejects.toThrow(/unsupported batch step/i);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("fails gesture/touch/key steps with precise unsupported errors (zero spawns)", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    await expect(driver.batch("R1", ["gesture scroll-up"])).rejects.toThrow(/scroll-up/);
+    await expect(driver.batch("R1", ["touch --x 1 --y 2 --down --up"])).rejects.toThrow(/touch/i);
+    await expect(driver.batch("R1", ["key a"])).rejects.toThrow(/key/i);
+    await expect(driver.batch("R1", ["key-sequence a b"])).rejects.toThrow(/key/i);
+    await expect(driver.batch("R1", ["key-combo cmd c"])).rejects.toThrow(/key/i);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("mirrors per-verb limits inside steps (selector taps, button holds, bad sleep)", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    await expect(driver.batch("R1", ["tap --label OK"])).rejects.toThrow(/coordinates only/);
+    await expect(driver.batch("R1", ["button home --duration 2"])).rejects.toThrow(/duration/i);
+    await expect(driver.batch("R1", ["button siri"])).rejects.toThrow(/siri/);
+    await expect(driver.batch("R1", ["sleep banana"])).rejects.toThrow(/sleep/i);
+    await expect(driver.batch("R1", ["type"])).rejects.toThrow(/Invalid text/);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("requires at least one step and a valid udid (zero spawns)", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    await expect(driver.batch("R1", [])).rejects.toThrow(/at least one step/);
+    await expect(driver.batch("", ["tap -x 1 -y 2"])).rejects.toThrow(/Invalid udid/);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("stops at the first runtime failure by default", async () => {
+    const run = stubRunner((bin, args) => {
+      if (args[1] === "type") throw new ExecError(bin, args, 1, "", "no focused field");
+      return { stdout: '{"result":{"success":true}}', stderr: "" };
+    });
+    const err = await new RealUiDriver({ runner: run })
+      .batch("R1", ["tap -x 1 -y 2", "type 'hi'", "button home"])
+      .catch((e: Error) => e);
+    expect(String(err.message)).toContain("no focused field");
+    expect(run.calls.map((c) => c.args[1])).toEqual(["tap", "type"]);
+  });
+
+  it("continues past runtime failures with continueOnError and accounts each one", async () => {
+    const run = stubRunner((bin, args) => {
+      if (args[1] === "type") throw new ExecError(bin, args, 1, "", "no focused field");
+      return { stdout: '{"result":{"success":true}}', stderr: "" };
+    });
+    const out = await new RealUiDriver({ runner: run }).batch(
+      "R1",
+      ["tap -x 1 -y 2", "type 'hi'", "button home"],
+      { continueOnError: true },
+    );
+    expect(run.calls.map((c) => c.args[1])).toEqual(["tap", "type", "button"]);
+    expect(out).toContain("step 2 (type) failed");
+    expect(out).toContain("no focused field");
+  });
+
+  it("ignores waitTimeout/pollInterval/verbose (tap-modifier precedent)", async () => {
+    const run = iosUiRunner();
+    await new RealUiDriver({ runner: run }).batch(
+      "R1", ["tap -x 1 -y 2"], { waitTimeout: 5, pollInterval: 1, verbose: true },
+    );
+    expect(run.calls).toHaveLength(1);
+  });
+
+  it("parses quoted and backslash-escaped step args", async () => {
+    const run = iosUiRunner();
+    const driver = new RealUiDriver({ runner: run });
+    await driver.batch("R1", ['type "hello world"']);
+    expect(run.calls[0]?.args).toContain("--text=hello world");
+    await driver.batch("R1", ["type hello\\ world"]);
+    expect(run.calls[1]?.args).toContain("--text=hello world");
+    // Coords win over selectors in steps too (axe precedence).
+    await driver.batch("R1", ["tap -x 1 -y 2 --label OK"]);
+    expect(run.calls[2]?.args).toEqual(["ui", "tap", "--x=1", "--y=2", "--udid=R1"]);
+  });
 });
 
 class FakeFleet implements FleetOps {
@@ -536,12 +874,25 @@ describe("ui_screenshot dispatch by lease kind", () => {
     expect((text as { text: string }).text).toContain("go-ios UI transport");
   });
 
-  it("keeps the remaining ui_* verbs fail-fast P2 on real leases", async () => {
-    const { client, realLeaseId } = await makeShotClient();
-    const type = await client.callTool({ name: "ui_type", arguments: { lease_id: realLeaseId, text: "hi" } });
-    expect(type.isError).toBe(true);
-    const text = type.content.find((c) => c.type === "text");
-    expect((text as { text: string }).text).toContain("P2");
+  it("no longer gates type/swipe/button/batch P2 on real leases (gesture stays a precise limit)", async () => {
+    const { client, realLeaseId } = await makeShotClient({
+      axeRun: axeUiRunner(), iosRun: iosUiRunner(),
+    });
+    for (const [name, args] of [
+      ["ui_type", { lease_id: realLeaseId, text: "hi" }],
+      ["ui_swipe", { lease_id: realLeaseId, start_x: 1, start_y: 2, end_x: 3, end_y: 4 }],
+      ["ui_button", { lease_id: realLeaseId, button: "home" }],
+      ["ui_batch", { lease_id: realLeaseId, steps: ["tap -x 1 -y 2"] }],
+    ] as const) {
+      const result = await client.callTool({ name, arguments: { ...args } });
+      expect(result.isError, name).not.toBe(true);
+    }
+    const gesture = await client.callTool({
+      name: "ui_gesture", arguments: { lease_id: realLeaseId, preset: "scroll-up" },
+    });
+    expect(gesture.isError).toBe(true);
+    const text = gesture.content.find((c) => c.type === "text");
+    expect((text as { text: string }).text).toContain("scroll-up");
   });
 });
 
@@ -637,6 +988,123 @@ describe("ui_describe/ui_tap dispatch by lease kind", () => {
     for (const { name, args } of calls) {
       const result = await client.callTool({ name, arguments: { ...args } });
       expect(result.isError).toBe(true);
+      const text = result.content.find((c) => c.type === "text");
+      expect((text as { text: string }).text).toContain("go-ios UI transport");
+    }
+  });
+});
+
+describe("ui_type/ui_swipe/ui_gesture/ui_button/ui_batch dispatch by lease kind", () => {
+  it("routes real ui_type to ios ui type", async () => {
+    const { client, orch, axeRun, iosRun, realLeaseId } = await makeShotClient({
+      axeRun: axeUiRunner(), iosRun: iosUiRunner(),
+    });
+    const result = await client.callTool({ name: "ui_type", arguments: { lease_id: realLeaseId, text: "hi" } });
+    expect(result.isError).not.toBe(true);
+    const text = result.content.find((c) => c.type === "text");
+    const json = JSON.parse((text as { text: string }).text) as Record<string, unknown>;
+    expect(json).toMatchObject({ ok: true, udid: "R1" });
+    expect(axeRun.calls).toHaveLength(0);
+    expect(iosRun.calls).toEqual([{ bin: "ios", args: ["ui", "type", "--text=hi", "--udid=R1"] }]);
+    const actions = orch.leaseActions(realLeaseId).map((a) => `${a.tool} ${a.summary}`);
+    expect(actions.join("\n")).toContain('ui_type type "hi"');
+  });
+
+  it("routes real ui_swipe to ios ui swipe with duration", async () => {
+    const { client, axeRun, iosRun, realLeaseId } = await makeShotClient({
+      axeRun: axeUiRunner(), iosRun: iosUiRunner(),
+    });
+    const result = await client.callTool({
+      name: "ui_swipe",
+      arguments: { lease_id: realLeaseId, start_x: 10, start_y: 20, end_x: 30, end_y: 40, duration: 1 },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(axeRun.calls).toHaveLength(0);
+    expect(iosRun.calls).toEqual([{
+      bin: "ios",
+      args: ["ui", "api", "--rpc-method=device.io.swipe", '--params={"x1":10,"y1":20,"x2":30,"y2":40,"duration":1}', "--udid=R1"],
+    }]);
+  });
+
+  it("routes real ui_button to ios ui button", async () => {
+    const { client, axeRun, iosRun, realLeaseId } = await makeShotClient({
+      axeRun: axeUiRunner(), iosRun: iosUiRunner(),
+    });
+    const result = await client.callTool({ name: "ui_button", arguments: { lease_id: realLeaseId, button: "home" } });
+    expect(result.isError).not.toBe(true);
+    expect(axeRun.calls).toHaveLength(0);
+    expect(iosRun.calls).toEqual([{ bin: "ios", args: ["ui", "button", "home", "--udid=R1"] }]);
+  });
+
+  it("routes real ui_batch per-step through the wired verbs", async () => {
+    const { client, axeRun, iosRun, realLeaseId } = await makeShotClient({
+      axeRun: axeUiRunner(), iosRun: iosUiRunner(),
+    });
+    const result = await client.callTool({
+      name: "ui_batch", arguments: { lease_id: realLeaseId, steps: ["tap -x 1 -y 2", "sleep 0.01"] },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(axeRun.calls).toHaveLength(0);
+    expect(iosRun.calls).toEqual([{ bin: "ios", args: ["ui", "tap", "--x=1", "--y=2", "--udid=R1"] }]);
+  });
+
+  it("fails real ui_gesture with the precise per-preset error (zero spawns)", async () => {
+    const { client, axeRun, iosRun, realLeaseId } = await makeShotClient({
+      axeRun: axeUiRunner(), iosRun: iosUiRunner(),
+    });
+    const result = await client.callTool({
+      name: "ui_gesture", arguments: { lease_id: realLeaseId, preset: "scroll-up" },
+    });
+    expect(result.isError).toBe(true);
+    const text = result.content.find((c) => c.type === "text");
+    expect((text as { text: string }).text).toContain("scroll-up");
+    expect(axeRun.calls).toHaveLength(0);
+    expect(iosRun.calls).toHaveLength(0);
+  });
+
+  it("keeps the sim paths byte-identical (axe argv + ok shape)", async () => {
+    const { client, axeRun, iosRun, simLeaseId } = await makeShotClient({
+      axeRun: axeUiRunner(), iosRun: iosUiRunner(),
+    });
+    const calls = [
+      { name: "ui_type", args: { lease_id: simLeaseId, text: "hi" }, argv: ["type", "--stdin", "--udid", "U1"] },
+      {
+        name: "ui_swipe",
+        args: { lease_id: simLeaseId, start_x: 1, start_y: 2, end_x: 3, end_y: 4, duration: 1 },
+        argv: ["swipe", "--udid", "U1", "--start-x", "1", "--start-y", "2", "--end-x", "3", "--end-y", "4", "--duration", "1"],
+      },
+      { name: "ui_gesture", args: { lease_id: simLeaseId, preset: "scroll-up" }, argv: ["gesture", "scroll-up", "--udid", "U1"] },
+      { name: "ui_button", args: { lease_id: simLeaseId, button: "home" }, argv: ["button", "home", "--udid", "U1"] },
+      {
+        name: "ui_batch",
+        args: { lease_id: simLeaseId, steps: ["tap -x 1 -y 2"] },
+        argv: ["batch", "--udid", "U1", "--step", "tap -x 1 -y 2"],
+      },
+    ] as const;
+    for (const { name, args, argv } of calls) {
+      const before = axeRun.calls.length;
+      const result = await client.callTool({ name, arguments: { ...args } });
+      expect(result.isError, name).not.toBe(true);
+      const text = result.content.find((c) => c.type === "text");
+      const json = JSON.parse((text as { text: string }).text) as Record<string, unknown>;
+      expect(json).toMatchObject({ ok: true, udid: "U1" });
+      expect(axeRun.calls.slice(before)).toEqual([{ bin: "axe", args: [...argv] }]);
+    }
+    expect(iosRun.calls).toHaveLength(0);
+  });
+
+  it("fails all five with a missing-transport error when realUi is absent", async () => {
+    const { client, realLeaseId } = await makeShotClient({ withRealUi: false });
+    const calls = [
+      { name: "ui_type", args: { lease_id: realLeaseId, text: "hi" } },
+      { name: "ui_swipe", args: { lease_id: realLeaseId, start_x: 1, start_y: 2, end_x: 3, end_y: 4 } },
+      { name: "ui_gesture", args: { lease_id: realLeaseId, preset: "scroll-up" } },
+      { name: "ui_button", args: { lease_id: realLeaseId, button: "home" } },
+      { name: "ui_batch", args: { lease_id: realLeaseId, steps: ["tap -x 1 -y 2"] } },
+    ] as const;
+    for (const { name, args } of calls) {
+      const result = await client.callTool({ name, arguments: { ...args } });
+      expect(result.isError, name).toBe(true);
       const text = result.content.find((c) => c.type === "text");
       expect((text as { text: string }).text).toContain("go-ios UI transport");
     }

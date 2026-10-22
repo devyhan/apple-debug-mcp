@@ -467,3 +467,91 @@ argv + normalization + compactor-compat + hit-test + tap limits +
 server dispatch + sim byte-identity + missing-transport). `npm run
 build`, `npm run typecheck`, full `vitest run` green. Session left
 RUNNING in tmux `wda` (do NOT kill; shared with further P2-B work).
+
+## 11. `ui_type` + `ui_swipe` + `ui_button` + `ui_batch` — WIRED; `ui_gesture` — precise limit
+
+Third P2-B slice: the five remaining real-device ui verbs, on the
+live §9 session (DeviceKit on `127.0.0.1:12004` in tmux `wda`).
+Four are wired; gesture presets are a deliberate, precise
+unsupported error (zero spawns). The stale `REAL_UI_WDA_DETAIL` /
+P2-throw story is deleted — bring-up is §9, limits are below.
+
+Real paths (`src/realui.ts` `RealUiDriver`):
+
+```
+ios ui type --text=<text> --udid=<udid>
+ios ui api --rpc-method=device.io.swipe --params='{"x1":…,"y1":…,"x2":…,"y2":…[,"duration":…]}' --udid=<udid>
+ios ui button <button> --udid=<udid>
+(batch: per-step fan-out through the wired verbs + in-process sleep; no `ui batch` verb exists)
+```
+
+Swipe bypasses `ui swipe` on purpose: go-ios 1.3.2 sends
+`{fromX,fromY,toX,toY}` (`cmd_ui.go`), but the DeviceKit runner
+rejects that shape with `-32602 Invalid parameters` on EVERY
+variant (durations 0/0.5/1, nested, empty) and accepts
+`{x1,y1,x2,y2}` (with or without `duration`) — measured live,
+then proven by a real SpringBoard page move (1→2→1 roundtrip
+via the driver, page-indicator verified). Upstream shape bug;
+revisit if go-ios fixes the CLI.
+
+Flag surface (go-ios 1.3.2 binary usage text + `cmd_ui.go` source —
+`ios ui <verb> --help` prints only the generic page, so the
+per-verb lines above come from the embedded usage / source):
+
+- `ui type --text=<text>` (empty → `--text is required`, verified
+  live), `ui swipe --from-x --from-y --to-x --to-y
+  [--duration=<seconds>]`, `ui longpress --x --y
+  [--duration=<seconds>]`, `ui button <button>` (name positional,
+  NO `--duration` flag), all plus `[--driver] [--session-id]
+  [--wda-url] [--devicekit-url]`.
+- `--driver` defaults to `devicekit`, `--devicekit-url` to
+  `http://127.0.0.1:12004` (source `cmd_ui.go`); argv passes
+  `--udid` only so env overrides keep working.
+- `ios ui size` (read-only, verified live) →
+  `{"result":{"scale":3,"screenSize":{"height":956,"width":440}}}`.
+
+Per-verb mapping and limits (honest — action-defining args without
+a CLI equivalent are precise errors, never faked):
+
+| Verb | Mapping | Refused (zero spawns) | Ignored (documented, §10 precedent) |
+| --- | --- | --- | --- |
+| `typeText` | `--text=<text>`, backend stdout trimmed | empty text (`Invalid text`; the CLI itself requires `--text`) | — |
+| `swipe` | `ui api device.io.swipe` with `{x1,y1,x2,y2[,duration]}` (NOT the broken CLI fromX shape) | non-finite from/to/duration | `delta` (touch-point spacing), `preDelay`/`postDelay` (client pacing) — same device action either way |
+| `button` | `<button>` positional: `home`, `lock`, `volumeUp`, `volumeDown` | `siri`/`side-button`/`apple-pay`/unknown (DeviceKit `device.io.button` takes exactly the four — grounded via `strings` on the 0.0.18 runner binary, which carries no siri/side-button/apple-pay); any hold `duration` (no `--duration` flag — a hold faked as a tap is refused instead) | — |
+| `gesture` | NONE — every preset errors | all 8 presets (`REAL_UI_GESTURE_DETAIL`): no `ui gesture` verb exists, the `device.io.gesture` RPC (raw `ui api` only) takes ungrounded params (no preset strings in the runner binary), and the Axe preset→coordinates formulas are unknown — rebuilding over `ui swipe` would diverge from sim, so it names the preset and points at `ui_swipe` | — |
+| `batch` | plan-then-run fan-out: `tap`→`ui tap`, `swipe`→`ui api device.io.swipe`, `type`→`ui type`, `button`→`ui button`, `sleep`→genuine in-process delay; outputs joined by newline | bad/unknown heads incl. `screenshot` (Axe rule mirrored); `gesture`/`touch`/`key`/`key-sequence`/`key-combo` steps (no CLI equivalent — `ui longpress` covers hold-at-point only, and 1.3.2 has no key-injection verb); per-verb limits inside steps (selector taps, button holds/names, bad sleep); ALL steps are planned upfront, so any static failure fails the whole batch with zero spawns | `waitTimeout`/`pollInterval`/`verbose` (selector-polling/HID plumbing, no real-device meaning); `continueOnError` is honored in-process (failures recorded as `step N (head) failed: <msg>`, runtime only — static failures always abort upfront) |
+
+Batch step syntax is AXe fragments (`axe tap -x/-y`,
+`--start-x/--start-y/--end-x/--end-y/--duration` for swipe,
+positional button name / sleep seconds / type text), parsed by a
+small quote/backslash lexer (covers `tap --label Sign\ In` and
+`type 'hello'`); coords win over selectors in tap steps, matching
+`Axe.tap` precedence.
+
+Live-verified 2026-10-22 on the paired iPhone 16 Pro Max
+(`00008140-000555603453001C`): `ui status` → `OK`; `ui type
+--text=` → `--text is required`; `ui button frobnicate` →
+`-32602 Invalid parameters` (hence the driver-side allowlist);
+`ui size` → 440x956@3x. Swipe roundtrip via OUR driver:
+page 1 → 2 → 1 with page-indicator proof at each step (device
+restored). Exit-0 error envelopes reject loudly with verbatim
+text (a resolved `-32602` would fake-ok a failed action);
+non-JSON and `error: null` resolve trimmed.
+
+Handler routing (`src/server.ts`): the `requireSimLease` gate is
+dropped on all five (`uiFor(lease)` one by one: sim → `Axe`
+byte-identical, real → `RealUiDriver`); the now-unused
+`UI_REAL_DETAIL` const is deleted. Tool descriptions name the
+real path + limits; `logAction` plumbing is shared and unchanged.
+`ServerDeps.realUi` comment, daemon boot warning (`index.ts`),
+and doctor fix text now name
+screenshot/describe/tap/type/swipe/button/batch. Failures mirror
+the §8 seam: ENOENT-only install hint, backend text verbatim
+otherwise.
+
+Verification: failing-test-first — 38 new `test/realui.test.ts`
+cases failed on the stubs/gates, then passed after the fix
+(driver argv + limits + batch fan-out/parser/continue-on-error +
+server dispatch + sim byte-identity + missing-transport).
+`npm run build`, `npm run typecheck`, full `vitest run` (728)
+green. Session left RUNNING in tmux `wda` (do NOT kill).

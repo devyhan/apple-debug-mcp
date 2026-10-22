@@ -20,8 +20,6 @@ import type { UiDriver } from "./uidriver.js";
 import { getServerInfo, getVersion } from "./version.js";
 import { XCTrace } from "./xctrace.js";
 
-const UI_REAL_DETAIL = "real-device UI automation via WebDriverAgent/idb-backed UiDriver";
-
 export interface ServerDeps {
   orchestrator: Orchestrator;
   simslim: Simslim;
@@ -34,7 +32,7 @@ export interface ServerDeps {
   screenshotDir: string;
   realApps?: AppOps;
   realLog?: LogOps;
-  /** Real-device UI backend (go-ios screenshot/describe/tap). Absent ⇒ real ui_* fails with a missing-transport error. */
+  /** Real-device UI backend (go-ios screenshot/describe/tap/type/swipe/button/batch; gesture is a precise driver limit). Absent ⇒ real ui_* fails with a missing-transport error. */
   realUi?: UiDriver;
 }
 
@@ -481,7 +479,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_type",
     {
-      description: "Type text on your leased simulator (AXe type). US-keyboard characters only.",
+      description: "Type text on your leased simulator or real device (AXe type; go-ios `ios ui type` on real devices). US-keyboard characters only.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         text: z.string().min(1).describe("Text to type."),
@@ -490,8 +488,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, text }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "ui_type", phase: "P2", detail: UI_REAL_DETAIL });
-        const out = await axe.typeText(lease.udid, text);
+        const out = await uiFor(lease, "ui_type").typeText(lease.udid, text);
         await orch.logAction(lease_id, "ui_type", `type ${JSON.stringify(text.slice(0, 80))}`);
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
@@ -503,7 +500,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_swipe",
     {
-      description: "Swipe from one point to another on your leased simulator (AXe swipe).",
+      description: "Swipe from one point to another on your leased simulator or real device (AXe swipe; go-ios `ios ui api device.io.swipe` on real devices — the `ui swipe` CLI sends a param shape the runner rejects).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         start_x: z.number().describe("Start X."),
@@ -516,8 +513,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async (args) => {
       try {
         const lease = await orch.resolveLease(args.lease_id);
-        requireSimLease(lease, { verb: "ui_swipe", phase: "P2", detail: UI_REAL_DETAIL });
-        const out = await axe.swipe(lease.udid, { x: args.start_x, y: args.start_y }, { x: args.end_x, y: args.end_y }, { duration: args.duration });
+        const out = await uiFor(lease, "ui_swipe").swipe(lease.udid, { x: args.start_x, y: args.start_y }, { x: args.end_x, y: args.end_y }, { duration: args.duration });
         await orch.logAction(args.lease_id, "ui_swipe", `swipe (${args.start_x},${args.start_y})->(${args.end_x},${args.end_y})`);
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
@@ -529,7 +525,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_gesture",
     {
-      description: "Run a preset gesture on your leased simulator: scroll-up/down/left/right, swipe-from-left/right/top/bottom-edge.",
+      description: "Run a preset gesture on your leased simulator: scroll-up/down/left/right, swipe-from-left/right/top/bottom-edge. On real devices every preset fails with a precise unsupported error (no go-ios equivalent) — use ui_swipe with explicit coordinates.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         preset: z.enum(["scroll-up", "scroll-down", "scroll-left", "scroll-right", "swipe-from-left-edge", "swipe-from-right-edge", "swipe-from-top-edge", "swipe-from-bottom-edge"]),
@@ -539,8 +535,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, preset, duration }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "ui_gesture", phase: "P2", detail: UI_REAL_DETAIL });
-        const out = await axe.gesture(lease.udid, preset, { duration });
+        const out = await uiFor(lease, "ui_gesture").gesture(lease.udid, preset, { duration });
         await orch.logAction(lease_id, "ui_gesture", `gesture ${preset}`);
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
@@ -552,7 +547,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_button",
     {
-      description: "Press a hardware button on your leased simulator: home, lock, side-button, siri, apple-pay.",
+      description: "Press a hardware button on your leased simulator or real device (AXe button; go-ios `ios ui button` with home/lock on real devices — siri/side-button/apple-pay and hold durations are precise unsupported errors there).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         button: z.enum(["apple-pay", "home", "lock", "side-button", "siri"]),
@@ -562,8 +557,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, button, duration }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "ui_button", phase: "P2", detail: UI_REAL_DETAIL });
-        const out = await axe.button(lease.udid, button, duration);
+        const out = await uiFor(lease, "ui_button").button(lease.udid, button, duration);
         await orch.logAction(lease_id, "ui_button", `button ${button}`);
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
@@ -601,7 +595,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     "ui_batch",
     {
       description:
-        "Run ordered interaction steps in one AXe session (faster than separate calls). Each step starts with tap|swipe|gesture|touch|type|button|key|key-sequence|key-combo|sleep, e.g. 'tap --label Sign\\ In' or \"type 'hello'\".",
+        "Run ordered interaction steps in one AXe session (faster than separate calls). Each step starts with tap|swipe|gesture|touch|type|button|key|key-sequence|key-combo|sleep, e.g. 'tap --label Sign\\ In' or \"type 'hello'\". On real devices tap/swipe/type/button/sleep steps run per-step via go-ios; gesture/touch/key steps fail with precise unsupported errors.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         steps: z.array(z.string().min(1)).min(1).max(50).describe("Ordered steps, one AXe command fragment each."),
@@ -612,8 +606,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, steps, continue_on_error, wait_timeout }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "ui_batch", phase: "P2", detail: UI_REAL_DETAIL });
-        const out = await axe.batch(lease.udid, steps, { continueOnError: continue_on_error, waitTimeout: wait_timeout });
+        const out = await uiFor(lease, "ui_batch").batch(lease.udid, steps, { continueOnError: continue_on_error, waitTimeout: wait_timeout });
         await orch.logAction(lease_id, "ui_batch", `batch ${steps.length} steps: ${steps.join("; ").slice(0, 120)}`);
         return ok({ udid: lease.udid, output: out });
       } catch (err) {
