@@ -59,7 +59,7 @@ export function isPathWithin(root: string, target: string): boolean {
  * refusal: empty/absolute/escaping path, Documents or Keychain target,
  * non-.plist file, or empty key list. Runs before any spawn or deletion.
  */
-function assertPlistTargetShape(target: PlistKeyTarget): void {
+export function assertPlistTargetShape(target: PlistKeyTarget): void {
   const rel = (target as { plist?: unknown } | null | undefined)?.plist;
   if (typeof rel !== "string" || rel.trim().length === 0) {
     throw new Error("Invalid plist target (expected a non-empty container-relative plist path)");

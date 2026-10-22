@@ -716,7 +716,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     "app_cache_clear",
     {
       description:
-        "Clear an app's Library/Caches on your leased simulator without logging out (terminates the app first; never touches Documents/Keychain; relaunch left to caller). Real-device leases fail fast (P2: no container-delete transport for third-party apps).",
+        "Clear an app's Library/Caches on your lease without logging out (terminates the app first; never touches Documents/Keychain; relaunch left to caller). Real-device leases clear via ios fsync on developer-profile installs (device-side ios-fsync:// paths; plist_keys refused); container-denied apps fail fast with a precise P2.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id whose caches to clear, e.g. com.example.App."),

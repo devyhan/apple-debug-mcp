@@ -38,27 +38,62 @@ Live-verified end-to-end 2026-10-22 on a paired iPhone 16 Pro Max:
 (confirmed via the listRunning join). Payload-URL delivery itself is
 inferred from devicectl success, not pixel-verified.
 
-## 2. `app_cache_clear` — still P2, now with a measured reason
+## 2. `app_cache_clear` — attempt-with-precise-fallback via `ios fsync`
 
-No honest non-destructive container-delete transport exists for
-third-party apps (`APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL`). Measured live
-on a paired iPhone 16 Pro Max (read-only probes, 2026-10-22):
+`RealDeviceApps.clearCache` attempts a real clear on
+developer-profile-installed apps and falls back to the precise measured
+P2 (`APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL`) for container-denied apps —
+without deleting anything on the fallback path. Flow: validate inputs
+(`Invalid udid/bundle_id` + plist shape, no spawn) → refuse
+`plist_keys` (fsync has file pull/push/rm/tree/mkdir only, no plist
+read-modify-write) → tolerant `ios kill` → `fsync tree --path=
+Library/Caches` probe → per-entry `fsync rm --r` (the probe's
+shallowest tree lines sit at prefix-depth 2, `|  |  |-Name/` — the
+parser keeps minimum-depth names, since depth-0 lines never appear).
+Terminate/rm failures
+are fail-soft `errors[]` (bounded 20, like the sim); a
+ContainerLookup/VendContainer/ActionError denial at probe OR rm time
+throws the P2 — never partial-delete + ok, never a missing-binary
+claim. A missing Caches dir (`ObjectNotFound`) is an empty clear.
+
+Result paths are DEVICE-side `ios-fsync://<udid>/<bundle>/…`
+(deliberately not host-absolute, so callers never feed them to host fs
+ops — sim results ARE host-absolute). Documents/Keychain never
+touched. Uninstall+reinstall is NOT used as a pseudo-clear (it would
+wipe Documents and log out).
+
+Write roundtrip measured live 2026-10-22 on a paired iPhone 16 Pro
+Max, dev-profile-installed `com.qa.golfzon.app` (udid
+`00008140-000555603453001C`):
 
 | Probe | Result |
 | --- | --- |
-| `ios file ls --app=<3rd-party>` | `ContainerLookupErrorDomain ErrorCode:3` |
+| `ios fsync tree --app=… --path=/` | exit 0 — full read: `Documents/` (AppLog, `.MOV`, `place_*.json`), `Library/Application Support/` (AmazonPublisherServices-config, GalbumModel.sqlite*, …), `Library/Caches/` (AdMob, WebKit/NetworkCache/Version 17/Blobs/…) |
+| `ios fsync mkdir --path=Library/Caches/__ios_fsync_probe__` | exit 0, silent |
+| `ios fsync push --srcPath=/tmp/fsync_probe_tiny.txt --dstPath=Library/Caches/__ios_fsync_probe__/probe.txt` | exit 0, silent |
+| tree before rm | `\|  \|  \|  \|-probe.txt` — file present |
+| `ios fsync rm --r --path=Library/Caches/__ios_fsync_probe__` | exit 0, silent |
+| tree after rm | exit 1 `{"level":"ERROR","msg":"fsync: tree view failed","err":"error listing afc dir: afc error code: 8 (ObjectNotFound)"}` — removal confirmed, Caches-wide grep count 0, nothing else touched |
+
+Contrast (same device/app): `ios file ls --app=…` prints NOTHING and
+hangs (killed by timeout, exit 124, twice; verbose stalls after
+`execute handshake`) — fsync is the transport, `file ls` unusable.
+
+Denial side (App Store / non-dev-profile apps), same device:
+
+| Probe | Result |
+| --- | --- |
 | `ios fsync tree --app=<3rd-party>` | `VendContainer denied (InstallationLookupFailed)` — "Full container access requires an app installed with a developer profile" |
+| `ios file ls --app=<3rd-party>` | `ContainerLookupErrorDomain ErrorCode:3` |
 | `devicectl device info files --domain-type appDataContainer` | `CoreDevice.ActionError error 3` (file list denied) |
 | `devicectl device copy` | to/from only — no delete verb |
 
-`ios fsync rm --r` exists but is gated on a developer-profile install
-(untestable without a dev-signed app + a write op — out of scope) and
-its flag mapping (`--path` vs `--srcPath/--dstPath`) is ambiguous in
-help text. Uninstall+reinstall would wipe Documents and log out,
-violating the no-logout contract, so it is NOT used as a pseudo-clear.
-
-Inputs are still validated first (`Invalid udid/bundle_id`, no spawn)
-so malformed calls fail identically on both lease kinds.
+Flag map (go-ios 1.3.2, full `fsync --help`): `ios fsync
+[--app=bundleId] [options] (pull | push) --srcPath=<src> --dstPath=
+<dst>` and `ios fsync [--app=bundleId] [options] (rm [--r] | tree |
+mkdir) --path=<target>` — rm/tree/mkdir take `--path`, pull/push take
+`--srcPath/--dstPath`. Bare `tree` without `--path` prints usage,
+exit 0. Per-subcommand `--help` prints the same generic line.
 
 ## 3. Handler routing
 
@@ -71,17 +106,31 @@ one") is deleted — it was false for open-url once measured.
 ## 4. Verification
 
 - Failing-test-first: 6 new `test/realdevices.test.ts` cases failed on
-  the P1 stubs, then passed after the fix.
+  the P1 stubs, then passed after the fix; 10 more (fsync
+  attempt/fallback matrix + tree parser) failed on the P2 stub, then
+  passed after the attempt-with-precise-fallback fix.
 - `npm run build`, `npm run typecheck`, full `vitest run` green.
 
 ## 5. Carried gaps (unresolved)
 
 - ~~End-to-end `devicectl … Safari --payload-url` open~~ — RESOLVED
   2026-10-22 (live-verified, §1).
-- `ios webinspector launch` preconditions (Remote Automation, tunnel,
-  `--bundle-id` default) — help text only.
-- `ios fsync rm --r` on a developer-profile-installed app (needs a
-  dev-signed test app + a write op).
+- ~~`ios fsync rm --r` on a developer-profile-installed app~~ —
+  RESOLVED 2026-10-22: full mkdir/push/tree/rm roundtrip SUCCEEDED on
+  dev-profile-installed `com.qa.golfzon.app` (exit-0 silent writes,
+  `ObjectNotFound`-verified deletion, §2). Implemented as
+  attempt-with-precise-fallback in `RealDeviceApps.clearCache`.
+- `ios webinspector launch` success-path output — CARRIED (out of
+  scope, no settings changed). Measured 2026-10-22: tunnel UP for
+  `00008140-000555603453001C`, but live `webinspector launch` fails
+  exit 1 verbatim `{"level":"ERROR","msg":"failed starting automation
+  session","err":"remote automation is not enabled on the device;
+  enable Settings > Safari > Advanced > Remote Automation, then
+  retry"}` — the single blocker is the device-side toggle
+  (Settings > Safari > Advanced > Remote Automation, currently OFF).
+  Usage: `ios webinspector launch <url>
+  [--bundle-id=<bundleID>] [--timeout=<seconds>] [options]`
+  (`ios webinspector --help` alone errors `unknown help topic`).
 - Uninstall keychain-persistence / reinstall data-loss semantics.
 - `devicectl copy to --remove-existing-content=true` pseudo-clear —
   speculative, still dev-profile-gated.

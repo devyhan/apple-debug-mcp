@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ExecError, Runner } from "../src/exec.js";
-import { RealDeviceApps, RealDevices, mapDevicectlDevice } from "../src/realdevices.js";
+import { RealDeviceApps, RealDevices, mapDevicectlDevice, parseFsyncTreeTopLevel } from "../src/realdevices.js";
 
 const FIXTURES = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 
@@ -259,21 +259,204 @@ describe("RealDeviceApps", () => {
     );
   });
 
-  it("clearCache validates inputs without spawning, then fails with a precise measured P2", async () => {
+  it("clearCache validates inputs without spawning, then maps fsync denials to the precise measured P2", async () => {
     const run = stubRunner({});
     const apps = new RealDeviceApps({ runner: run });
     await expect(apps.clearCache("R1", "")).rejects.toThrow(/bundle_id/i);
     await expect(apps.clearCache("", "com.example.App")).rejects.toThrow(/udid/i);
+    await expect(
+      apps.clearCache("R1", "com.example.App", { plistKeys: [{ plist: "Library/Preferences/x.plist", keys: [] }] }),
+    ).rejects.toThrow(/keys must be a non-empty array/);
     expect(run.calls).toHaveLength(0);
-    const err = await apps.clearCache("R1", "com.example.App").catch((e) => e as Error);
-    expect(err.message).toMatch(/P2/);
-    expect(err.message).toMatch(/container-delete/);
-    expect(err.message).toMatch(/developer.profile/);
-    expect(err.message).toMatch(/ContainerLookupErrorDomain/);
+
+    // Each measured denial form → the SAME precise P2, never a
+    // missing-binary claim, and no rm spawned (probe-before-delete).
+    const denials = [
+      "ContainerLookupErrorDomain ErrorCode:3",
+      "VendContainer denied (InstallationLookupFailed): Full container access requires an app installed with a developer profile",
+      "CoreDevice.ActionError error 3",
+    ];
+    for (const denial of denials) {
+      const denied = stubRunner({
+        ios: (args) => {
+          if (args[0] === "kill") return { stdout: "", stderr: "" };
+          throw new ExecError("ios", args, 1, "", denial);
+        },
+      });
+      const err = await new RealDeviceApps({ runner: denied }).clearCache("R1", "com.example.App").catch((e) => e as Error);
+      expect(err.message).toMatch(/P2/);
+      expect(err.message).toMatch(/container-delete/);
+      expect(err.message).toMatch(/developer.profile/);
+      expect(err.message).toMatch(/ContainerLookupErrorDomain/);
+      expect(err.message).not.toContain("is not installed");
+      expect(denied.calls.filter((c) => c.args[1] === "rm")).toHaveLength(0);
+    }
+  });
+
+  it("clearCache clears Caches via fsync tree + per-entry rm on dev-profile installs", async () => {
+    const tree = "Library/Caches\n|-AdMob\n|-Assets/\n|  |-nested.txt\n|-probe.txt\n";
+    const run = stubRunner({
+      ios: (args) => {
+        if (args[0] === "kill") return { stdout: "", stderr: "" };
+        if (args[0] === "fsync" && args[1] === "tree") return { stdout: tree, stderr: "" };
+        if (args[0] === "fsync" && args[1] === "rm") return { stdout: "", stderr: "" };
+        throw new Error(`unexpected ios call: ${args.join(" ")}`);
+      },
+    });
+    const r = await new RealDeviceApps({ runner: run }).clearCache("R1", "com.example.App");
+    expect(run.calls[0]).toEqual({ bin: "ios", args: ["kill", "com.example.App", "--udid=R1"] });
+    expect(run.calls[1]).toEqual({
+      bin: "ios",
+      args: ["fsync", "tree", "--app=com.example.App", "--udid=R1", "--path=Library/Caches"],
+    });
+    expect(run.calls.filter((c) => c.args[1] === "rm")).toEqual([
+      { bin: "ios", args: ["fsync", "rm", "--r", "--app=com.example.App", "--udid=R1", "--path=Library/Caches/AdMob"] },
+      { bin: "ios", args: ["fsync", "rm", "--r", "--app=com.example.App", "--udid=R1", "--path=Library/Caches/Assets"] },
+      { bin: "ios", args: ["fsync", "rm", "--r", "--app=com.example.App", "--udid=R1", "--path=Library/Caches/probe.txt"] },
+    ]);
+    expect(r).toMatchObject({
+      container: "ios-fsync://R1/com.example.App",
+      cachesDir: "ios-fsync://R1/com.example.App/Library/Caches",
+      deletedCount: 3,
+      terminated: true,
+      errors: [],
+      plistKeysRemoved: [],
+    });
+    expect(r.deleted).toEqual([
+      "ios-fsync://R1/com.example.App/Library/Caches/AdMob",
+      "ios-fsync://R1/com.example.App/Library/Caches/Assets",
+      "ios-fsync://R1/com.example.App/Library/Caches/probe.txt",
+    ]);
+  });
+
+  it("clearCache tolerates terminate failure and per-entry rm failure (fail-soft)", async () => {
+    const tree = "Library/Caches\n|-a\n|-b\n";
+    const run = stubRunner({
+      ios: (args) => {
+        if (args[0] === "kill") throw new ExecError("ios", args, 1, "", "process not found");
+        if (args[0] === "fsync" && args[1] === "tree") return { stdout: tree, stderr: "" };
+        if (args[0] === "fsync" && args[1] === "rm") {
+          if (args.includes("--path=Library/Caches/a")) throw new ExecError("ios", args, 1, "", "afc write denied for a");
+          return { stdout: "", stderr: "" };
+        }
+        throw new Error(`unexpected ios call: ${args.join(" ")}`);
+      },
+    });
+    const r = await new RealDeviceApps({ runner: run }).clearCache("R1", "com.example.App");
+    expect(r.terminated).toBe(false);
+    expect(r.deletedCount).toBe(1);
+    expect(r.deleted).toEqual(["ios-fsync://R1/com.example.App/Library/Caches/b"]);
+    expect(r.errors.join("\n")).toMatch(/terminate.*process not found/s);
+    expect(r.errors.join("\n")).toMatch(/delete a/);
+  });
+
+  it("clearCache treats a missing Caches dir (ObjectNotFound) as empty, with no deletes", async () => {
+    const run = stubRunner({
+      ios: (args) => {
+        if (args[0] === "kill") return { stdout: "", stderr: "" };
+        throw new ExecError(
+          "ios",
+          args,
+          1,
+          "",
+          '{"level":"ERROR","msg":"fsync: tree view failed","err":"error listing afc dir: afc error code: 8 (ObjectNotFound)"}',
+        );
+      },
+    });
+    const r = await new RealDeviceApps({ runner: run }).clearCache("R1", "com.example.App");
+    expect(r.deleted).toEqual([]);
+    expect(r.deletedCount).toBe(0);
+    expect(r.terminated).toBe(true);
+    expect(run.calls.filter((c) => c.args[1] === "rm")).toHaveLength(0);
+  });
+
+  it("clearCache refuses plist_keys on real devices without spawning", async () => {
+    const run = stubRunner({ ios: () => ({ stdout: "", stderr: "" }) });
+    const err = await new RealDeviceApps({ runner: run })
+      .clearCache("R1", "com.example.App", { plistKeys: [{ plist: "Library/Preferences/com.example.App.plist", keys: ["k"] }] })
+      .catch((e) => e as Error);
+    expect(err.message).toMatch(/plist_keys.*not supported.*fsync/s);
+    expect(run.calls).toHaveLength(0);
+  });
+
+  it("clearCache maps an rm-time denial to P2 instead of partial-delete + ok", async () => {
+    const tree = "Library/Caches\n|-a\n|-b\n";
+    const run = stubRunner({
+      ios: (args) => {
+        if (args[0] === "kill") return { stdout: "", stderr: "" };
+        if (args[0] === "fsync" && args[1] === "tree") return { stdout: tree, stderr: "" };
+        throw new ExecError("ios", args, 1, "", "ContainerLookupErrorDomain ErrorCode:3");
+      },
+    });
+    await expect(new RealDeviceApps({ runner: run }).clearCache("R1", "com.example.App")).rejects.toThrow(
+      /P2.*container-delete/s,
+    );
+  });
+
+  it("clearCache keeps the install hint when ios is genuinely missing (probe ENOENT)", async () => {
+    const run = stubRunner({
+      ios: () => {
+        throw new ExecError("ios", ["fsync"], "ENOENT", "", "spawn ios ENOENT");
+      },
+    });
+    const err = await new RealDeviceApps({ runner: run }).clearCache("R1", "com.example.App").catch((e) => e as Error);
+    expect(err.message).toMatch(/not installed.*npm install -g go-ios/s);
+    expect(err.message).not.toMatch(/P2/);
+  });
+
+  it("clearCache refuses escaping tree entries without spawning rm for them", async () => {
+    const tree = "Library/Caches\n|-ok\n|-../evil\n|-a/b\n";
+    const run = stubRunner({
+      ios: (args) => {
+        if (args[0] === "kill") return { stdout: "", stderr: "" };
+        if (args[0] === "fsync" && args[1] === "tree") return { stdout: tree, stderr: "" };
+        if (args[0] === "fsync" && args[1] === "rm") return { stdout: "", stderr: "" };
+        throw new Error(`unexpected ios call: ${args.join(" ")}`);
+      },
+    });
+    const r = await new RealDeviceApps({ runner: run }).clearCache("R1", "com.example.App");
+    expect(r.deleted).toEqual(["ios-fsync://R1/com.example.App/Library/Caches/ok"]);
+    expect(r.errors.join("\n")).toMatch(/refused to delete outside Caches/);
+    expect(run.calls.filter((c) => c.args[1] === "rm")).toHaveLength(1);
   });
 
   it("checkAvailable resolves with the ios version", async () => {
     await expect(new RealDeviceApps({ runner: stubRunner({}) }).checkAvailable()).resolves.toContain("go-ios");
+  });
+});
+
+describe("parseFsyncTreeTopLevel", () => {
+  it("returns sorted depth-0 entries, skipping nested lines and the root", () => {
+    const out = "Library/Caches\n|-probe.txt\n|  |-nested.txt\n|  |  |  |-probe.txt\n|-AdMob\n";
+    expect(parseFsyncTreeTopLevel(out)).toEqual(["AdMob", "probe.txt"]);
+  });
+
+  it("strips a trailing dir slash and skips blank lines", () => {
+    expect(parseFsyncTreeTopLevel("Library/Caches\n\n|-Assets/\n")).toEqual(["Assets"]);
+  });
+
+  it("returns [] for empty output", () => {
+    expect(parseFsyncTreeTopLevel("")).toEqual([]);
+    expect(parseFsyncTreeTopLevel("Library/Caches\n")).toEqual([]);
+  });
+
+  it("keeps the shallowest depth of real --path=Library/Caches output (depth 2, no depth-0 lines)", () => {
+    // Verbatim head of `ios fsync tree --path=Library/Caches` on a paired
+    // iPhone 16 Pro Max (go-ios 1.3.2); shallowest entries sit at depth 2.
+    const out = [
+      "|  |  |-AdMob/",
+      "|  |  |  |-crash_reporting/",
+      "|  |  |  |  |-symbol_table.txt",
+      "|  |  |-AdViewer/",
+      "|  |  |-Assets/",
+      "|  |  |-CBPrefetchCacheFolder/",
+    ].join("\n");
+    expect(parseFsyncTreeTopLevel(out)).toEqual(["AdMob", "AdViewer", "Assets", "CBPrefetchCacheFolder"]);
+  });
+
+  it("ignores non-tree noise lines", () => {
+    const out = '{"level":"INFO","msg":"x"}\n|  |  |-AdMob/\nnot a tree line\n';
+    expect(parseFsyncTreeTopLevel(out)).toEqual(["AdMob"]);
   });
 });
 

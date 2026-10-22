@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { assertPlistTargetShape } from "./appcache.js";
 import type { CacheClearOptions, CacheClearResult } from "./appcache.js";
 import type { AppOps, LaunchResult } from "./appops.js";
 import type { DeviceTransport } from "./devicekind.js";
@@ -25,16 +26,17 @@ export const APP_OPEN_URL_NON_HTTP_DETAIL =
 
 /**
  * Error detail for cache-clear on real hardware (P2): no container-delete
- * transport for third-party apps. Measured live on a paired iPhone 16 Pro
- * Max: `ios file ls --app=<3rd-party>` → ContainerLookupErrorDomain/3,
- * `ios fsync tree` → VendContainer denied (full container access needs a
- * developer-profile install), `devicectl device info files --domain-type
- * appDataContainer` → CoreDevice.ActionError 3, and `devicectl device copy`
- * is to/from only (no delete). Uninstall+reinstall would wipe Documents
- * and log out, violating the no-logout contract.
+ * transport for THIS app. Measured live on a paired iPhone 16 Pro Max:
+ * `ios fsync tree` on an App Store app → VendContainer denied
+ * (InstallationLookupFailed — "Full container access requires an app
+ * installed with a developer profile") or ContainerLookupErrorDomain/3,
+ * while a full fsync mkdir/push/tree/rm roundtrip SUCCEEDS on a
+ * developer-profile-installed app. `devicectl device copy` is to/from
+ * only (no delete). Uninstall+reinstall would wipe Documents and log
+ * out, violating the no-logout contract.
  */
 export const APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL =
-  "no container-delete transport for third-party apps (measured on a paired iPhone: ios file ls → ContainerLookupErrorDomain/3, ios fsync → VendContainer denied — full container access needs a developer-profile install; devicectl copy has no delete; uninstall+reinstall would wipe Documents and log out)";
+  "no container-delete transport for this app (measured on a paired iPhone: ios fsync tree → ContainerLookupErrorDomain/3 or VendContainer denied unless the app was installed with a developer profile — a full fsync mkdir/push/tree/rm roundtrip succeeds on dev-profile installs; devicectl copy has no delete; uninstall+reinstall would wipe Documents and log out)";
 
 function assertUdid(udid: string): void {
   if (udid.trim().length === 0) throw new Error("Invalid udid (expected a non-empty string)");
@@ -219,6 +221,55 @@ interface DevicectlAppsJson {
   result?: { apps?: { bundleIdentifier?: unknown; url?: unknown }[] };
 }
 
+/** Fail-soft error bound for real-device cache clears (mirrors the sim path). */
+const MAX_REAL_CACHE_ERRORS = 20;
+
+/** `ios fsync` denial forms measured live (all mean "no container access for this app"). */
+function isFsyncDenied(msg: string): boolean {
+  return /ContainerLookupErrorDomain|VendContainer|InstallationLookupFailed|developer.profile|ActionError/i.test(msg);
+}
+
+/**
+ * Missing-path form (NOT a denial): `afc error code: 8 (ObjectNotFound)`,
+ * measured verbatim from `ios fsync tree` on a removed path.
+ */
+function isFsyncNotFound(msg: string): boolean {
+  return /ObjectNotFound|afc error code:\s*8\b/i.test(msg);
+}
+
+function realCacheClearP2(): Error {
+  return new Error(
+    `app_cache_clear is denied for this app on a real-device lease: real-device support lands in P2 (${APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL}).`,
+  );
+}
+
+/**
+ * Top-level entry names from `ios fsync tree` output. Measured format
+ * (go-ios 1.3.2): each entry is prefixed by `"|  "` per depth level plus
+ * `"|-"` — but the shallowest depth is NOT 0: `tree
+ * --path=Library/Caches` on a paired iPhone emits `"|  |  |-AdMob/"`
+ * (depth 2) as its shallowest lines, with zero depth-0 lines. So depth is
+ * counted per line and only the minimum-depth names are kept; anything
+ * else (root line, JSON noise, blanks) never matches. A trailing `/` dir
+ * marker is stripped. Sorted for deterministic deletes.
+ */
+export function parseFsyncTreeTopLevel(output: string): string[] {
+  const found: { depth: number; name: string }[] = [];
+  for (const raw of output.split("\n")) {
+    const match = /^((?:\|  )*)\|-(.+)$/.exec(raw.replace(/\r$/, ""));
+    if (!match) continue;
+    const name = match[2]!.replace(/\s+$/, "").replace(/\/+$/, "");
+    if (name.length === 0) continue;
+    found.push({ depth: match[1]!.length / 3, name });
+  }
+  if (found.length === 0) return [];
+  const min = Math.min(...found.map((f) => f.depth));
+  return found
+    .filter((f) => f.depth === min)
+    .map((f) => f.name)
+    .sort();
+}
+
 /**
  * App lifecycle on a real device: go-ios (`ios`) backend for
  * install/uninstall/launch/terminate, devicectl for openUrl (http(s) via
@@ -304,14 +355,112 @@ export class RealDeviceApps implements AppOps {
   }
 
   /**
-   * Still P2: no honest non-destructive container-delete transport exists
-   * for third-party apps (see APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL). Inputs
-   * are validated first so malformed calls fail identically on both kinds.
+   * Attempt-with-precise-fallback cache clear (measured 2026-10-22 on a
+   * paired iPhone 16 Pro Max): developer-profile-installed apps get a
+   * real clear via `ios fsync` — tolerant `kill`, then a `tree` probe of
+   * `Library/Caches`, then per-entry `rm --r`. Container-denied apps
+   * (App Store installs) fall back to the precise P2 without deleting
+   * anything. `plist_keys` is refused: fsync has file pull/push/rm/tree/
+   * mkdir only, with no plist read-modify-write.
+   *
+   * `container`/`cachesDir`/`deleted` are DEVICE-side
+   * `ios-fsync://<udid>/<bundle>/…` paths — deliberately not
+   * host-absolute, so callers never feed them to host fs ops (sim
+   * results ARE host-absolute). Documents/Keychain are never touched.
    */
-  async clearCache(udid: string, bundleId: string, _opts: CacheClearOptions = {}): Promise<CacheClearResult> {
+  async clearCache(udid: string, bundleId: string, opts: CacheClearOptions = {}): Promise<CacheClearResult> {
     assertUdid(udid);
     assertBundleId(bundleId);
-    throw new Error(`app_cache_clear does not support real-device leases yet: real-device support lands in P2 (${APP_CACHE_CLEAR_NO_TRANSPORT_DETAIL}).`);
+    const plistTargets = opts.plistKeys ?? [];
+    for (const t of plistTargets) assertPlistTargetShape(t);
+    if (plistTargets.length > 0) {
+      throw new Error(
+        "app_cache_clear plist_keys is not supported on real-device leases: `ios fsync` offers file " +
+          "pull/push/rm/tree/mkdir only, with no plist read-modify-write (measured on go-ios 1.3.2) — " +
+          "re-run without plist_keys to clear Caches; nothing was deleted.",
+      );
+    }
+
+    const errors: string[] = [];
+    const pushError = (m: string): void => {
+      if (errors.length < MAX_REAL_CACHE_ERRORS) errors.push(m.slice(0, 300));
+    };
+    const base = `ios-fsync://${udid}/${bundleId}`;
+    const appFlag = `--app=${bundleId}`;
+    const udidFlag = `--udid=${udid}`;
+
+    // 1. Terminate first (tolerant: a non-running app is the common case).
+    // Raw runner (not this.ios): kill failures are fail-soft notes, and
+    // raw errors keep their device text for the classifiers below.
+    let terminated = true;
+    try {
+      await this.run(this.iosBin, ["kill", bundleId, udidFlag], { timeoutMs: this.execTimeoutMs });
+    } catch (err) {
+      terminated = false;
+      pushError(`terminate: ${(err as Error).message}`);
+    }
+
+    // 2. Probe Caches readability BEFORE any delete, so the P2 fallback
+    // is side-effect-free. A missing Caches dir is an empty clear.
+    let treeOut: string;
+    try {
+      const { stdout, stderr } = await this.run(
+        this.iosBin,
+        ["fsync", "tree", appFlag, udidFlag, "--path=Library/Caches"],
+        { timeoutMs: this.execTimeoutMs },
+      );
+      treeOut = `${stdout}\n${stderr}`;
+    } catch (err) {
+      const msg = (err as Error).message;
+      if (isFsyncDenied(msg)) throw realCacheClearP2();
+      if (isFsyncNotFound(msg)) {
+        return {
+          container: base,
+          cachesDir: `${base}/Library/Caches`,
+          deleted: [],
+          deletedCount: 0,
+          plistKeysRemoved: [],
+          terminated,
+          errors,
+        };
+      }
+      throw iosError(this.iosBin, "cache-clear probe", udid, err);
+    }
+
+    // 3. Per-entry `rm --r` (fail-soft like the sim path). A denial
+    // mid-run throws P2 — never partial-delete + ok.
+    const entries = parseFsyncTreeTopLevel(treeOut);
+    if (entries.length === 0 && /[|+]/.test(treeOut)) {
+      pushError("fsync tree output had no parseable top-level entries; nothing deleted");
+    }
+    const deleted: string[] = [];
+    for (const entry of entries) {
+      if (entry === "." || entry === ".." || entry.includes("/") || entry.includes("\\")) {
+        pushError(`refused to delete outside Caches: ${entry}`);
+        continue;
+      }
+      const rel = `Library/Caches/${entry}`;
+      try {
+        await this.run(this.iosBin, ["fsync", "rm", "--r", appFlag, udidFlag, `--path=${rel}`], {
+          timeoutMs: this.execTimeoutMs,
+        });
+        deleted.push(`${base}/${rel}`);
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (isFsyncDenied(msg)) throw realCacheClearP2();
+        pushError(`delete ${entry}: ${msg}`);
+      }
+    }
+
+    return {
+      container: base,
+      cachesDir: `${base}/Library/Caches`,
+      deleted,
+      deletedCount: deleted.length,
+      plistKeysRemoved: [],
+      terminated,
+      errors,
+    };
   }
 
   /**
