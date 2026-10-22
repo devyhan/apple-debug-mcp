@@ -174,3 +174,23 @@ existing verbs are byte-identical.
   wrongly whitelist a foreign relaunch. `test/appreinstall.test.ts` proves
   the wiring end-to-end (launch → reinstall → foreign check flips
   contended).
+
+## 7. P2-B scoping — measured UI transport surface (not yet wired)
+
+go-ios 1.3.2 help text (read-only, 2026-10-22) shows a complete UI family
+behind one backend — no Appium needed:
+
+- `ios ui <download|status|api|tap|swipe|longpress|type|button|
+  screenshot|source|size|orientation|app|stream|raw>` — "Control UI
+  through WebDriverAgent or DeviceKit."
+- `ios runwda [--bundleid=…] [--testrunnerbundleid=…] …` — runs WDA;
+  `ios ui download|install` fetches/signs/installs WDA or DeviceKit
+  artifacts (`ios sign app` signs with a P12 + profile).
+- `ios screenshot [--output=…] [--stream] [--port=…]` — capture or
+  MJPEG stream; `ios ax` — accessibility inspector features.
+- devicectl side: `device orientation` (control), `device notification`
+  (post/observe Darwin notifications) — narrow but native.
+
+Nothing above has been run against a device yet (needs WDA signing +
+install + a running WDA session); the P2-B workflow must ground each
+verb live before wiring. Xcode on this host: 26.6 (17F113).
