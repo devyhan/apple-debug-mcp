@@ -12,6 +12,7 @@ import type { AppOps } from "./appops.js";
 import type { LogOps } from "./logops.js";
 import { GO_IOS_INSTALL_HINT } from "./realdevices.js";
 import { Lease } from "./store.js";
+import { failureExtra, successExtra } from "./recovery.js";
 import { Symbolicator } from "./symbolicate.js";
 import { CA_DEBUG_OPTIONS, CAMERA_MIRROR_MODES, CAMERA_SOURCES, ORIENTATIONS, ServeSim } from "./servesim.js";
 import { MAX_STREAM_SEC } from "./simlog.js";
@@ -40,12 +41,17 @@ type ToolResult = {
   isError?: boolean;
 };
 
-function ok(data: unknown): ToolResult {
-  return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...(data as object) }, null, 2) }] };
+function ok(data: unknown, tool?: string): ToolResult {
+  // P2: additive `next` only — every key from data keeps its value.
+  return { content: [{ type: "text", text: JSON.stringify({ ok: true, ...(data as object), ...successExtra(tool) }, null, 2) }] };
 }
 
-function fail(message: string): ToolResult {
-  return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: message }, null, 2) }], isError: true };
+function fail(message: string, tool?: string): ToolResult {
+  // P2: additive recovery fields only — `error` keeps its text verbatim.
+  return {
+    content: [{ type: "text", text: JSON.stringify({ ok: false, error: message, ...failureExtra(message, tool) }, null, 2) }],
+    isError: true,
+  };
 }
 
 /** Top-level state/stopReason (cont/step/wait). */
@@ -310,7 +316,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         requireSimLease(holder, { verb: real.verb, phase: "sim-only", detail: real.detail });
       } catch (err) {
-        return { holder, refusal: fail((err as Error).message) };
+        return { holder, refusal: fail((err as Error).message, real.verb) };
       }
     }
     if (holder && !force) {
@@ -318,6 +324,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         holder,
         refusal: fail(
           `Simulator ${udid} is leased to session ${holder.sessionId} (lease ${holder.leaseId}). Pass force=true to proceed anyway.`,
+          real?.verb,
         ),
       };
     }
@@ -342,9 +349,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (refusal) return refusal;
         await serveSim.rotate(udid, orientation);
         if (holder) await orch.logAction(holder.leaseId, "sim_rotate", `rotate ${orientation}${force ? " (force)" : ""}`);
-        return ok({ udid, orientation });
+        return ok({ udid, orientation }, "sim_rotate");
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(serveSimError(err), "sim_rotate");
       }
     },
   );
@@ -369,9 +376,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const state = enabled ? "on" : "off";
         await serveSim.caDebug(udid, option, state);
         if (holder) await orch.logAction(holder.leaseId, "sim_ca_debug", `ca-debug ${option} ${state}${force ? " (force)" : ""}`);
-        return ok({ udid, option, enabled });
+        return ok({ udid, option, enabled }, "sim_ca_debug");
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(serveSimError(err), "sim_ca_debug");
       }
     },
   );
@@ -393,9 +400,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (refusal) return refusal;
         await serveSim.memoryWarning(udid);
         if (holder) await orch.logAction(holder.leaseId, "sim_memory_warning", `memory-warning${force ? " (force)" : ""}`);
-        return ok({ udid, memoryWarning: true });
+        return ok({ udid, memoryWarning: true }, "sim_memory_warning");
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(serveSimError(err), "sim_memory_warning");
       }
     },
   );
@@ -427,9 +434,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (holder) {
           await orch.logAction(holder.leaseId, "camera_start", `camera ${bundle_id} ${source ?? "placeholder"}${force ? " (force)" : ""}`);
         }
-        return ok({ udid, bundle_id, source: source ?? "placeholder" });
+        return ok({ udid, bundle_id, source: source ?? "placeholder" }, "camera_start");
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(serveSimError(err), "camera_start");
       }
     },
   );
@@ -454,9 +461,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (refusal) return refusal;
         await serveSim.switchSource(udid, source, file);
         if (holder) await orch.logAction(holder.leaseId, "camera_switch", `switch ${source}${force ? " (force)" : ""}`);
-        return ok({ udid, source });
+        return ok({ udid, source }, "camera_switch");
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(serveSimError(err), "camera_switch");
       }
     },
   );
@@ -477,9 +484,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const holder = await orch.leaseForUdid(udid);
         if (holder) requireSimLease(holder, { verb: "camera_mirror", phase: "sim-only", detail: "serve-sim camera preview mirroring" });
         await serveSim.mirror(udid, mode);
-        return ok({ udid, mode });
+        return ok({ udid, mode }, "camera_mirror");
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(serveSimError(err), "camera_mirror");
       }
     },
   );
@@ -497,9 +504,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ udid }) => {
       try {
         const s = await serveSim.status(udid);
-        return ok({ udid, ...s });
+        return ok({ udid, ...s }, "camera_status");
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(serveSimError(err), "camera_status");
       }
     },
   );
@@ -517,9 +524,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ udid }) => {
       try {
         await serveSim.stop(udid);
-        return ok({ udid, stopped: true });
+        return ok({ udid, stopped: true }, "camera_stop");
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(serveSimError(err), "camera_stop");
       }
     },
   );
@@ -549,9 +556,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           timeoutSec: timeout_sec ?? 5,
           maxChars: max_chars,
         });
-        return ok({ udid, log: r.stdout, truncated: r.truncated, timedOut: r.timedOut });
+        return ok({ udid, log: r.stdout, truncated: r.truncated, timedOut: r.timedOut }, "sim_log_stream");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "sim_log_stream");
       }
     },
   );
@@ -585,9 +592,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           signpost,
           maxChars: max_chars,
         });
-        return ok({ udid, log: r.stdout, truncated: r.truncated, timedOut: r.timedOut });
+        return ok({ udid, log: r.stdout, truncated: r.truncated, timedOut: r.timedOut }, "sim_log_show");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "sim_log_show");
       }
     },
   );
@@ -610,9 +617,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (held && isRealLease(held)) mapError = realStreamError;
         const { lease, url, port } = await orch.startLeaseStream(lease_id);
         await orch.logAction(lease_id, "stream_start", `stream ${url}`);
-        return ok({ lease_id, udid: lease.udid, url, port });
+        return ok({ lease_id, udid: lease.udid, url, port }, "stream_start");
       } catch (err) {
-        return fail(mapError(err));
+        return fail(mapError(err), "stream_start");
       }
     },
   );
@@ -634,9 +641,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (held && isRealLease(held)) mapError = realStreamError;
         const { lease, stopped } = await orch.stopLeaseStream(lease_id);
         await orch.logAction(lease_id, "stream_stop", stopped ? "stream stopped" : "stream already stopped");
-        return ok({ lease_id, udid: lease.udid, stopped });
+        return ok({ lease_id, udid: lease.udid, stopped }, "stream_stop");
       } catch (err) {
-        return fail(mapError(err));
+        return fail(mapError(err), "stream_stop");
       }
     },
   );
@@ -657,9 +664,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const lease = await orch.resolveLease(lease_id);
         await appsFor(lease, "app_open_url").openUrl(lease.udid, url);
         await orch.logAction(lease_id, "app_open_url", `open ${url.slice(0, 120)}`);
-        return ok({ lease_id, udid: lease.udid, url });
+        return ok({ lease_id, udid: lease.udid, url }, "app_open_url");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "app_open_url");
       }
     },
   );
@@ -680,9 +687,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const lease = await orch.resolveLease(lease_id);
         await appsFor(lease, "app_install").install(lease.udid, app_path);
         await orch.logAction(lease_id, "app_install", `install ${path.basename(app_path).slice(0, 120)}`);
-        return ok({ lease_id, udid: lease.udid, app_path });
+        return ok({ lease_id, udid: lease.udid, app_path }, "app_install");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "app_install");
       }
     },
   );
@@ -703,9 +710,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const lease = await orch.resolveLease(lease_id);
         await appsFor(lease, "app_uninstall").uninstall(lease.udid, bundle_id);
         await orch.logAction(lease_id, "app_uninstall", `uninstall ${bundle_id}`);
-        return ok({ lease_id, udid: lease.udid, bundle_id });
+        return ok({ lease_id, udid: lease.udid, bundle_id }, "app_uninstall");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "app_uninstall");
       }
     },
   );
@@ -749,13 +756,13 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           // lease-launched claim is dropped exactly like terminate.
           orch.markAppTerminated(lease_id, bundle_id);
           await orch.logAction(lease_id, "app_reinstall", `reinstall ${bundle_id} HALF-STATE (removed, install failed)`);
-          return fail(`app_reinstall half-state: app ${bundle_id} was removed but install failed: ${(err as Error).message}`);
+          return fail(`app_reinstall half-state: app ${bundle_id} was removed but install failed: ${(err as Error).message}`, "app_reinstall");
         }
         orch.markAppTerminated(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_reinstall", `reinstall ${bundle_id} from ${path.basename(app_path).slice(0, 120)}`);
-        return ok({ lease_id, udid: lease.udid, bundle_id, uninstalled: true, installed: true, logged_out: true });
+        return ok({ lease_id, udid: lease.udid, bundle_id, uninstalled: true, installed: true, logged_out: true }, "app_reinstall");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "app_reinstall");
       }
     },
   );
@@ -778,9 +785,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const { pid, output } = await appsFor(lease, "app_launch").launch(lease.udid, bundle_id, args ?? []);
         orch.markAppLaunched(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_launch", `launch ${bundle_id} (pid ${pid})`);
-        return ok({ lease_id, udid: lease.udid, bundle_id, pid, output });
+        return ok({ lease_id, udid: lease.udid, bundle_id, pid, output }, "app_launch");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "app_launch");
       }
     },
   );
@@ -802,9 +809,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         await appsFor(lease, "app_terminate").terminate(lease.udid, bundle_id);
         orch.markAppTerminated(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_terminate", `terminate ${bundle_id}`);
-        return ok({ lease_id, udid: lease.udid, bundle_id });
+        return ok({ lease_id, udid: lease.udid, bundle_id }, "app_terminate");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "app_terminate");
       }
     },
   );
@@ -847,9 +854,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           plist_keys_removed: r.plistKeysRemoved,
           terminated: r.terminated,
           errors: r.errors,
-        });
+        }, "app_cache_clear");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "app_cache_clear");
       }
     },
   );
@@ -880,9 +887,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           timeLimitSec: duration_sec ?? 5,
         });
         await orch.logAction(lease_id, "profile_trace", `trace ${used} ${duration_sec ?? 5}s -> ${path.basename(output)}`);
-        return ok({ lease_id, udid: lease.udid, path: output, template: used, duration_sec: duration_sec ?? 5 });
+        return ok({ lease_id, udid: lease.udid, path: output, template: used, duration_sec: duration_sec ?? 5 }, "profile_trace");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "profile_trace");
       }
     },
   );
@@ -925,9 +932,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         }
         const target = bundle_id !== undefined ? bundle_id : `pid ${pid}`;
         await orch.logAction(lease_id, "debug_attach", `attach ${target} (session ${sessionId})`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result: response });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result: response }, "debug_attach");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_attach");
       }
     },
   );
@@ -980,10 +987,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
             : null,
         ].filter((op): op is string => op !== null);
         if (ops.length === 0) {
-          return fail("debug_break needs exactly one op: set (file+line), list=true, delete=<id>, or exception=[...].");
+          return fail("debug_break needs exactly one op: set (file+line), list=true, delete=<id>, or exception=[...].", "debug_break");
         }
         if (ops.length > 1) {
-          return fail(`debug_break takes exactly one op per call (got ${ops.join("+")}).`);
+          return fail(`debug_break takes exactly one op per call (got ${ops.join("+")}).`, "debug_break");
         }
         const lease = await orch.resolveLease(lease_id);
         requireSimLease(lease, { verb: "debug_break", phase: "P3", detail: DEBUG_REAL_DETAIL });
@@ -992,7 +999,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (op === "list") {
           const result = await lldmdb.breakList(sessionId);
           await orch.logAction(lease_id, "debug_break", "break list");
-          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result }, "debug_break");
         }
         if (op === "delete") {
           const ids = del as number | number[];
@@ -1000,17 +1007,17 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
             ? await lldmdb.breakDeleteMany(sessionId, ids)
             : await lldmdb.breakDelete(sessionId, ids);
           await orch.logAction(lease_id, "debug_break", `break delete ${Array.isArray(ids) ? ids.join(",") : ids}`);
-          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result }, "debug_break");
         }
         if (op === "exception") {
           const result = await lldmdb.breakException(sessionId, exception as string[]);
           const summary = (exception as string[]).length === 0 ? "break exception (clear)" : `break exception ${(exception as string[]).join(",")}`;
           await orch.logAction(lease_id, "debug_break", summary.slice(0, 160));
-          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result }, "debug_break");
         }
         if (breakpoints !== undefined) {
           if (file !== undefined || line !== undefined || condition !== undefined || hit_condition !== undefined) {
-            return fail("debug_break set takes either file+line or breakpoints=[...], not both.");
+            return fail("debug_break set takes either file+line or breakpoints=[...], not both.", "debug_break");
           }
           const result = await lldmdb.breakSetMany(
             sessionId,
@@ -1022,10 +1029,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
             })),
           );
           await orch.logAction(lease_id, "debug_break", `break set x${breakpoints.length}`.slice(0, 160));
-          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result }, "debug_break");
         }
         if (file === undefined || line === undefined) {
-          return fail("debug_break set needs both file and line.");
+          return fail("debug_break set needs both file and line.", "debug_break");
         }
         const result = await lldmdb.breakSet(sessionId, file, line, {
           ...(condition !== undefined ? { condition } : {}),
@@ -1036,9 +1043,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           hit_condition !== undefined ? ` hit ${hit_condition}` : "",
         ].join("");
         await orch.logAction(lease_id, "debug_break", `break ${file}:${line}${extras}`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, op, result }, "debug_break");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_break");
       }
     },
   );
@@ -1070,9 +1077,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           // tracking must never break the tool path.
         }
         await orch.logAction(lease_id, "debug_continue", `continue (wait ${wait_sec ?? 60}s)`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), ...(waitElapsed ? { wait_elapsed: true } : {}), result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), ...(waitElapsed ? { wait_elapsed: true } : {}), result }, "debug_continue");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_continue");
       }
     },
   );
@@ -1100,9 +1107,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           depth !== undefined ? `depth ${depth}` : "",
         ].filter((s) => s.length > 0);
         await orch.logAction(lease_id, "debug_bt", qualifiers.length > 0 ? `bt (${qualifiers.join(", ")})` : "bt");
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_bt");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_bt");
       }
     },
   );
@@ -1125,9 +1132,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.locals(sessionId, frame ?? 0);
         await orch.logAction(lease_id, "debug_locals", `locals (frame ${frame ?? 0})`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_locals");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_locals");
       }
     },
   );
@@ -1151,9 +1158,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.eval(sessionId, expr, frame ?? 0);
         await orch.logAction(lease_id, "debug_eval", `eval ${JSON.stringify(expr.slice(0, 80))}`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_eval");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_eval");
       }
     },
   );
@@ -1181,9 +1188,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           // tracking must never break the tool path.
         }
         await orch.logAction(lease_id, "debug_step", `step ${mode ?? "over"}`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), result }, "debug_step");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_step");
       }
     },
   );
@@ -1202,7 +1209,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       try {
         const lease = await orch.resolveLease(lease_id);
         const sessionId = lease.debugSessionId ?? null;
-        if (!sessionId) return ok({ lease_id, udid: lease.udid, stopped: false });
+        if (!sessionId) return ok({ lease_id, udid: lease.udid, stopped: false }, "debug_detach");
         try {
           const result = await lldmdb.stop(sessionId);
           await orch.clearDebugSession(lease_id);
@@ -1212,7 +1219,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
             // tracking must never break the tool path.
           }
           await orch.logAction(lease_id, "debug_detach", `detach session ${sessionId}`);
-          return ok({ lease_id, udid: lease.udid, session_id: sessionId, stopped: true, result });
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, stopped: true, result }, "debug_detach");
         } catch (err) {
           if (/no session with id/i.test((err as Error).message)) {
             await orch.clearDebugSession(lease_id);
@@ -1222,12 +1229,12 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
               // tracking must never break the tool path.
             }
             await orch.logAction(lease_id, "debug_detach", `detach session ${sessionId} (already gone)`);
-            return ok({ lease_id, udid: lease.udid, session_id: sessionId, stopped: false });
+            return ok({ lease_id, udid: lease.udid, session_id: sessionId, stopped: false }, "debug_detach");
           }
           throw err;
         }
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_detach");
       }
     },
   );
@@ -1253,9 +1260,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (lease_id !== undefined) {
           await orch.logAction(lease_id, "debug_sessions", "sessions");
         }
-        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), result });
+        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), result }, "debug_sessions");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_sessions");
       }
     },
   );
@@ -1277,7 +1284,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, path: target, bundle_id, args }) => {
       try {
         if ((target === undefined) === (bundle_id === undefined)) {
-          return fail("debug_launch needs exactly one of path or bundle_id.");
+          return fail("debug_launch needs exactly one of path or bundle_id.", "debug_launch");
         }
         const lease = await orch.resolveLease(lease_id);
         requireSimLease(lease, { verb: "debug_launch", phase: "P3", detail: DEBUG_REAL_DETAIL });
@@ -1286,7 +1293,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           try {
             ({ pid } = await simApps.launch(lease.udid, bundle_id, args ?? []));
           } catch (err) {
-            return fail((err as Error).message);
+            return fail((err as Error).message, "debug_launch");
           }
           const { sessionId, response } = await lldmdb.attach({ bundleId: bundle_id });
           try {
@@ -1308,7 +1315,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
             }
           }
           await orch.logAction(lease_id, "debug_launch", `launch ${bundle_id} (pid ${pid}, session ${sessionId})`.slice(0, 160));
-          return ok({ lease_id, udid: lease.udid, session_id: sessionId, bundle_id, pid, result: response });
+          return ok({ lease_id, udid: lease.udid, session_id: sessionId, bundle_id, pid, result: response }, "debug_launch");
         }
         const fsPath = target as string; // exactly-one check above guarantees this
         const { sessionId, response } = await lldmdb.launch(fsPath, args ?? []);
@@ -1331,9 +1338,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           }
         }
         await orch.logAction(lease_id, "debug_launch", `launch ${path.basename(fsPath)} (session ${sessionId})`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result: response });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result: response }, "debug_launch");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_launch");
       }
     },
   );
@@ -1359,9 +1366,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (lease_id !== undefined) {
           await orch.logAction(lease_id, "debug_doctor", "doctor");
         }
-        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), result });
+        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), result }, "debug_doctor");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_doctor");
       }
     },
   );
@@ -1383,9 +1390,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.threads(sessionId);
         await orch.logAction(lease_id, "debug_threads", "threads");
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_threads");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_threads");
       }
     },
   );
@@ -1408,9 +1415,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.scopes(sessionId, frame ?? 0);
         await orch.logAction(lease_id, "debug_scopes", `scopes (frame ${frame ?? 0})`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_scopes");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_scopes");
       }
     },
   );
@@ -1434,9 +1441,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.expand(sessionId, ref);
         await orch.logAction(lease_id, "debug_expand", `expand ref ${ref}`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_expand");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_expand");
       }
     },
   );
@@ -1461,9 +1468,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.setVar(sessionId, target, value, frame ?? 0);
         await orch.logAction(lease_id, "debug_set_var", `set ${target} = ${value.slice(0, 60)}`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_set_var");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_set_var");
       }
     },
   );
@@ -1488,9 +1495,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const result = await lldmdb.output(sessionId, clear ?? false);
         await orch.logAction(lease_id, "debug_output", clear === true ? "output (clear)" : "output");
         const { output, truncated } = truncateOutput(result, max_chars ?? DEFAULT_BOUND_MAX_CHARS);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result, output, truncated });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result, output, truncated }, "debug_output");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_output");
       }
     },
   );
@@ -1523,9 +1530,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           // tracking must never break the tool path.
         }
         await orch.logAction(lease_id, "debug_run_until", `run-until ${file}:${line}${cleanup === true ? " (cleanup)" : ""}`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_run_until");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_run_until");
       }
     },
   );
@@ -1557,9 +1564,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           // tracking must never break the tool path.
         }
         await orch.logAction(lease_id, "debug_wait", `wait (timeout ${timeout ?? 60}s)`);
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), ...(waitElapsed ? { wait_elapsed: true } : {}), result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), ...(waitElapsed ? { wait_elapsed: true } : {}), result }, "debug_wait");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_wait");
       }
     },
   );
@@ -1584,7 +1591,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         try {
           if (debugRobustnessEnabled() && debugStates.get(sessionId) === "stopped") {
             await orch.logAction(lease_id, "debug_interrupt", "interrupt (already stopped, skipped)");
-            return ok({ lease_id, udid: lease.udid, session_id: sessionId, state: "stopped", already_stopped: true, result: alreadyStoppedResult() });
+            return ok({ lease_id, udid: lease.udid, session_id: sessionId, state: "stopped", already_stopped: true, result: alreadyStoppedResult() }, "debug_interrupt");
           }
         } catch {
           // fall through to llmdb.
@@ -1602,9 +1609,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           // tracking must never break the tool path.
         }
         await orch.logAction(lease_id, "debug_interrupt", "interrupt");
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...(waitElapsed ? { wait_elapsed: true } : {}), ...(alreadyStopped ? { already_stopped: true } : {}), result });
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...(waitElapsed ? { wait_elapsed: true } : {}), ...(alreadyStopped ? { already_stopped: true } : {}), result }, "debug_interrupt");
       } catch (err) {
-        return fail(lldmdbError(err));
+        return fail(lldmdbError(err), "debug_interrupt");
       }
     },
   );
@@ -1646,9 +1653,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         if (lease_id !== undefined) {
           await orch.logAction(lease_id, "symbolicate", `symbolicate ${addresses.length} pc(s) ${path.basename(result.binary)}`.slice(0, 160));
         }
-        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), ...result });
+        return ok({ ...(lease_id !== undefined ? { lease_id } : {}), ...(udid !== undefined ? { udid } : {}), ...result }, "symbolicate");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "symbolicate");
       }
     },
   );
@@ -1667,9 +1674,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, limit }) => {
       try {
         const actions = orch.leaseActions(lease_id, limit);
-        return ok({ lease_id, actions });
+        return ok({ lease_id, actions }, "lease_actions");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "lease_actions");
       }
     },
   );
@@ -1701,9 +1708,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const count = rules?.length ?? 0;
         const quic = quicBlocked ? ", quic blocked" : "";
         await orch.logAction(lease_id, "net_proxy_start", `proxy :${port}${count > 0 ? ` (${count} rules)` : " (transparent)"}${quic}`);
-        return ok({ lease_id, udid: lease.udid, port, pid, rule_count: count, quic_blocked: quicBlocked });
+        return ok({ lease_id, udid: lease.udid, port, pid, rule_count: count, quic_blocked: quicBlocked }, "net_proxy_start");
       } catch (err) {
-        return fail(netProxyError(err));
+        return fail(netProxyError(err), "net_proxy_start");
       }
     },
   );
@@ -1726,9 +1733,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         requireSimLease(lease, { verb: "net_proxy_set_rules", phase: "P4", detail: NET_REAL_DETAIL });
         await orch.setLeaseProxyRules(lease_id, rules);
         await orch.logAction(lease_id, "net_proxy_set_rules", `rules := ${rules.length} rule(s)`);
-        return ok({ lease_id, udid: lease.udid, rule_count: rules.length });
+        return ok({ lease_id, udid: lease.udid, rule_count: rules.length }, "net_proxy_set_rules");
       } catch (err) {
-        return fail(netProxyError(err));
+        return fail(netProxyError(err), "net_proxy_set_rules");
       }
     },
   );
@@ -1754,9 +1761,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           udid: lease.udid,
           stopped,
           ...(flowLogPath !== undefined ? { flow_log_path: flowLogPath } : {}),
-        });
+        }, "net_proxy_stop");
       } catch (err) {
-        return fail(netProxyError(err));
+        return fail(netProxyError(err), "net_proxy_stop");
       }
     },
   );
@@ -1802,9 +1809,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           ...(addonPath !== undefined ? { addon_path: addonPath } : {}),
           ...(flowLogPath !== undefined ? { flow_log_path: flowLogPath } : {}),
           ...(lastFlowLogPath !== undefined ? { last_flow_log_path: lastFlowLogPath } : {}),
-        });
+        }, "net_proxy_status");
       } catch (err) {
-        return fail(netProxyError(err));
+        return fail(netProxyError(err), "net_proxy_status");
       }
     },
   );
@@ -1840,9 +1847,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const lease = await orch.resolveLease(lease_id);
         const { pid, pcapPath } = await orch.startLeaseCapture(lease_id, { filter, snaplen, interface: iface });
         await orch.logAction(lease_id, "net_capture_start", `capture pid ${pid}${filter ? ` filter ${JSON.stringify(filter)}` : ""} -> ${pcapPath}`);
-        return ok({ lease_id, udid: lease.udid, pid, pcap_path: pcapPath });
+        return ok({ lease_id, udid: lease.udid, pid, pcap_path: pcapPath }, "net_capture_start");
       } catch (err) {
-        return fail(netCaptureError(err));
+        return fail(netCaptureError(err), "net_capture_start");
       }
     },
   );
@@ -1871,9 +1878,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           stopped,
           ...(pcapPath !== undefined ? { pcap_path: pcapPath } : {}),
           ...(summary !== undefined ? { summary } : {}),
-        });
+        }, "net_capture_stop");
       } catch (err) {
-        return fail(netCaptureError(err));
+        return fail(netCaptureError(err), "net_capture_stop");
       }
     },
   );
@@ -1906,9 +1913,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           ...(pcapPath !== undefined ? { pcap_path: pcapPath } : {}),
           ...(startedAt !== undefined ? { started_at: startedAt } : {}),
           ...(bytesWritten !== undefined ? { bytes_written: bytesWritten } : {}),
-        });
+        }, "net_capture_status");
       } catch (err) {
-        return fail(netCaptureError(err));
+        return fail(netCaptureError(err), "net_capture_status");
       }
     },
   );
@@ -1992,12 +1999,13 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           return fail(
             `net_assert_flow: saw ${count} matching flow(s) for ${JSON.stringify(url_regex)} ` +
               `(needed ${needed}) out of ${total} total (${newSinceCall} new since call) within ${timeout_sec ?? 5}s.`,
+            "net_assert_flow",
           );
         }
         await orch.logAction(lease_id, "net_assert_flow", `assert ${JSON.stringify(url_regex)}: ${count}/${total}`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, count, total, new_since_call: newSinceCall, matched });
+        return ok({ lease_id, udid: lease.udid, count, total, new_since_call: newSinceCall, matched }, "net_assert_flow");
       } catch (err) {
-        return fail(netProxyError(err));
+        return fail(netProxyError(err), "net_assert_flow");
       }
     },
   );
@@ -2038,9 +2046,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           action: { map_local: file },
         });
         await orch.logAction(lease_id, "map_local", `${JSON.stringify(url_regex)} -> ${path.basename(file)}`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, url_regex, file, rule_count: ruleCount });
+        return ok({ lease_id, udid: lease.udid, url_regex, file, rule_count: ruleCount }, "map_local");
       } catch (err) {
-        return fail(netProxyError(err));
+        return fail(netProxyError(err), "map_local");
       }
     },
   );
@@ -2095,9 +2103,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           action: { map_remote: url },
         });
         await orch.logAction(lease_id, "map_remote", `${JSON.stringify(url_regex)} -> ${url}`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, url_regex, url, rule_count: ruleCount });
+        return ok({ lease_id, udid: lease.udid, url_regex, url, rule_count: ruleCount }, "map_remote");
       } catch (err) {
-        return fail(netProxyError(err));
+        return fail(netProxyError(err), "map_remote");
       }
     },
   );

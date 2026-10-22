@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { compactAxText } from "./ax-prune.js";
 import { isRealLease, requireSimLease } from "./devicekind.js";
+import { failureExtra, successExtra } from "./recovery.js";
 import { instrumentToolcalls } from "./toolcalls.js";
 import { registerDeviceExtras } from "./extras.js";
 import { Llmdb } from "./llmdb.js";
@@ -42,14 +43,20 @@ type ToolResult = {
   isError?: boolean;
 };
 
-function ok(data: unknown, extra: ToolResult["content"] = []): ToolResult {
+function ok(data: unknown, extra: ToolResult["content"] = [], tool?: string): ToolResult {
+  // P2: additive `next` only — every key from data keeps its value.
+  const body = { ok: true, ...((data ?? {}) as object), ...successExtra(tool) };
   return {
-    content: [{ type: "text", text: JSON.stringify({ ok: true, ...((data ?? {}) as object)}, null, 2) }, ...extra],
+    content: [{ type: "text", text: JSON.stringify(body, null, 2) }, ...extra],
   };
 }
 
-function fail(message: string): ToolResult {
-  return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: message }, null, 2) }], isError: true };
+function fail(message: string, tool?: string): ToolResult {
+  // P2: additive recovery fields only — `error` keeps its text verbatim.
+  return {
+    content: [{ type: "text", text: JSON.stringify({ ok: false, error: message, ...failureExtra(message, tool) }, null, 2) }],
+    isError: true,
+  };
 }
 
 function sessionField(desc: string) {
@@ -97,9 +104,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
     async () => {
       try {
-        return ok({ server: getServerInfo(), ...(await orch.poolStatus()) });
+        return ok({ server: getServerInfo(), ...(await orch.poolStatus()) }, [], "pool_status");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "pool_status");
       }
     },
   );
@@ -115,9 +122,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
     async () => {
       try {
-        return ok(await orch.sessionsList());
+        return ok(await orch.sessionsList(), [], "sessions_list");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "sessions_list");
       }
     },
   );
@@ -133,9 +140,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ udid }) => {
       try {
         await simslim.boot(udid);
-        return ok({ booted: udid });
+        return ok({ booted: udid }, [], "sim_boot");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "sim_boot");
       }
     },
   );
@@ -160,14 +167,15 @@ export function createMcpServer(deps: ServerDeps): McpServer {
           if (!force) {
             return fail(
               `Simulator ${udid} is leased to session ${holder.sessionId} (lease ${holder.leaseId}). Pass force=true to preempt.`,
+              "sim_shutdown",
             );
           }
           released = await orch.release(holder.leaseId, holder.sessionId, { force: true });
         }
         await simslim.shutdown(udid);
-        return ok({ shutdown: udid, released });
+        return ok({ shutdown: udid, released }, [], "sim_shutdown");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "sim_shutdown");
       }
     },
   );
@@ -195,6 +203,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         if (holder && reboot && !force) {
           return fail(
             `Simulator ${udid} is leased to session ${holder.sessionId}; slimming with reboot would interrupt it. Use noReboot or force=true.`,
+            "sim_slim",
           );
         }
         if (mode === "on") {
@@ -202,9 +211,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         } else {
           await simslim.slimOff(udid);
         }
-        return ok({ udid, mode });
+        return ok({ udid, mode }, [], "sim_slim");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "sim_slim");
       }
     },
   );
@@ -252,10 +261,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
           ttlMs: args.ttl_ms,
           stream: args.stream,
         });
-        if (!result.ok) return fail(result.reason);
-        return ok(result);
+        if (!result.ok) return fail(result.reason, "lease_acquire");
+        return ok(result, [], "lease_acquire");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "lease_acquire");
       }
     },
   );
@@ -274,9 +283,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
     async ({ lease_id, session_id }) => {
       try {
-        return ok(await orch.release(lease_id, session_id));
+        return ok(await orch.release(lease_id, session_id), [], "lease_release");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "lease_release");
       }
     },
   );
@@ -294,9 +303,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
     async ({ lease_id, session_id }) => {
       try {
-        return ok({ lease: await orch.heartbeat(lease_id, session_id) });
+        return ok({ lease: await orch.heartbeat(lease_id, session_id) }, [], "lease_heartbeat");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "lease_heartbeat");
       }
     },
   );
@@ -311,9 +320,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
     async () => {
       try {
-        return ok(await orch.leasesList());
+        return ok(await orch.leasesList(), [], "lease_list");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "lease_list");
       }
     },
   );
@@ -331,9 +340,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
     async ({ ticket_id }) => {
       try {
-        return ok(await orch.queueStatus(ticket_id));
+        return ok(await orch.queueStatus(ticket_id), [], "queue_status");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "queue_status");
       }
     },
   );
@@ -351,9 +360,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
     async ({ ticket_id, session_id }) => {
       try {
-        return ok(await orch.cancelTicket(ticket_id, session_id));
+        return ok(await orch.cancelTicket(ticket_id, session_id), [], "queue_cancel");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "queue_cancel");
       }
     },
   );
@@ -388,7 +397,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
             payload = pruned.text;
             kept = pruned.kept;
           } catch (err) {
-            return fail(`compact format failed: ${(err as Error).message}`);
+            return fail(`compact format failed: ${(err as Error).message}`, "ui_describe");
           }
         }
         const { text, truncated } = truncate(payload, max_chars ?? 20000);
@@ -401,9 +410,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         if (x === undefined && y === undefined) noteM4Ui(lease_id, payload, snap?.id);
         await orch.logAction(lease_id, "ui_describe", x !== undefined && y !== undefined ? `describe at (${x},${y})` : "describe full hierarchy",
           { ...(x !== undefined && y !== undefined ? { x, y } : {}), truncated, format: shape, ...(kept !== undefined ? { kept } : {}), ...(snap ? { snapshot_id: snap.id } : {}) });
-        return ok({ udid: lease.udid, ui: text, truncated, format: shape, ...(kept !== undefined ? { kept } : {}) });
+        return ok({ udid: lease.udid, ui: text, truncated, format: shape, ...(kept !== undefined ? { kept } : {}) }, [], "ui_describe");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "ui_describe");
       }
     },
   );
@@ -455,7 +464,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         if (m4 !== null && m4.decision === "deny") {
           appendM4Audit({ leaseId: args.lease_id, query: shadowQuery, result: m4, tapped: false });
           await orch.logAction(args.lease_id, "ui_tap", `tap ${target} denied: ${m4.reason}`.slice(0, 160), { ...selectors, m4: `deny:${m4.reason}` });
-          return fail(`m4 denied autonomous tap: ${m4.reason}`);
+          return fail(`m4 denied autonomous tap: ${m4.reason}`, "ui_tap");
         }
         const out = await uiFor(lease, "ui_tap").tap(lease.udid, {
           x: args.x, y: args.y, id: args.id, label: args.label, value: args.value,
@@ -477,7 +486,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
           ...(shadowExtra ?? {}),
           ...(m4 !== null ? { m4: "allow" } : {}),
         });
-        return ok({ udid: lease.udid, output: out });
+        return ok({ udid: lease.udid, output: out }, [], "ui_tap");
       } catch (err) {
         // M1 snapshot failure echo (env-gated, default OFF): null when off, so
         // the failure path is unchanged unless snapshots are on. Never masks.
@@ -499,7 +508,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         } catch {
           // Never mask the original tap error.
         }
-        return fail((err as Error).message);
+        return fail((err as Error).message, "ui_tap");
       }
     },
   );
@@ -520,9 +529,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const lease = await orch.resolveLease(lease_id);
         const out = await uiFor(lease, "ui_type").typeText(lease.udid, text);
         await orch.logAction(lease_id, "ui_type", `type ${JSON.stringify(text.slice(0, 80))}`);
-        return ok({ udid: lease.udid, output: out });
+        return ok({ udid: lease.udid, output: out }, [], "ui_type");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "ui_type");
       }
     },
   );
@@ -547,9 +556,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const lease = await orch.resolveLease(args.lease_id);
         const out = await uiFor(lease, "ui_swipe").swipe(lease.udid, { x: args.start_x, y: args.start_y }, { x: args.end_x, y: args.end_y }, { duration: args.duration });
         await orch.logAction(args.lease_id, "ui_swipe", `swipe (${args.start_x},${args.start_y})->(${args.end_x},${args.end_y})`);
-        return ok({ udid: lease.udid, output: out });
+        return ok({ udid: lease.udid, output: out }, [], "ui_swipe");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "ui_swipe");
       }
     },
   );
@@ -571,9 +580,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const lease = await orch.resolveLease(lease_id);
         const out = await uiFor(lease, "ui_gesture").gesture(lease.udid, preset, { duration });
         await orch.logAction(lease_id, "ui_gesture", `gesture ${preset}`);
-        return ok({ udid: lease.udid, output: out });
+        return ok({ udid: lease.udid, output: out }, [], "ui_gesture");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "ui_gesture");
       }
     },
   );
@@ -595,9 +604,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const lease = await orch.resolveLease(lease_id);
         const out = await uiFor(lease, "ui_button").button(lease.udid, button, duration);
         await orch.logAction(lease_id, "ui_button", `button ${button}`);
-        return ok({ udid: lease.udid, output: out });
+        return ok({ udid: lease.udid, output: out }, [], "ui_button");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "ui_button");
       }
     },
   );
@@ -622,9 +631,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         // M1 snapshot (env-gated, default OFF): shot->describe link; null when off.
         const shot = saveShotLink({ leaseId: lease_id, shotPath: file });
         await orch.logAction(lease_id, "ui_screenshot", `screenshot ${path.basename(file)}`, shot ?? undefined);
-        return ok({ udid: lease.udid, path: file }, [{ type: "image", data, mimeType: "image/png" }]);
+        return ok({ udid: lease.udid, path: file }, [{ type: "image", data, mimeType: "image/png" }], "ui_screenshot");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "ui_screenshot");
       }
     },
   );
@@ -648,9 +657,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const lease = await orch.resolveLease(lease_id);
         const out = await uiFor(lease, "ui_batch").batch(lease.udid, steps, { continueOnError: continue_on_error, waitTimeout: wait_timeout });
         await orch.logAction(lease_id, "ui_batch", `batch ${steps.length} steps: ${steps.join("; ").slice(0, 120)}`);
-        return ok({ udid: lease.udid, output: out });
+        return ok({ udid: lease.udid, output: out }, [], "ui_batch");
       } catch (err) {
-        return fail((err as Error).message);
+        return fail((err as Error).message, "ui_batch");
       }
     },
   );
