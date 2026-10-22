@@ -22,7 +22,7 @@ apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
 
 ## Features
 
-- **66 tools across 10 groups** — pool/lease/queue, AXe UI automation, device extras, synthetic camera, app lifecycle, xctrace profiling, live streaming, llmdb debugging, crash symbolication, and an HTTPS intercept proxy
+- **69 tools across 10 groups** — pool/lease/queue, AXe UI automation, device extras, synthetic camera, app lifecycle, xctrace profiling, live streaming, llmdb debugging, crash symbolication, and an HTTPS intercept proxy
 - **One shared daemon** — leases, the wait queue, and auto-dispatch live in a single process; per-session stdio servers would split the pool
 - **Lease ownership gates** — each lease holds one simulator and only its holder may drive UI, apps, debugging, or the proxy through it
 - **Wait queue with auto-dispatch** — when no simulator matches, callers get a ticket; releases, TTL expiry, and external-shutdown detection hand the next match to the first fitting ticket (FIFO)
@@ -196,7 +196,7 @@ npm uninstall -g apple-debug-mcp               # when installed via npm-global
 
 Full reference: [Tools](docs/tools.md).
 
-66 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
+69 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
 
 | Group | Tools |
 | --- | --- |
