@@ -553,5 +553,43 @@ Verification: failing-test-first — 38 new `test/realui.test.ts`
 cases failed on the stubs/gates, then passed after the fix
 (driver argv + limits + batch fan-out/parser/continue-on-error +
 server dispatch + sim byte-identity + missing-transport).
-`npm run build`, `npm run typecheck`, full `vitest run` (728)
-green. Session left RUNNING in tmux `wda` (do NOT kill).
+`npm run build`, `npm run typecheck`, full `vitest run` (731:
+728 + 3 exit-0-envelope cases) green. Session left RUNNING in
+tmux `wda` (do NOT kill).
+
+## 12. Debug on real hardware — CARRIED (P3, transport blocked upstream)
+
+Grounding-only slice (C0, no src/test changes): `debug_*` stays
+P3-gated, and the gate is CORRECT — no CLI transport can open a
+real-device debug session today. Measured 2026-10-22 on the
+paired iPhone 16 Pro Max (`00008140-000555603453001C`,
+iOS 27.0.1) against dev-signed `com.qa.golfzon.app`
+(`get-task-allow=true`, so entitlements are not the issue):
+
+- `ios debug <host-.app>` (go-ios 1.3.2, launch-model: needs the
+  HOST .app for lldb symbols, resolves the device container
+  on-device) fails in ~0.5s, before any launch/handshake:
+  `Could not start service:com.apple.debugserver.
+  DVTSecureSocketProxy with reason:'InvalidService'. Have you
+  mounted the Developer Image?`
+- Root cause (source-read, `ios/debugserver/debugserver.go` →
+  `ios.ConnectToService` → lockdown `StartService` + usbmuxd
+  connect, no RSD fallback): on iOS 17+ that service is not a
+  lockdown service. `ios rsd ls` shows 76 services including
+  `com.apple.coredevice.debugserverproxy:55185` — the modern
+  path — which `ios debug` does not speak.
+- Retries ruled out: `--userspace-port=60106` → same
+  InvalidService; `--address/--rsd-port` → `no route to host`
+  (userspace tunnel has no kernel utun for fd3f::1);
+  `ios image auto` → "already a developer image mounted"
+  (Xcode 26.6 DDI for 24A446 present; replace needs a reboot).
+  `ios dproxy` is a usbmuxd sniffer, irrelevant to lldb.
+- `xcrun devicectl` has no debug verb; lldb `remote-ios`
+  platform needs the dead usbmuxd path.
+
+P3 options (all unexplored): upstream go-ios RSD support for
+`debug`; a custom `coredevice.debugserverproxy` client (big
+build); Xcode-toolchain lldb attach research; pymobiledevice3
+(which speaks RSD debugserver) behind the GPL product/legal
+call. `crash ls/cp` works but is crashreport-service file
+copy, not debugging.
