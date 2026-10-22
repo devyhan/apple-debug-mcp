@@ -154,7 +154,7 @@ async function main(): Promise<void> {
   } catch {
     console.warn(
       `[sim-mcp] WARNING: optional binary "${config.iosBin}" is not usable; ` +
-        `app_install/app_uninstall/app_launch/app_terminate, sim_log_stream and ui_screenshot on real-device leases ` +
+        `app_install/app_uninstall/app_launch/app_terminate, sim_log_stream and ui_screenshot/ui_describe/ui_tap on real-device leases ` +
         `will fail until it is installed (${GO_IOS_INSTALL_HINT}, or set IOS_BIN)`,
     );
   }

@@ -34,7 +34,7 @@ export interface ServerDeps {
   screenshotDir: string;
   realApps?: AppOps;
   realLog?: LogOps;
-  /** Real-device UI backend (go-ios screenshot). Absent ⇒ real ui_screenshot fails with a missing-transport error. */
+  /** Real-device UI backend (go-ios screenshot/describe/tap). Absent ⇒ real ui_* fails with a missing-transport error. */
   realUi?: UiDriver;
 }
 
@@ -75,11 +75,11 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   const { orchestrator: orch, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir } = deps;
   const server = new McpServer({ name: "apple-debug-mcp", version: getVersion() });
 
-  /** UI backend for a resolved lease: AXe for sims, go-ios screenshot for real devices. */
+  /** UI backend for a resolved lease: AXe for sims, go-ios for real devices. */
   function uiFor(lease: Lease, verb: string): UiDriver {
     if (!isRealLease(lease)) return axe;
     if (!deps.realUi) {
-      throw new Error(`${verb} on real-device lease ${lease.leaseId} needs the go-ios screenshot transport, which is unavailable in this embedding.`);
+      throw new Error(`${verb} on real-device lease ${lease.leaseId} needs the go-ios UI transport, which is unavailable in this embedding.`);
     }
     return deps.realUi;
   }
@@ -341,7 +341,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_describe",
     {
-      description: "Describe the accessibility UI hierarchy of your leased simulator (AXe describe-ui).",
+      description: "Describe the accessibility UI hierarchy of your leased simulator or real device (AXe describe-ui; go-ios `ios ui source` on real devices).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         x: z.number().optional().describe("With y: describe only the element at this point."),
@@ -354,8 +354,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, x, y, format, max_depth, max_chars }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "ui_describe", phase: "P2", detail: UI_REAL_DETAIL });
-        const out = await axe.describeUi(lease.udid, x !== undefined && y !== undefined ? { x, y } : undefined);
+        const out = await uiFor(lease, "ui_describe").describeUi(lease.udid, x !== undefined && y !== undefined ? { x, y } : undefined);
         const shape = format ?? "full";
         let payload = out;
         let kept: number | undefined;
@@ -388,7 +387,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_tap",
     {
-      description: "Tap a point or an accessibility element on your leased simulator (AXe tap).",
+      description: "Tap a point or an accessibility element on your leased simulator or real device (AXe tap; go-ios `ios ui tap` with x/y only on real devices).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         x: z.number().optional().describe("X coordinate (with y)."),
@@ -423,7 +422,6 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         let m4: M4Result | null = null;
       try {
         const lease = await orch.resolveLease(args.lease_id);
-        requireSimLease(lease, { verb: "ui_tap", phase: "P2", detail: UI_REAL_DETAIL });
         // M4 (env-gated, default OFF): autonomous-tap pre-tap gate. Null when
         // manual (auto !== true) or the gate is off -> falls through
         // byte-identical. Deny -> no tap, audit line, standard deny response.
@@ -433,7 +431,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
           await orch.logAction(args.lease_id, "ui_tap", `tap ${target} denied: ${m4.reason}`.slice(0, 160), { ...selectors, m4: `deny:${m4.reason}` });
           return fail(`m4 denied autonomous tap: ${m4.reason}`);
         }
-        const out = await axe.tap(lease.udid, {
+        const out = await uiFor(lease, "ui_tap").tap(lease.udid, {
           x: args.x, y: args.y, id: args.id, label: args.label, value: args.value,
           elementType: args.element_type, waitTimeout: args.wait_timeout,
         });

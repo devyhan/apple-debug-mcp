@@ -191,10 +191,10 @@ behind one backend — no Appium needed:
 - devicectl side: `device orientation` (control), `device notification`
   (post/observe Darwin notifications) — narrow but native.
 
-Except `ios screenshot` (§8, now wired), nothing above has been run
-against a device yet (needs WDA signing + install + a running WDA
-session); the P2-B workflow must ground each remaining verb live before
-wiring. Xcode on this host: 26.6 (17F113).
+`ios screenshot` (§8), `ios ui source` + `ios ui tap` (§10) are now
+wired; the rest above has not been run against a device yet (needs the
+running session from §9); the P2-B workflow must ground each remaining
+verb live before wiring. Xcode on this host: 26.6 (17F113).
 
 Measured split 2026-10-22 (paired iPhone 16 Pro Max):
 
@@ -208,10 +208,10 @@ Measured split 2026-10-22 (paired iPhone 16 Pro Max):
 ## 8. `ui_screenshot` — WIRED (screenshot-only `UiDriver`)
 
 First P2-B verb out of §7: `RealUiDriver` (`src/realui.ts`) implements
-`UiDriver` with a real `screenshot` and precise P2 throws for the seven
-WDA-gated verbs (`REAL_UI_WDA_DETAIL`). Scope is deliberately
-screenshot-only — tap/type/source need a running WDA session (§7) and
-stay out.
+`UiDriver` with a real `screenshot` and precise P2 throws for the
+WDA-gated verbs (`REAL_UI_WDA_DETAIL`). Scope was deliberately
+screenshot-only at the time — describe+tap are wired in §10 now that
+the §9 session is up; type/swipe/gesture/button/batch stay P2.
 
 Real path:
 
@@ -367,3 +367,103 @@ runner — then hits the device gate). Still open: on-device UI
 Automation toggle state; `--p12password`-omitted behavior (moot —
 manual flow needs no P12); `runwda`→8100 wiring (untried — same
 automation-mode gate expected); `tunnel ls` state source.
+
+## 10. `ui_describe` + `ui_tap` — WIRED (DeviceKit `ui source` / `ui tap`)
+
+Second P2-B slice out of §7, on the live §9 session (DeviceKit on
+`127.0.0.1:12004` in tmux `wda`, `/health` → `OK`). Scope is
+describe+tap ONLY — type/swipe/gesture/button/batch stay precise P2
+(`REAL_UI_WDA_DETAIL`, rewritten from a blocker into a bring-up
+prerequisite; the const name is unchanged).
+
+Real paths (`src/realui.ts` `RealUiDriver`):
+
+```
+ios ui source --udid=<udid>
+ios ui tap --x=<x> --y=<y> --udid=<udid>
+```
+
+- Flag surface (go-ios 1.3.2 binary usage text): `ui source
+  [--output=<outfile>] [--driver=<driver>] [--session-id=<sessionid>]
+  [--wda-url=<url>] [--devicekit-url=<url>]`, `ui tap --x=<x> --y=<y>`
+  plus the same optionals. `--driver` defaults to `devicekit`,
+  `--devicekit-url` to `http://127.0.0.1:12004` (or
+  `GO_IOS_DEVICEKIT_URL`) — verified live that the defaults reach the
+  §9 session, so argv passes `--udid` only and env overrides keep
+  working. `--udid` is still passed explicitly (multi-device safety).
+- Live-verified 2026-10-22 on the paired iPhone 16 Pro Max
+  (`00008140-000555603453001C`): `ui source` → exit 0, 34,919-byte
+  JSON-RPC tree; `ui tap --x=74 --y=33` (status-bar clock, harmless)
+  → exit 0, `{"id":1,"jsonrpc":"2.0","result":{"success":true}}`,
+  empty stderr. Driver-level roundtrip after wiring: describe →
+  29,595-char AX JSON (2 roots, compact kept 283), point (74,33) →
+  the `16:32` StaticText, tap → success JSON.
+
+Source format mapping (`normalizeDeviceKitSource`): `ios ui source`
+returns JSON-RPC `{id, jsonrpc, result: {children, rect, type}}`
+(AX-JSON-ish, NOT XML — §9's "expect XML dump" guess was wrong).
+Nodes carry `type`/`label`/`name`/`rawIdentifier`/`value`/`rect`/
+`children` and are mapped to the AX keys the shared
+`compactAxText`/`max_depth`/baseline/shadow/M4 plumbing reads:
+
+| DeviceKit | AX | Notes |
+| --- | --- | --- |
+| `label` | `AXLabel` | verbatim |
+| `rawIdentifier` or `name` | `AXUniqueId` | stable id first, name fallback (often echoes the label) |
+| `type` minus `XCUIElementType` prefix | `type` | `XCUIElementTypeButton` → `Button`, matching the AXe vocabulary (incl. interactive-first) |
+| `rect` `{x,y,width,height}` | `frame` `{x,y,width,height}` | verbatim; finite numbers only |
+| `value` (string/number/bool) | `AXValue` | strings verbatim, scalars stringified |
+| `children[]` | `children[]` | recursive; empty omitted |
+
+- The result root is a synthetic zero-rect `XCUIElementTypeAny`
+  container on live dumps — it is unwrapped so the Application +
+  status-bar subtrees are the roots (a non-Any root stays a
+  single-element array; nothing else is dropped).
+- Point queries (`x`+`y`) have no `ui source` flag, so they are
+  answered by a local smallest-area hit-test over the normalized tree
+  (ties → deepest, then first), returning the single element object —
+  the same element-only shape the server already handles for sims
+  (M4 skips point payloads). Smallest-area, not deepest: live dumps
+  nest full-screen `Other` wrappers 9 deep, which a deepest-wins rule
+  prefers over the tight element under the point (the clock text at
+  depth 4 lost to a depth-9 440x956 `Other` before the fix). A point
+  miss is a precise `ui_describe found no element at (x, y)` error,
+  never an empty payload.
+
+Tap arg limits (honest, not faked):
+
+- `x`+`y` required; either missing (including id/label/value-only
+  taps) fails WITHOUT spawning:
+  `ui_tap … takes coordinates only` (`REAL_UI_TAP_SELECTOR_DETAIL`) —
+  the WDA CLI exposes no selector flags, so selector resolution is
+  left to the caller (run `ui_describe`, tap the frame center) rather
+  than faked via a hidden describe-lookup.
+- Coords win over co-passed selectors, matching `Axe.tap`
+  precedence. Non-finite x/y is `Invalid x/y`, no spawn.
+- `elementType`, `preDelay`/`postDelay`, `waitTimeout`,
+  `pollInterval` have no `ios ui tap` equivalent and are ignored on
+  real leases (documented here, not erroring, so shared callers
+  passing `wait_timeout` keep working).
+- Resolves the backend stdout trimmed (the success JSON-RPC line),
+  mirroring `Axe.tap`.
+
+Handler routing (`src/server.ts`): the `requireSimLease` gate is
+dropped ONLY on `ui_describe` + `ui_tap`, which now route via
+`uiFor(lease)` (sim → `Axe`, byte-identical argv + ok shape; real →
+`RealUiDriver`). The stale `uiFor` wording ("go-ios screenshot
+transport") is generalized to "go-ios UI transport"; the
+`ServerDeps.realUi` comment, tool descriptions, daemon boot warning
+(`index.ts`), and doctor fix text now name
+screenshot/describe/tap. Compact/truncate/snapshot/shadow/M4/
+`lease_actions` plumbing is shared and unchanged. Failures mirror
+the §8 seam: ENOENT-only install hint (`GO_IOS_INSTALL_HINT`),
+device-side text verbatim otherwise; unparseable source / missing
+`result` fail with the backend text verbatim (capped), never a
+missing-binary claim.
+
+Verification: failing-test-first — 22 new `test/realui.test.ts`
+cases failed on the P2 stubs, then passed after the fix (driver
+argv + normalization + compactor-compat + hit-test + tap limits +
+server dispatch + sim byte-identity + missing-transport). `npm run
+build`, `npm run typecheck`, full `vitest run` green. Session left
+RUNNING in tmux `wda` (do NOT kill; shared with further P2-B work).
