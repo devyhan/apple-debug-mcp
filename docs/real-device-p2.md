@@ -251,11 +251,14 @@ unchanged axe argv, missing-transport error, other verbs still P2).
 ## 9. WDA/DeviceKit bring-up runbook (2026-10-22, paired iPhone 16 Pro Max)
 
 Goal: a running UI-automation backend so `ios ui status` is green and
-`ios ui source` returns an XML dump. Result this session: download →
-sign → install COMPLETE for both runners (zero interactive prompts);
-session start BLOCKED on a device-side gate (see failure table).
-No session is left running — B2 must flip the on-device toggle, then
-run the start command below.
+`ios ui source` returns an element dump. Result: download → sign →
+install COMPLETE for both runners (zero interactive prompts);
+session start initially BLOCKED on a device-side gate (see failure
+table), then GREEN after the user enabled Settings → Developer → UI
+Automation: `/health` → `OK`, `ui status` → `OK`, `ui source` →
+34,919-byte XCUIElement JSON-RPC tree (NOT XML — `result.children`
+with `rect`/`type`/`label`). Session left RUNNING in tmux `wda`
+for B2 (stop: `tmux kill-session -t wda`).
 
 Facts (measured, not inferred):
 
@@ -351,7 +354,7 @@ Failure table (verbatim errors):
 
 | Step | Error (verbatim) | Meaning / fix |
 |---|---|---|
-| `ui run devicekit` (2/2 attempts) | `ui run: runner failed … Timed out while enabling automation mode. (Error code: 1000, Domain: com.apple.dt.XCTest.XCTFuture)`; device log: `Failed to initialize for UI testing: … Code=1000 "Timed out while enabling automation mode."`; runner then killed, 12004 refused again | Device-side gate. Prime suspect: on-device Settings → Developer → **Enable UI Automation** is OFF (no CLI can flip it; `lockdown get`/`diagnostics list` cannot read it). Secondary: screen asleep/locked. USER ACTION: on the iPhone, enable Developer → UI Automation, keep screen awake/unlocked, then rerun step 5. |
+| `ui run devicekit` (2/2 attempts pre-toggle) | `ui run: runner failed … Timed out while enabling automation mode. (Error code: 1000, Domain: com.apple.dt.XCTest.XCTFuture)` | CONFIRMED device-side gate: resolved by enabling Settings → Developer → UI Automation on the phone (no CLI can flip it). Post-toggle: session green in ~5s. |
 | `ios prepare` | `failed erasing … A cloud configuration is already present on this device` (DMCTunnelErrorDomain 14002) | `prepare` is a supervision/erase flow for lab devices, NOT the UI-automation toggle. Do NOT use on this personal device. Device untouched (command refused). |
 | `ios ui install` / `sign provision appstoreconnect` | not runnable: `--p12file` missing (no P12 on host; export would prompt), `--asc-issuer-id` unknown | Use the manual codesign flow above instead; needs no new secrets. |
 
