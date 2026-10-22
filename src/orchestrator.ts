@@ -1,8 +1,9 @@
+import { AppOps } from "./appops.js";
+import { allowRealLease, isRealLease } from "./devicekind.js";
 import { DebugOps } from "./llmdb.js";
 import { CaptureOps, CaptureStartSpec, CaptureStatus, CaptureStopResult } from "./netcapture.js";
 import { AssertFlowResult, AssertFlowSpec, NetProxyRule, NetProxyStatus, ProxyOps } from "./netproxy.js";
 import { DEFAULT_STREAM_PORT_BASE, StreamOps } from "./servesim.js";
-import { SimApps } from "./simapps.js";
 import { FleetOps, SimDevice } from "./simslim.js";
 import { Lease, Requirements, Store, Ticket, nextId } from "./store.js";
 import { traceHook } from "./trace.js";
@@ -91,6 +92,7 @@ interface ContaminationState {
 }
 
 function matches(dev: SimDevice, req: Requirements): boolean {
+  if ((req.deviceKind ?? "sim") !== "sim") return false; // P0 fleet is sims only; P1 adds the real fleet
   if (req.udid && dev.udid !== req.udid) return false;
   if (req.device && !dev.name.toLowerCase().includes(req.device.toLowerCase())) return false;
   if (req.osVersion && !(dev.osVersion ?? "").startsWith(req.osVersion)) return false;
@@ -127,10 +129,11 @@ export class Orchestrator {
   private readonly debugger?: DebugOps;
   private readonly netProxy?: ProxyOps;
   private readonly netCapture?: CaptureOps;
-  private readonly apps?: Pick<SimApps, "listRunning">;
+  private readonly apps?: Pick<AppOps, "listRunning">;
   private readonly contaminationCheck: boolean;
   private readonly contaminationCheckMinIntervalMs: number;
   private readonly traceDir?: string;
+  private readonly env: NodeJS.ProcessEnv;
   private readonly actions = new Map<string, LeaseAction[]>();
   private readonly contamination = new Map<string, ContaminationState>();
 
@@ -145,10 +148,12 @@ export class Orchestrator {
       debugger?: DebugOps;
       proxy?: ProxyOps;
       capture?: CaptureOps;
-      apps?: Pick<SimApps, "listRunning">;
+      apps?: Pick<AppOps, "listRunning">;
       contaminationCheck?: boolean;
       contaminationCheckMinIntervalMs?: number;
       traceDir?: string;
+      /** Injected env for gates (tests); defaults to process.env. */
+      env?: NodeJS.ProcessEnv;
     },
   ) {
     this.fleet = fleet;
@@ -164,6 +169,7 @@ export class Orchestrator {
     this.contaminationCheck = opts.contaminationCheck ?? true;
     this.contaminationCheckMinIntervalMs = opts.contaminationCheckMinIntervalMs ?? 30_000;
     this.traceDir = opts.traceDir;
+    this.env = opts.env ?? process.env;
   }
 
   // ---------- state views (read-only, never mutate) ----------
@@ -311,6 +317,25 @@ export class Orchestrator {
       const expiredSwept = await this.sweepLocked();
       const warnings = expiredSwept.map((id) => `Swept expired lease ${id}`);
 
+      if ((req.deviceKind ?? "sim") === "real") {
+        if (allowRealLease(this.env)) {
+          if (!req.udid) {
+            return { ok: false, reason: "Experimental real leases require an explicit udid (SIM_MCP_REAL_LEASE=1 hatch; P1 owns real matching)." };
+          }
+          // Experimental hatch (§8.2): no fleet lookup, no boot, no slim, no
+          // baseline capture, no auto-stream. P1 deletes this branch.
+          if (input.stream === true) {
+            warnings.push("Stream requested but experimental real leases never auto-stream; continuing without a live stream");
+          }
+          const lease = await this.createLease(req.udid, input, client);
+          return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
+        }
+        return {
+          ok: false,
+          reason: 'kind=real acquisition lands in P1 (real-device fleet: devicectl inventory, pairing, transport). Omit device_kind (default sim) for a simulator lease.',
+        };
+      }
+
       const devices = await this.fleet.list();
       const leases = await this.store.read((s) => s.leases);
       const held = new Set(leases.map((l) => l.udid));
@@ -383,7 +408,8 @@ export class Orchestrator {
         return { value: lease, dirty: true };
       });
       // Stop BEFORE dispatch: a waiter reusing this sim may start its own stream.
-      await this.stopStreamQuiet(removed.udid);
+      // Real leases never had a serve-sim helper; keep the release hermetic.
+      if (!isRealLease(removed)) await this.stopStreamQuiet(removed.udid);
       await this.stopDebugQuiet(removed.debugSessionId);
       await this.stopProxyQuiet(removed.leaseId);
       await this.stopCaptureQuiet(removed.leaseId);
@@ -449,7 +475,7 @@ export class Orchestrator {
           s.leases = s.leases.filter((l) => l.leaseId !== leaseId);
           return { value: undefined, dirty: true };
         });
-        await this.stopStreamQuiet(lease.udid);
+        if (!isRealLease(lease)) await this.stopStreamQuiet(lease.udid);
         await this.stopDebugQuiet(lease.debugSessionId);
         await this.stopProxyQuiet(leaseId);
         await this.stopCaptureQuiet(leaseId);
@@ -459,6 +485,7 @@ export class Orchestrator {
       this.contamination.delete(leaseId);
       throw new LeaseError(`Lease ${leaseId} expired and was released`);
     }
+    if (isRealLease(lease)) return lease; // P0: validity only; every sim-assuming verb fail-fasts itself (§6)
     const devices = await this.fleet.list();
     const dev = devices.find((d) => d.udid === lease.udid);
     if (!dev || !isBooted(dev)) {
@@ -483,6 +510,11 @@ export class Orchestrator {
 
   leaseForUdid(udid: string): Promise<Lease | null> {
     return this.store.read((s) => s.leases.find((l) => l.udid === udid) ?? null);
+  }
+
+  /** Read-only lease lookup by id (no validation, no eviction); null when unknown. */
+  leaseById(leaseId: string): Promise<Lease | null> {
+    return this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId) ?? null);
   }
 
   // ---------- per-lease action ring (in-memory, last 100) ----------
@@ -565,6 +597,7 @@ export class Orchestrator {
   private async checkContamination(lease: Lease): Promise<void> {
     try {
       if (!this.contaminationCheck || !this.apps) return;
+      if (isRealLease(lease)) return; // listRunning is simctl-based; keep real leases offline
       const state = this.contamination.get(lease.leaseId);
       if (!state) return;
       if (Date.now() - state.lastCheck < this.contaminationCheckMinIntervalMs) return;
@@ -598,7 +631,7 @@ export class Orchestrator {
       s.leases = s.leases.filter((l) => {
         if (isExpired(l, now)) {
           ids.push(l.leaseId);
-          sweptUdids.push(l.udid);
+          if (!isRealLease(l)) sweptUdids.push(l.udid);
           sweptDebugSessions.push(l.debugSessionId);
           sweptLeaseIds.push(l.leaseId);
           return false;
@@ -680,6 +713,8 @@ export class Orchestrator {
           createdAt: Date.now(),
           lastHeartbeat: Date.now(),
           ttlMs: this.defaultTtlMs,
+          deviceKind: ticket.requirements.deviceKind ?? "sim",
+          ...(ticket.requirements.transport !== undefined ? { transport: ticket.requirements.transport } : {}),
         };
         s.leases.push(lease);
         const rec = s.tickets.find((t) => t.ticketId === ticket.ticketId);
@@ -715,6 +750,8 @@ export class Orchestrator {
         createdAt: Date.now(),
         lastHeartbeat: Date.now(),
         ttlMs: input.ttlMs ?? this.defaultTtlMs,
+        deviceKind: input.requirements?.deviceKind ?? "sim",
+        ...(input.requirements?.transport !== undefined ? { transport: input.requirements.transport } : {}),
       };
       s.leases.push(lease);
       return { value: { ...lease }, dirty: true };

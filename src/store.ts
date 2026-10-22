@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { DeviceKind, DeviceTransport } from "./devicekind.js";
 
 /**
  * Tool-agnostic session identity. Any client (Orca, Claude Code, TMA, scripts)
@@ -14,6 +15,10 @@ export interface Requirements {
   osVersion?: string;
   /** Exact match on platform, e.g. "iOS". */
   platform?: string;
+  /** Default when omitted: "sim". P0 rejects "real" (see §8); P1 matches the real fleet. */
+  deviceKind?: DeviceKind;
+  /** Only meaningful with deviceKind "real" (P1). Accepted + persisted in P0, otherwise unused. */
+  transport?: DeviceTransport;
 }
 
 export interface Lease {
@@ -37,6 +42,10 @@ export interface Lease {
    */
   contended?: boolean;
   contendedSince?: number | null;
+  /** Always present after load migration (§3). Old persisted leases default to "sim". */
+  deviceKind: DeviceKind;
+  /** Present only on real leases that requested one (P1). */
+  transport?: DeviceTransport;
 }
 
 export type TicketStatus = "waiting" | "assigned" | "cancelled";
@@ -68,6 +77,21 @@ function emptyState(): StoreState {
   return { seq: 0, leases: [], tickets: [] };
 }
 
+/**
+ * Load-time migration (§3): leases persisted before `deviceKind` existed get
+ * `"sim"` (in memory; persisted on the next mutating write). Unknown future
+ * values fail loudly — the throw triggers the fresh-state fallback in
+ * `Store.load`, which logs — rather than silently coercing.
+ */
+function normalizeLease(lease: Lease): Lease {
+  const kind: unknown = (lease as { deviceKind?: unknown }).deviceKind;
+  if (kind === undefined) return { ...lease, deviceKind: "sim" };
+  if (kind !== "sim" && kind !== "real") {
+    throw new Error(`Unknown deviceKind ${JSON.stringify(kind)} on lease ${lease.leaseId}`);
+  }
+  return lease;
+}
+
 export function nextId(prefix: string, seq: number): string {
   return `${prefix}_${seq}_${Math.random().toString(36).slice(2, 6)}`;
 }
@@ -92,7 +116,7 @@ export class Store {
       const parsed = JSON.parse(raw) as Partial<StoreState>;
       return new Store(file, {
         seq: typeof parsed.seq === "number" ? parsed.seq : 0,
-        leases: Array.isArray(parsed.leases) ? parsed.leases : [],
+        leases: Array.isArray(parsed.leases) ? parsed.leases.map(normalizeLease) : [],
         tickets: Array.isArray(parsed.tickets)
           ? parsed.tickets.filter((t) => t.status === "waiting" || t.status === "assigned")
           : [],

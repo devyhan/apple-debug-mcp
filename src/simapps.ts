@@ -1,12 +1,8 @@
 import { AppCacheClearer, CacheClearOptions, CacheClearResult } from "./appcache.js";
+import type { AppOps, LaunchResult } from "./appops.js";
 import { Runner, defaultRunner } from "./exec.js";
 
-export interface LaunchResult {
-  /** PID printed by `simctl launch` ("<bundle>: <pid>"). -1 when unparseable. */
-  pid: number;
-  /** Raw stdout of `simctl launch`. */
-  output: string;
-}
+export type { LaunchResult } from "./appops.js";
 
 function assertUdid(udid: string): void {
   if (udid.trim().length === 0) throw new Error("Invalid udid (expected a non-empty string)");
@@ -31,7 +27,7 @@ function assertAppPath(appPath: string): void {
  * App lifecycle on a simulator via `xcrun simctl` (openurl, install,
  * uninstall, launch, terminate). System-tool only: no new npm dependency.
  */
-export class SimApps {
+export class SimApps implements AppOps {
   private readonly run: Runner;
   private readonly execTimeoutMs: number;
 

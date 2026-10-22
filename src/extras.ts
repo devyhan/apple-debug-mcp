@@ -3,11 +3,12 @@ import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { DEFAULT_BOUND_MAX_CHARS, ExecError, tailTruncationMarker } from "./exec.js";
+import { requireSimLease } from "./devicekind.js";
 import { Llmdb, MAX_CONTINUE_WAIT_SEC, STEP_MODES, hintForDebugError, isDebugTimeoutError } from "./llmdb.js";
 import { DebugStateTracker, alreadyStoppedResult, debugRobustnessEnabled, isAlreadyStoppedError, isAlreadyStoppedResponse, isWaitElapsedError, isWaitElapsedResponse, waitElapsedResult } from "./debug-robustness.js";
 import { MAX_ASSERT_FLOW_SEC, MAX_PROXY_RULES } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
-import { SimApps } from "./simapps.js";
+import type { AppOps } from "./appops.js";
 import { Lease } from "./store.js";
 import { Symbolicator } from "./symbolicate.js";
 import { CA_DEBUG_OPTIONS, CAMERA_MIRROR_MODES, CAMERA_SOURCES, ORIENTATIONS, ServeSim } from "./servesim.js";
@@ -18,11 +19,17 @@ export interface ExtrasDeps {
   orchestrator: Orchestrator;
   serveSim: ServeSim;
   simLog: SimLog;
-  simApps: SimApps;
+  simApps: AppOps;
   xctrace: XCTrace;
   lldmdb: Llmdb;
   symbolicator?: Symbolicator;
 }
+
+const APP_REAL_DETAIL = "AppOps real backend (devicectl)";
+const STREAM_REAL_DETAIL = "real-device screen streaming";
+const DEBUG_REAL_DETAIL = "remote debug sessions";
+const NET_REAL_DETAIL = "real-device network interception (manual CA-profile install replacing the keychain step)";
+const LOG_REAL_DETAIL = "device-log capture (devicectl/syslog replacement for simctl spawn log)";
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
@@ -259,8 +266,19 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   }
 
   /** Mirrors sim_shutdown: leased sims need force=true. Returns the holder (if any). */
-  async function leaseGate(udid: string, force: boolean | undefined): Promise<{ holder: Lease | null; refusal: ToolResult | null }> {
+  async function leaseGate(
+    udid: string,
+    force: boolean | undefined,
+    real?: { verb: string; detail: string },
+  ): Promise<{ holder: Lease | null; refusal: ToolResult | null }> {
     const holder = await orch.leaseForUdid(udid);
+    if (holder && real) {
+      try {
+        requireSimLease(holder, { verb: real.verb, phase: "sim-only", detail: real.detail });
+      } catch (err) {
+        return { holder, refusal: fail((err as Error).message) };
+      }
+    }
     if (holder && !force) {
       return {
         holder,
@@ -284,7 +302,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ udid, orientation, force }) => {
       try {
-        const { holder, refusal } = await leaseGate(udid, force);
+        const { holder, refusal } = await leaseGate(udid, force, { verb: "sim_rotate", detail: "serve-sim display rotation" });
         if (refusal) return refusal;
         await serveSim.rotate(udid, orientation);
         if (holder) await orch.logAction(holder.leaseId, "sim_rotate", `rotate ${orientation}${force ? " (force)" : ""}`);
@@ -308,7 +326,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ udid, option, enabled, force }) => {
       try {
-        const { holder, refusal } = await leaseGate(udid, force);
+        const { holder, refusal } = await leaseGate(udid, force, { verb: "sim_ca_debug", detail: "serve-sim CoreAnimation debug flags" });
         if (refusal) return refusal;
         const state = enabled ? "on" : "off";
         await serveSim.caDebug(udid, option, state);
@@ -331,7 +349,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ udid, force }) => {
       try {
-        const { holder, refusal } = await leaseGate(udid, force);
+        const { holder, refusal } = await leaseGate(udid, force, { verb: "sim_memory_warning", detail: "serve-sim memory warnings" });
         if (refusal) return refusal;
         await serveSim.memoryWarning(udid);
         if (holder) await orch.logAction(holder.leaseId, "sim_memory_warning", `memory-warning${force ? " (force)" : ""}`);
@@ -361,7 +379,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ udid, bundle_id, source, file, webcam, force }) => {
       try {
-        const { holder, refusal } = await leaseGate(udid, force);
+        const { holder, refusal } = await leaseGate(udid, force, { verb: "camera_start", detail: "serve-sim synthetic camera feed injection" });
         if (refusal) return refusal;
         await serveSim.start(udid, bundle_id, { source, file, webcam });
         if (holder) {
@@ -388,7 +406,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ udid, source, file, force }) => {
       try {
-        const { holder, refusal } = await leaseGate(udid, force);
+        const { holder, refusal } = await leaseGate(udid, force, { verb: "camera_switch", detail: "serve-sim synthetic camera feed injection" });
         if (refusal) return refusal;
         await serveSim.switchSource(udid, source, file);
         if (holder) await orch.logAction(holder.leaseId, "camera_switch", `switch ${source}${force ? " (force)" : ""}`);
@@ -410,6 +428,8 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ udid, mode }) => {
       try {
+        const holder = await orch.leaseForUdid(udid);
+        if (holder) requireSimLease(holder, { verb: "camera_mirror", phase: "sim-only", detail: "serve-sim camera preview mirroring" });
         await serveSim.mirror(udid, mode);
         return ok({ udid, mode });
       } catch (err) {
@@ -469,6 +489,8 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ udid, predicate, process, level, timeout_sec, max_chars }) => {
       try {
+        const holder = await orch.leaseForUdid(udid);
+        if (holder) requireSimLease(holder, { verb: "sim_log_stream", phase: "P3", detail: LOG_REAL_DETAIL });
         const r = await simLog.stream(udid, {
           predicate,
           process,
@@ -500,6 +522,8 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ udid, last, predicate, process, info, debug, signpost, max_chars }) => {
       try {
+        const holder = await orch.leaseForUdid(udid);
+        if (holder) requireSimLease(holder, { verb: "sim_log_show", phase: "P3", detail: LOG_REAL_DETAIL });
         const r = await simLog.show(udid, {
           last: last ?? "5m",
           predicate,
@@ -527,6 +551,8 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ lease_id }) => {
       try {
+        const held = await orch.leaseById(lease_id);
+        if (held) requireSimLease(held, { verb: "stream_start", phase: "P3", detail: STREAM_REAL_DETAIL });
         const { lease, url, port } = await orch.startLeaseStream(lease_id);
         await orch.logAction(lease_id, "stream_start", `stream ${url}`);
         return ok({ lease_id, udid: lease.udid, url, port });
@@ -546,6 +572,8 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ lease_id }) => {
       try {
+        const held = await orch.leaseById(lease_id);
+        if (held) requireSimLease(held, { verb: "stream_stop", phase: "P3", detail: STREAM_REAL_DETAIL });
         const { lease, stopped } = await orch.stopLeaseStream(lease_id);
         await orch.logAction(lease_id, "stream_stop", stopped ? "stream stopped" : "stream already stopped");
         return ok({ lease_id, udid: lease.udid, stopped });
@@ -567,6 +595,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, url }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "app_open_url", phase: "P2", detail: APP_REAL_DETAIL });
         await simApps.openUrl(lease.udid, url);
         await orch.logAction(lease_id, "app_open_url", `open ${url.slice(0, 120)}`);
         return ok({ lease_id, udid: lease.udid, url });
@@ -588,6 +617,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, app_path }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "app_install", phase: "P2", detail: APP_REAL_DETAIL });
         await simApps.install(lease.udid, app_path);
         await orch.logAction(lease_id, "app_install", `install ${path.basename(app_path).slice(0, 120)}`);
         return ok({ lease_id, udid: lease.udid, app_path });
@@ -609,6 +639,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "app_uninstall", phase: "P2", detail: APP_REAL_DETAIL });
         await simApps.uninstall(lease.udid, bundle_id);
         await orch.logAction(lease_id, "app_uninstall", `uninstall ${bundle_id}`);
         return ok({ lease_id, udid: lease.udid, bundle_id });
@@ -631,6 +662,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id, args }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "app_launch", phase: "P2", detail: APP_REAL_DETAIL });
         const { pid, output } = await simApps.launch(lease.udid, bundle_id, args ?? []);
         orch.markAppLaunched(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_launch", `launch ${bundle_id} (pid ${pid})`);
@@ -653,6 +685,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "app_terminate", phase: "P2", detail: APP_REAL_DETAIL });
         await simApps.terminate(lease.udid, bundle_id);
         orch.markAppTerminated(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_terminate", `terminate ${bundle_id}`);
@@ -685,6 +718,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id, plist_keys }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "app_cache_clear", phase: "P2", detail: APP_REAL_DETAIL });
         const r = await simApps.clearCache(lease.udid, bundle_id, { plistKeys: plist_keys });
         orch.markAppTerminated(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_cache_clear", `cache-clear ${bundle_id} (${r.deletedCount} removed)`);
@@ -722,6 +756,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, duration_sec, template, attach, output_dir }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "profile_trace", phase: "P3", detail: "real-device tracing via xctrace (pairing/trust preconditions)" });
         const dir = output_dir ?? path.join(os.tmpdir(), "sim-mcp-traces");
         const output = path.join(dir, `${lease.udid}-${Date.now()}.trace`);
         const { template: used } = await xctrace.record(lease.udid, output, {
@@ -751,6 +786,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id, pid }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_attach", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const { sessionId, response } = await lldmdb.attach({ bundleId: bundle_id, pid });
         try {
           if (debugRobustnessEnabled()) debugStates.markAttached(sessionId, response);
@@ -831,6 +867,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           return fail(`debug_break takes exactly one op per call (got ${ops.join("+")}).`);
         }
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_break", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const op = ops[0]!;
         if (op === "list") {
@@ -899,6 +936,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, wait_sec }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_continue", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.cont(sessionId, wait_sec ?? 60), "continue");
         let waitElapsed = false;
@@ -931,6 +969,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, depth, thread }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_bt", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.backtrace(sessionId, depth, thread);
         const qualifiers = [
@@ -957,6 +996,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, frame }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_locals", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.locals(sessionId, frame ?? 0);
         await orch.logAction(lease_id, "debug_locals", `locals (frame ${frame ?? 0})`);
@@ -980,6 +1020,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, expr, frame }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_eval", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.eval(sessionId, expr, frame ?? 0);
         await orch.logAction(lease_id, "debug_eval", `eval ${JSON.stringify(expr.slice(0, 80))}`);
@@ -1002,6 +1043,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, mode }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_step", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.step(sessionId, mode ?? "over");
         try {
@@ -1103,6 +1145,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
           return fail("debug_launch needs exactly one of path or bundle_id.");
         }
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_launch", phase: "P3", detail: DEBUG_REAL_DETAIL });
         if (bundle_id !== undefined) {
           let pid: number;
           try {
@@ -1197,6 +1240,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_threads", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.threads(sessionId);
         await orch.logAction(lease_id, "debug_threads", "threads");
@@ -1219,6 +1263,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, frame }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_scopes", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.scopes(sessionId, frame ?? 0);
         await orch.logAction(lease_id, "debug_scopes", `scopes (frame ${frame ?? 0})`);
@@ -1242,6 +1287,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, ref }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_expand", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.expand(sessionId, ref);
         await orch.logAction(lease_id, "debug_expand", `expand ref ${ref}`);
@@ -1266,6 +1312,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, target, value, frame }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_set_var", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.setVar(sessionId, target, value, frame ?? 0);
         await orch.logAction(lease_id, "debug_set_var", `set ${target} = ${value.slice(0, 60)}`);
@@ -1289,6 +1336,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, clear, max_chars }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_output", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await lldmdb.output(sessionId, clear ?? false);
         await orch.logAction(lease_id, "debug_output", clear === true ? "output (clear)" : "output");
@@ -1315,6 +1363,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, file, line, wait_sec, cleanup }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_run_until", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await withDebugTimeoutGuard(lease_id, sessionId, () =>
           lldmdb.runUntil(sessionId, file, line, wait_sec ?? 60, { cleanup: cleanup ?? false }),
@@ -1344,6 +1393,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, timeout }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_wait", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         const result = await withDebugTimeoutGuard(lease_id, sessionId, () => lldmdb.wait(sessionId, timeout ?? 60), "wait");
         let waitElapsed = false;
@@ -1375,6 +1425,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, wait_sec }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "debug_interrupt", phase: "P3", detail: DEBUG_REAL_DETAIL });
         const sessionId = requireDebugSession(lease);
         // D1.1 (gated): skip llmdb when the session is already stopped.
         try {
@@ -1486,6 +1537,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, rules, block_quic }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "net_proxy_start", phase: "P4", detail: NET_REAL_DETAIL });
         const { port, pid, quicBlocked } = await orch.startLeaseProxy(lease_id, rules ?? [], { blockQuic: block_quic === true });
         const count = rules?.length ?? 0;
         const quic = quicBlocked ? ", quic blocked" : "";
@@ -1510,6 +1562,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, rules }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "net_proxy_set_rules", phase: "P4", detail: NET_REAL_DETAIL });
         await orch.setLeaseProxyRules(lease_id, rules);
         await orch.logAction(lease_id, "net_proxy_set_rules", `rules := ${rules.length} rule(s)`);
         return ok({ lease_id, udid: lease.udid, rule_count: rules.length });
@@ -1747,6 +1800,8 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     },
     async ({ lease_id, url_regex, method, min_count, timeout_sec, since, status, min_bytes, body_regex, rewritten, rule }) => {
       try {
+        const held = await orch.leaseById(lease_id);
+        if (held) requireSimLease(held, { verb: "net_assert_flow", phase: "P4", detail: NET_REAL_DETAIL });
         const { lease, count, total, newSinceCall, matched } = await orch.assertLeaseFlow(lease_id, {
           urlRegex: url_regex,
           ...(method !== undefined ? { method } : {}),
@@ -1802,6 +1857,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, url_regex, file }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "map_local", phase: "P4", detail: NET_REAL_DETAIL });
         const { ruleCount } = await orch.upsertLeaseMapRule(lease_id, {
           match: { url_regex },
           action: { map_local: file },
@@ -1856,6 +1912,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, url_regex, url }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "map_remote", phase: "P4", detail: NET_REAL_DETAIL });
         const { ruleCount } = await orch.upsertLeaseMapRule(lease_id, {
           match: { url_regex },
           action: { map_remote: url },

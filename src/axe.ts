@@ -1,38 +1,7 @@
 import { Runner, defaultRunner } from "./exec.js";
+import type { BatchOptions, GestureOptions, SwipeOptions, TapTarget, UiDriver } from "./uidriver.js";
 
-export interface TapTarget {
-  x?: number;
-  y?: number;
-  id?: string;
-  label?: string;
-  value?: string;
-  elementType?: string;
-  preDelay?: number;
-  postDelay?: number;
-  waitTimeout?: number;
-  pollInterval?: number;
-}
-
-export interface SwipeOptions {
-  duration?: number;
-  delta?: number;
-  preDelay?: number;
-  postDelay?: number;
-}
-
-export interface GestureOptions {
-  screenWidth?: number;
-  screenHeight?: number;
-  duration?: number;
-  delta?: number;
-}
-
-export interface BatchOptions {
-  continueOnError?: boolean;
-  waitTimeout?: number;
-  pollInterval?: number;
-  verbose?: boolean;
-}
+export type { BatchOptions, GestureOptions, SwipeOptions, TapTarget } from "./uidriver.js";
 
 const STEP_COMMANDS = new Set([
   "tap",
@@ -47,7 +16,7 @@ const STEP_COMMANDS = new Set([
   "sleep",
 ]);
 
-export class Axe {
+export class Axe implements UiDriver {
   private readonly bin: string;
   private readonly run: Runner;
   private readonly execTimeoutMs: number;

@@ -2,8 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { Axe } from "./axe.js";
 import { compactAxText } from "./ax-prune.js";
+import { requireSimLease } from "./devicekind.js";
 import { registerDeviceExtras } from "./extras.js";
 import { Llmdb } from "./llmdb.js";
 import { appendM4Audit, maybeM4Decide, noteM4Ui } from "./m4.js";
@@ -15,13 +15,16 @@ import { SimLog } from "./simlog.js";
 import { Simslim } from "./simslim.js";
 import { appendShadowLog, buildShadowExtra, noteShadowUi } from "./shadow.js";
 import { buildTapEchoExtra, buildTapFailureExtra, saveDescribeSnapshot, saveShotLink } from "./snapshot.js";
+import type { UiDriver } from "./uidriver.js";
 import { getServerInfo, getVersion } from "./version.js";
 import { XCTrace } from "./xctrace.js";
+
+const UI_REAL_DETAIL = "real-device UI automation via WebDriverAgent/idb-backed UiDriver";
 
 export interface ServerDeps {
   orchestrator: Orchestrator;
   simslim: Simslim;
-  axe: Axe;
+  axe: UiDriver;
   serveSim: ServeSim;
   simLog: SimLog;
   simApps: SimApps;
@@ -54,6 +57,8 @@ const requirementsShape = {
   device: z.string().optional().describe('Case-insensitive substring of device name, e.g. "iPhone 17 Pro".'),
   osVersion: z.string().optional().describe('OS version prefix, e.g. "26" or "26.5".'),
   platform: z.string().optional().describe('Platform, e.g. "iOS".'),
+  device_kind: z.enum(["sim", "real"]).optional().describe('Device kind. Default "sim". P0 rejects "real" (lands in P1).'),
+  transport: z.enum(["usb", "wifi"]).optional().describe('Only meaningful with device_kind "real" (P1). Accepted + persisted in P0, otherwise unused.'),
 };
 
 function truncate(text: string, maxChars: number): { text: string; truncated: boolean } {
@@ -129,6 +134,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         const holder = await orch.leaseForUdid(udid);
         let released: unknown = null;
         if (holder) {
+          requireSimLease(holder, { verb: "sim_shutdown", phase: "sim-only", detail: "simulators boot/shutdown via simslim" });
           if (!force) {
             return fail(
               `Simulator ${udid} is leased to session ${holder.sessionId} (lease ${holder.leaseId}). Pass force=true to preempt.`,
@@ -160,6 +166,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ udid, mode, except, noReboot, force }) => {
       try {
         const holder = await orch.leaseForUdid(udid);
+        if (holder) requireSimLease(holder, { verb: "sim_slim", phase: "sim-only", detail: "simulator daemon profiles via simslim" });
         const reboot = mode === "on" && noReboot === false;
         if (holder && reboot && !force) {
           return fail(
@@ -204,7 +211,14 @@ export function createMcpServer(deps: ServerDeps): McpServer {
           sessionId: args.session_id,
           client: args.client,
           task: args.task,
-          requirements: { udid: args.udid, device: args.device, osVersion: args.osVersion, platform: args.platform },
+          requirements: {
+            udid: args.udid,
+            device: args.device,
+            osVersion: args.osVersion,
+            platform: args.platform,
+            ...(args.device_kind !== undefined ? { deviceKind: args.device_kind } : {}),
+            ...(args.transport !== undefined ? { transport: args.transport } : {}),
+          },
           queue: args.queue,
           autoBoot: args.auto_boot,
           slim: args.slim,
@@ -326,6 +340,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, x, y, format, max_depth, max_chars }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "ui_describe", phase: "P2", detail: UI_REAL_DETAIL });
         const out = await axe.describeUi(lease.udid, x !== undefined && y !== undefined ? { x, y } : undefined);
         const shape = format ?? "full";
         let payload = out;
@@ -394,6 +409,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         let m4: M4Result | null = null;
       try {
         const lease = await orch.resolveLease(args.lease_id);
+        requireSimLease(lease, { verb: "ui_tap", phase: "P2", detail: UI_REAL_DETAIL });
         // M4 (env-gated, default OFF): autonomous-tap pre-tap gate. Null when
         // manual (auto !== true) or the gate is off -> falls through
         // byte-identical. Deny -> no tap, audit line, standard deny response.
@@ -462,6 +478,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, text }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "ui_type", phase: "P2", detail: UI_REAL_DETAIL });
         const out = await axe.typeText(lease.udid, text);
         await orch.logAction(lease_id, "ui_type", `type ${JSON.stringify(text.slice(0, 80))}`);
         return ok({ udid: lease.udid, output: out });
@@ -487,6 +504,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async (args) => {
       try {
         const lease = await orch.resolveLease(args.lease_id);
+        requireSimLease(lease, { verb: "ui_swipe", phase: "P2", detail: UI_REAL_DETAIL });
         const out = await axe.swipe(lease.udid, { x: args.start_x, y: args.start_y }, { x: args.end_x, y: args.end_y }, { duration: args.duration });
         await orch.logAction(args.lease_id, "ui_swipe", `swipe (${args.start_x},${args.start_y})->(${args.end_x},${args.end_y})`);
         return ok({ udid: lease.udid, output: out });
@@ -509,6 +527,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, preset, duration }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "ui_gesture", phase: "P2", detail: UI_REAL_DETAIL });
         const out = await axe.gesture(lease.udid, preset, { duration });
         await orch.logAction(lease_id, "ui_gesture", `gesture ${preset}`);
         return ok({ udid: lease.udid, output: out });
@@ -531,6 +550,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, button, duration }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "ui_button", phase: "P2", detail: UI_REAL_DETAIL });
         const out = await axe.button(lease.udid, button, duration);
         await orch.logAction(lease_id, "ui_button", `button ${button}`);
         return ok({ udid: lease.udid, output: out });
@@ -551,6 +571,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "ui_screenshot", phase: "P2", detail: UI_REAL_DETAIL });
         fs.mkdirSync(screenshotDir, { recursive: true });
         const file = path.join(screenshotDir, `${lease.udid}-${Date.now()}.png`);
         await axe.screenshot(lease.udid, file);
@@ -580,6 +601,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id, steps, continue_on_error, wait_timeout }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
+        requireSimLease(lease, { verb: "ui_batch", phase: "P2", detail: UI_REAL_DETAIL });
         const out = await axe.batch(lease.udid, steps, { continueOnError: continue_on_error, waitTimeout: wait_timeout });
         await orch.logAction(lease_id, "ui_batch", `batch ${steps.length} steps: ${steps.join("; ").slice(0, 120)}`);
         return ok({ udid: lease.udid, output: out });

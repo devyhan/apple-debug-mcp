@@ -98,7 +98,7 @@ describe("Store", () => {
       s.seq = 7;
       s.leases.push({
         leaseId: "lease_1", udid: "U1", sessionId: "s", client: "orca",
-        createdAt: 1, lastHeartbeat: 1, ttlMs: 1000,
+        createdAt: 1, lastHeartbeat: 1, ttlMs: 1000, deviceKind: "sim",
       });
       s.tickets.push({
         ticketId: "ticket_2", sessionId: "s2", client: "tma", requirements: {},
