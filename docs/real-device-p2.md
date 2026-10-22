@@ -194,3 +194,12 @@ behind one backend — no Appium needed:
 Nothing above has been run against a device yet (needs WDA signing +
 install + a running WDA session); the P2-B workflow must ground each
 verb live before wiring. Xcode on this host: 26.6 (17F113).
+
+Measured split 2026-10-22 (paired iPhone 16 Pro Max):
+
+- WDA-less: `ios screenshot --output=` works with NO session —
+  genuine 1320x2868 PNG captured. Screenshots are wirtable today.
+- WDA-gated: `ios ui status` fails `dial 127.0.0.1:12004: connection
+  refused` — every `ios ui *` verb (tap/swipe/type/source/…)
+  needs a running WDA server first (download → sign → install →
+  run → local port 12004).
