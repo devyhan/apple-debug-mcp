@@ -131,6 +131,40 @@ one") is deleted — it was false for open-url once measured.
   Usage: `ios webinspector launch <url>
   [--bundle-id=<bundleID>] [--timeout=<seconds>] [options]`
   (`ios webinspector --help` alone errors `unknown help topic`).
-- Uninstall keychain-persistence / reinstall data-loss semantics.
+- ~~Reinstall data-loss semantics~~ — RESOLVED by contract (§6: wipe +
+  logout, `logged_out: true`, named half-state). Uninstall
+  keychain-persistence (whether iOS preserves keychain items across an
+  uninstall) — still CARRIED, unverified live.
 - `devicectl copy to --remove-existing-content=true` pseudo-clear —
   speculative, still dev-profile-gated.
+
+## 6. `app_reinstall` — uninstall→install in one call (sim + real)
+
+`app_reinstall {lease_id, bundle_id, app_path, confirm_data_loss: true}`
+(`src/extras.ts`, after `app_uninstall`) composes the two verbs the caller
+could otherwise run separately, over the SAME backend each verb uses today
+per lease kind (`appsFor` dispatch: simctl via `SimApps` for sim leases,
+go-ios via `RealDeviceApps` for real leases). No `AppOps`/backend changes;
+existing verbs are byte-identical.
+
+- Gate: `confirm_data_loss` is `z.literal(true)` — a missing/declined
+  confirm (or a missing/empty `app_path`) is refused at schema validation
+  with zero spawns. The refusal names the wipe (Documents/Keychain, logs
+  out).
+- Return: `{lease_id, udid, bundle_id, uninstalled: true, installed: true,
+  logged_out: true}` — deliberately NOT the `CacheClearResult` shape:
+  reinstall is the opposite of `app_cache_clear` (wipe + logout vs
+  Caches-only, login-preserving).
+- Failure semantics (non-atomic by nature): an uninstall failure aborts
+  before install (no half-state); an install failure after uninstall
+  returns a half-state error (`app <bundle> was removed but install
+  failed: <reason>`) with the backend's own text verbatim — device errors
+  keep their text and are never reframed as a missing binary. Both
+  outcomes are recorded in `lease_actions` (success or `HALF-STATE`).
+- Contamination: no terminate-first (uninstall removes a running app on
+  both backends; terminate would fail on a non-running app for zero
+  benefit), and `markAppTerminated` is called on both outcomes — the
+  reinstalled app is not running, so a stale lease-launched claim would
+  wrongly whitelist a foreign relaunch. `test/appreinstall.test.ts` proves
+  the wiring end-to-end (launch → reinstall → foreign check flips
+  contended).

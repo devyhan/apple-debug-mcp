@@ -199,7 +199,7 @@ const netProxyRulesSchema = z
 /**
  * Phase-1 device extras: serve-sim one-shots (rotate, CoreAnimation debug
  * flags, memory warnings), synthetic camera (start/switch/mirror/status/stop),
- * unified-log capture, app lifecycle (openurl/install/uninstall/launch/
+ * unified-log capture, app lifecycle (openurl/install/uninstall/reinstall/launch/
  * terminate/cache-clear), xctrace profiling, llmdb debugging (attach/launch/break/
  * continue/run-until/wait/interrupt/bt/threads/locals/scopes/expand/eval/
  * set-var/output/step/detach/sessions/doctor, all lease-gated), atos crash
@@ -661,6 +661,54 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         await appsFor(lease, "app_uninstall").uninstall(lease.udid, bundle_id);
         await orch.logAction(lease_id, "app_uninstall", `uninstall ${bundle_id}`);
         return ok({ lease_id, udid: lease.udid, bundle_id });
+      } catch (err) {
+        return fail((err as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    "app_reinstall",
+    {
+      description:
+        "Reinstall an app on your lease: uninstall then install from app_path in one call (xcrun simctl on a simulator, go-ios on a real-device lease). WIPES Documents/Keychain and logs out — the opposite of app_cache_clear. Requires confirm_data_loss: true.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        bundle_id: z.string().min(1).describe("Bundle id to remove and reinstall, e.g. com.example.App."),
+        app_path: z.string().min(1).describe("Host path to the .app bundle to install after removal."),
+        confirm_data_loss: z
+          .literal(true, {
+            errorMap: () => ({
+              message:
+                "app_reinstall refused: pass confirm_data_loss: true — reinstall wipes Documents/Keychain and logs out",
+            }),
+          })
+          .describe("Must be true: reinstall wipes Documents/Keychain (logs out). Refused otherwise, before any spawn."),
+      },
+    },
+    async ({ lease_id, bundle_id, app_path }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        // Same backend path each verb uses today: simctl via SimApps for sim
+        // leases, go-ios via RealDeviceApps for real leases (appsFor dispatch).
+        // No terminate-first: uninstall removes a running app on both backends,
+        // while terminate would fail on a non-running app for zero benefit.
+        const apps = appsFor(lease, "app_reinstall");
+        await apps.uninstall(lease.udid, bundle_id);
+        try {
+          await apps.install(lease.udid, app_path);
+        } catch (err) {
+          // Non-atomic by nature: the app is already gone. Name the half-state
+          // and keep the backend's own text verbatim (device errors are never
+          // reframed as a missing binary). The app is not running, so the
+          // lease-launched claim is dropped exactly like terminate.
+          orch.markAppTerminated(lease_id, bundle_id);
+          await orch.logAction(lease_id, "app_reinstall", `reinstall ${bundle_id} HALF-STATE (removed, install failed)`);
+          return fail(`app_reinstall half-state: app ${bundle_id} was removed but install failed: ${(err as Error).message}`);
+        }
+        orch.markAppTerminated(lease_id, bundle_id);
+        await orch.logAction(lease_id, "app_reinstall", `reinstall ${bundle_id} from ${path.basename(app_path).slice(0, 120)}`);
+        return ok({ lease_id, udid: lease.udid, bundle_id, uninstalled: true, installed: true, logged_out: true });
       } catch (err) {
         return fail((err as Error).message);
       }

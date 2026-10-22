@@ -1,6 +1,6 @@
 # Tools
 
-69 tools across 10 groups. Tools marked \* require a `lease_id` and accept only
+70 tools across 10 groups. Tools marked \* require a `lease_id` and accept only
 the holding lease.
 
 | Group | Tools |
@@ -10,7 +10,7 @@ the holding lease.
 | UI automation (8) \* | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch` |
 | Device extras (5) | `sim_rotate`, `sim_ca_debug`, `sim_memory_warning`, `sim_log_stream`, `sim_log_show` |
 | Synthetic camera (5) | `camera_start`, `camera_switch`, `camera_mirror`, `camera_status`, `camera_stop` |
-| App lifecycle (6) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_launch`, `app_terminate`, `app_cache_clear` |
+| App lifecycle (7) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_reinstall`, `app_launch`, `app_terminate`, `app_cache_clear` |
 | Profiling (1) \* | `profile_trace` |
 | Live streaming (2) \* | `stream_start`, `stream_stop` |
 | Debugging (20) \* | `debug_attach`, `debug_launch`, `debug_break`, `debug_continue`, `debug_run_until`, `debug_wait`, `debug_interrupt`, `debug_bt`, `debug_threads`, `debug_locals`, `debug_scopes`, `debug_expand`, `debug_eval`, `debug_set_var`, `debug_output`, `debug_step`, `debug_detach`, `debug_sessions`, `debug_doctor`, `symbolicate` (lease optional) |
@@ -55,7 +55,12 @@ Key behaviors:
   leases `app_install`/`app_uninstall`/`app_launch`/`app_terminate` use
   go-ios, `app_open_url` uses devicectl (http(s) via Safari; other schemes
   stay P2), and `app_cache_clear` stays P2 (no container-delete transport
-  for third-party apps).
+  for third-party apps). `app_reinstall` composes uninstall→install in one
+  call over the same backends per lease kind, requires
+  `confirm_data_loss: true` (refused at validation with zero spawns
+  otherwise), wipes Documents/Keychain (`logged_out: true` — the opposite
+  of `app_cache_clear`), and names the half-state when install fails after
+  uninstall.
 - `profile_trace` records with `xcrun xctrace record --device` into a `.trace`
   file (default template "Time Profiler", default 5s, max 60s). `--attach`
   often cannot find the simulator process ("Cannot find process"), so

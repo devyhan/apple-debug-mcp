@@ -22,7 +22,7 @@ apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
 
 ## Features
 
-- **69 tools across 10 groups** — pool/lease/queue, AXe UI automation, device extras, synthetic camera, app lifecycle, xctrace profiling, live streaming, llmdb debugging, crash symbolication, and an HTTPS intercept proxy
+- **70 tools across 10 groups** — pool/lease/queue, AXe UI automation, device extras, synthetic camera, app lifecycle, xctrace profiling, live streaming, llmdb debugging, crash symbolication, and an HTTPS intercept proxy
 - **One shared daemon** — leases, the wait queue, and auto-dispatch live in a single process; per-session stdio servers would split the pool
 - **Lease ownership gates** — each lease holds one simulator and only its holder may drive UI, apps, debugging, or the proxy through it
 - **Wait queue with auto-dispatch** — when no simulator matches, callers get a ticket; releases, TTL expiry, and external-shutdown detection hand the next match to the first fitting ticket (FIFO)
@@ -196,7 +196,7 @@ npm uninstall -g apple-debug-mcp               # when installed via npm-global
 
 Full reference: [Tools](docs/tools.md).
 
-69 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
+70 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
 
 | Group | Tools |
 | --- | --- |
@@ -205,7 +205,7 @@ Full reference: [Tools](docs/tools.md).
 | UI automation (8) \* | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch` |
 | Device extras (5) | `sim_rotate`, `sim_ca_debug`, `sim_memory_warning`, `sim_log_stream`, `sim_log_show` |
 | Synthetic camera (5) | `camera_start`, `camera_switch`, `camera_mirror`, `camera_status`, `camera_stop` |
-| App lifecycle (6) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_launch`, `app_terminate`, `app_cache_clear` |
+| App lifecycle (7) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_reinstall`, `app_launch`, `app_terminate`, `app_cache_clear` |
 | Profiling (1) \* | `profile_trace` |
 | Live streaming (2) \* | `stream_start`, `stream_stop` |
 | Debugging (20) \* | `debug_attach`, `debug_launch`, `debug_break`, `debug_continue`, `debug_run_until`, `debug_wait`, `debug_interrupt`, `debug_bt`, `debug_threads`, `debug_locals`, `debug_scopes`, `debug_expand`, `debug_eval`, `debug_set_var`, `debug_output`, `debug_step`, `debug_detach`, `debug_sessions`, `debug_doctor`, `symbolicate` (lease optional) |
@@ -221,7 +221,7 @@ Key behaviors:
 - `sim_log_stream` collects live logs for a window (default 5s, max 60s), `sim_log_show` reads the past `--last` window (default `5m`); both are `xcrun simctl spawn`-based, so they need no serve-sim. Results are `{log, truncated, timedOut}` — `stream` always ends on window expiry, so `timedOut: true` is normal.
 - Log filters: a full predicate (`predicate`, e.g. `process == "MyApp"`) or the `process` shorthand; both combine with AND. Predicates are rejected before the call when empty or unbalanced. Quote string literals with double quotes (`eventMessage CONTAINS "x"`); parens inside literals are ignored, so `process == "My(App)"` is valid.
 - Output past `max_chars` (default 20000) keeps the tail with a `…[truncated N chars]` prefix. Prefer a narrow window (`timeout_sec`/`last`) plus a `process` filter.
-- App lifecycle is `xcrun simctl`-based with no extra dependencies: `app_launch` returns `{pid}`; `terminate` fails on a non-running app ("found nothing to terminate"); `uninstall` quietly succeeds on a missing bundle (idempotent). Every call is recorded in `lease_actions`.
+- App lifecycle is `xcrun simctl`-based with no extra dependencies: `app_launch` returns `{pid}`; `terminate` fails on a non-running app ("found nothing to terminate"); `uninstall` quietly succeeds on a missing bundle (idempotent). Every call is recorded in `lease_actions`. `app_reinstall` composes uninstall→install in one call, requires `confirm_data_loss: true`, and wipes Documents/Keychain (`logged_out: true`).
 - `profile_trace` records with `xcrun xctrace record --device` into a `.trace` file (default template "Time Profiler", default 5s, max 60s). `--attach` often cannot find the simulator process ("Cannot find process"), so whole-system recording is the default. Note: on this host family simulator-target recording stalls at "Starting recording..." (host recording works), so the smoke test asserts the validation path only.
 - Streaming is opt-in: `lease_acquire` with `stream: true` (a stream failure only warns; the lease stands) or `stream_start`/`stream_stop` (both idempotent; `stream_start` returns the existing URL when already streaming). The URL lives on the lease's `streamUrl`, visible in `pool_status`/`sessions_list`/`lease_list`. One stream costs one serve-sim helper process plus MJPEG CPU — turn it on to look, off when done; `ui_screenshot` is cheaper for stills. Ports scan upward from `SERVE_SIM_PORT_BASE` because serve-sim kills whatever occupies its requested port instead of scanning (and its `:3100` default would collide with this daemon).
 - Debugging wraps the llmdb CLI (an lldb-dap wrapper with session JSON): `debug_attach {bundle_id|pid}` (exactly one) or `debug_launch {path, args?}` opens one session per lease, then break/continue/inspect. Needs a debuggable (`get-task-allow`) third-party build plus one-time host developer-tools authorization — stock Apple apps refuse attach. llmdb 0.2.0 takes `file:line` breakpoints only (no symbol breakpoints), `expand` takes a variablesReference number (not an expression), and `launch` takes a binary path (not a bundle ID).
