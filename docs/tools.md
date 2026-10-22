@@ -31,7 +31,9 @@ Key behaviors:
   same, naming the holder in the error. `camera_start`/`camera_switch` are
   lease-gated the same way; `camera_mirror`/`camera_status`/`camera_stop`
   ignore leases.
-- `ui_screenshot` returns a PNG path plus an image block. `sim_rotate` takes
+- `ui_screenshot` returns a PNG path plus an image block (same shape on sim
+  and real leases; real leases capture via WDA-less `ios screenshot`, every
+  other `ui_*` verb stays sim-only P2). `sim_rotate` takes
   `portrait|portrait_upside_down|landscape_left|landscape_right`;
   `sim_ca_debug` takes `option=blended|copies|misaligned|offscreen|slow-animations`
   plus an `enabled` boolean.

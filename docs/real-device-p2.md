@@ -191,9 +191,10 @@ behind one backend — no Appium needed:
 - devicectl side: `device orientation` (control), `device notification`
   (post/observe Darwin notifications) — narrow but native.
 
-Nothing above has been run against a device yet (needs WDA signing +
-install + a running WDA session); the P2-B workflow must ground each
-verb live before wiring. Xcode on this host: 26.6 (17F113).
+Except `ios screenshot` (§8, now wired), nothing above has been run
+against a device yet (needs WDA signing + install + a running WDA
+session); the P2-B workflow must ground each remaining verb live before
+wiring. Xcode on this host: 26.6 (17F113).
 
 Measured split 2026-10-22 (paired iPhone 16 Pro Max):
 
@@ -203,3 +204,43 @@ Measured split 2026-10-22 (paired iPhone 16 Pro Max):
   refused` — every `ios ui *` verb (tap/swipe/type/source/…)
   needs a running WDA server first (download → sign → install →
   run → local port 12004).
+
+## 8. `ui_screenshot` — WIRED (screenshot-only `UiDriver`)
+
+First P2-B verb out of §7: `RealUiDriver` (`src/realui.ts`) implements
+`UiDriver` with a real `screenshot` and precise P2 throws for the seven
+WDA-gated verbs (`REAL_UI_WDA_DETAIL`). Scope is deliberately
+screenshot-only — tap/type/source need a running WDA session (§7) and
+stay out.
+
+Real path:
+
+```
+ios screenshot --udid=<udid> --output=<file>
+```
+
+- Transport: go-ios `screenshot` (`ios screenshot --help`: capture or
+  MJPEG stream; global `--udid=<udid>`). No session, no signing.
+- Validation mirrors the sim seam (`Invalid udid/output`, no spawn).
+- After capture the file is verified (exists + PNG magic bytes
+  `89 50 4E 47 0D 0A 1A 0A`); a missing/non-PNG result fails with the
+  backend text verbatim, never a missing-binary claim.
+- Failures mirror the go-ios seam in `realdevices.ts`: ENOENT-only
+  install hint (`GO_IOS_INSTALL_HINT`), device-side text verbatim
+  otherwise.
+
+Live-verified end-to-end 2026-10-22 on the paired iPhone 16 Pro Max
+(`00008140-000555603453001C`): exit 0,
+`{"msg":"File saved successfully"}`, genuine 1320x2868 PNG on disk.
+
+Handler routing (`src/server.ts`): new optional `ServerDeps.realUi`
+(parallel to `realApps`/`realLog`, constructed + wired in `index.ts`)
+with a `uiFor(lease)` helper mirroring extras `appsFor` — sim leases
+get `Axe` (byte-identical argv + ok shape), real leases get `RealUiDriver`.
+The `requireSimLease` gate is dropped ONLY on `ui_screenshot`; the
+mkdir/filename/base64/image-extra/logAction plumbing is shared and
+unchanged. Boot probe + install hint follow the `realApps`/`realLog`
+wiring (same `ios` binary probe; warning and doctor fix text now name
+`ui_screenshot`). `test/realui.test.ts` proves the driver contract and
+the dispatch end-to-end (real → go-ios argv + image block, sim →
+unchanged axe argv, missing-transport error, other verbs still P2).

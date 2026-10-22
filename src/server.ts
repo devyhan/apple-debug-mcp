@@ -3,7 +3,7 @@ import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { compactAxText } from "./ax-prune.js";
-import { requireSimLease } from "./devicekind.js";
+import { isRealLease, requireSimLease } from "./devicekind.js";
 import { registerDeviceExtras } from "./extras.js";
 import { Llmdb } from "./llmdb.js";
 import { appendM4Audit, maybeM4Decide, noteM4Ui } from "./m4.js";
@@ -13,6 +13,7 @@ import { ServeSim } from "./servesim.js";
 import type { AppOps } from "./appops.js";
 import type { LogOps } from "./logops.js";
 import { Simslim } from "./simslim.js";
+import type { Lease } from "./store.js";
 import { appendShadowLog, buildShadowExtra, noteShadowUi } from "./shadow.js";
 import { buildTapEchoExtra, buildTapFailureExtra, saveDescribeSnapshot, saveShotLink } from "./snapshot.js";
 import type { UiDriver } from "./uidriver.js";
@@ -33,6 +34,8 @@ export interface ServerDeps {
   screenshotDir: string;
   realApps?: AppOps;
   realLog?: LogOps;
+  /** Real-device UI backend (go-ios screenshot). Absent ⇒ real ui_screenshot fails with a missing-transport error. */
+  realUi?: UiDriver;
 }
 
 type ToolResult = {
@@ -71,6 +74,15 @@ function truncate(text: string, maxChars: number): { text: string; truncated: bo
 export function createMcpServer(deps: ServerDeps): McpServer {
   const { orchestrator: orch, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir } = deps;
   const server = new McpServer({ name: "apple-debug-mcp", version: getVersion() });
+
+  /** UI backend for a resolved lease: AXe for sims, go-ios screenshot for real devices. */
+  function uiFor(lease: Lease, verb: string): UiDriver {
+    if (!isRealLease(lease)) return axe;
+    if (!deps.realUi) {
+      throw new Error(`${verb} on real-device lease ${lease.leaseId} needs the go-ios screenshot transport, which is unavailable in this embedding.`);
+    }
+    return deps.realUi;
+  }
 
   // ---------------- pool state ----------------
 
@@ -565,7 +577,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_screenshot",
     {
-      description: "Capture a PNG screenshot from your leased simulator. Returns the image plus its saved path.",
+      description: "Capture a PNG screenshot from your leased simulator or real device. Returns the image plus its saved path.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
@@ -573,10 +585,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     async ({ lease_id }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "ui_screenshot", phase: "P2", detail: UI_REAL_DETAIL });
         fs.mkdirSync(screenshotDir, { recursive: true });
         const file = path.join(screenshotDir, `${lease.udid}-${Date.now()}.png`);
-        await axe.screenshot(lease.udid, file);
+        await uiFor(lease, "ui_screenshot").screenshot(lease.udid, file);
         const data = fs.readFileSync(file).toString("base64");
         // M1 snapshot (env-gated, default OFF): shot->describe link; null when off.
         const shot = saveShotLink({ leaseId: lease_id, shotPath: file });

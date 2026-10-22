@@ -12,6 +12,7 @@ import { NetProxy } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import { GO_IOS_INSTALL_HINT, RealDeviceApps, RealDevices } from "./realdevices.js";
 import { RealSyslog } from "./realsyslog.js";
+import { RealUiDriver } from "./realui.js";
 import { createMcpServer } from "./server.js";
 import { ServeSim } from "./servesim.js";
 import { SimApps } from "./simapps.js";
@@ -67,6 +68,7 @@ async function main(): Promise<void> {
   const realDevices = new RealDevices({ execTimeoutMs: config.execTimeoutMs });
   const realApps = new RealDeviceApps({ iosBin: config.iosBin, execTimeoutMs: config.execTimeoutMs });
   const realLog = new RealSyslog({ iosBin: config.iosBin });
+  const realUi = new RealUiDriver({ iosBin: config.iosBin, execTimeoutMs: config.execTimeoutMs });
 
   for (const [name, check] of [
     ["simslim", () => simslim.checkAvailable()],
@@ -145,14 +147,14 @@ async function main(): Promise<void> {
   }
 
   // Optional dependency: the daemon starts without go-ios; the real-lease
-  // app verbs and syslog relay fail at call time with an install hint.
+  // app verbs, syslog relay and ui_screenshot fail at call time with an install hint.
   try {
     const version = await realApps.checkAvailable();
     console.log(`[sim-mcp] ios: ${version.split("\n")[0]}`);
   } catch {
     console.warn(
       `[sim-mcp] WARNING: optional binary "${config.iosBin}" is not usable; ` +
-        `app_install/app_uninstall/app_launch/app_terminate and sim_log_stream on real-device leases ` +
+        `app_install/app_uninstall/app_launch/app_terminate, sim_log_stream and ui_screenshot on real-device leases ` +
         `will fail until it is installed (${GO_IOS_INSTALL_HINT}, or set IOS_BIN)`,
     );
   }
@@ -173,7 +175,7 @@ async function main(): Promise<void> {
     contaminationCheckMinIntervalMs: config.contaminationCheckMinIntervalMs,
     traceDir: config.traceDir,
   });
-  const mcpDeps = { orchestrator, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir: config.screenshotDir, realApps, realLog };
+  const mcpDeps = { orchestrator, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir: config.screenshotDir, realApps, realLog, realUi };
 
   // One transport (= one MCP session) per client; the Orchestrator+Store behind
   // every session is shared, so pool/lease/queue state is truly global across
