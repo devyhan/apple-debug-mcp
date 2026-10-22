@@ -15,6 +15,7 @@ import { Lease } from "./store.js";
 import { Symbolicator } from "./symbolicate.js";
 import { CA_DEBUG_OPTIONS, CAMERA_MIRROR_MODES, CAMERA_SOURCES, ORIENTATIONS, ServeSim } from "./servesim.js";
 import { MAX_STREAM_SEC } from "./simlog.js";
+import { instrumentToolcalls } from "./toolcalls.js";
 import { MAX_TRACE_SEC, XCTrace } from "./xctrace.js";
 
 export interface ExtrasDeps {
@@ -217,6 +218,7 @@ const netProxyRulesSchema = z
  * and the per-lease action log.
  */
 export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void {
+  instrumentToolcalls(server); // P1 single choke point (idempotent; no-op when createMcpServer already wrapped this server).
   const { orchestrator: orch, serveSim, simLog, simApps, xctrace, lldmdb } = deps;
   const symbolicator = deps.symbolicator ?? new Symbolicator();
   const debugStates = new DebugStateTracker();
@@ -325,7 +327,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "sim_rotate",
     {
-      description: "Rotate a simulator display via serve-sim. Refuses when leased unless force=true.",
+      title: "Rotate display",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to rotate a simulator display. INSTEAD OF `serve-sim rotate -d UDID <orientation>`. Rotate a simulator display via serve-sim. Refuses when leased unless force=true.",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
         orientation: z.enum(ORIENTATIONS).describe("Target orientation."),
@@ -348,7 +352,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "sim_ca_debug",
     {
-      description: "Toggle a CoreAnimation debug visualization via serve-sim. Refuses when leased unless force=true.",
+      title: "Toggle CA debug",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to toggle a CoreAnimation debug visualization. INSTEAD OF `serve-sim ca-debug -d UDID <option> <on|off>`. Toggle a CoreAnimation debug visualization via serve-sim. Refuses when leased unless force=true.",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
         option: z.enum(CA_DEBUG_OPTIONS).describe("Debug visualization to toggle."),
@@ -373,7 +379,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "sim_memory_warning",
     {
-      description: "Simulate a memory warning on a simulator via serve-sim. Refuses when leased unless force=true.",
+      title: "Memory warning",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to simulate a memory warning. INSTEAD OF `serve-sim memory-warning -d UDID`. Simulate a memory warning on a simulator via serve-sim. Refuses when leased unless force=true.",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
         force: z.boolean().optional().describe("Proceed even when another session holds the lease. Default false."),
@@ -395,8 +403,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "camera_start",
     {
+      title: "Start camera feed",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "Launch an app with a synthetic serve-sim camera feed (placeholder, host webcam, or image/video file). Relaunches the app; needs a debuggable (get-task-allow) build. Refuses when leased unless force=true.",
+        "WHEN you want to launch an app with a fake or synthetic camera feed (placeholder, webcam, or file). INSTEAD OF `serve-sim camera <bundle-id> -d UDID [--file PATH | --webcam [name]]`. Launch an app with a synthetic serve-sim camera feed (placeholder, host webcam, or image/video file). Relaunches the app; needs a debuggable (get-task-allow) build. Refuses when leased unless force=true.",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
         bundle_id: z.string().describe("App bundle id to launch with the injected feed."),
@@ -427,8 +437,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "camera_switch",
     {
+      title: "Switch camera feed",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Hot-swap a running serve-sim camera feed without relaunching the app. Refuses when leased unless force=true.",
+        "WHEN you want to hot-swap a running camera feed without relaunching. INSTEAD OF `serve-sim camera switch <source> [file] -d UDID`. Hot-swap a running serve-sim camera feed without relaunching the app. Refuses when leased unless force=true.",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
         source: z.enum(CAMERA_SOURCES).describe("Feed source to switch to."),
@@ -452,7 +464,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "camera_mirror",
     {
-      description: "Set preview mirroring (auto|on|off) for a running serve-sim camera feed. Read-only vs leases.",
+      title: "Mirror camera preview",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to set camera preview mirroring. INSTEAD OF `serve-sim camera mirror <mode> -d UDID`. Set preview mirroring (auto|on|off) for a running serve-sim camera feed. Read-only vs leases.",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
         mode: z.enum(CAMERA_MIRROR_MODES).describe("Preview mirroring mode."),
@@ -473,7 +487,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "camera_status",
     {
-      description: "Show a simulator's serve-sim camera helper state ({alive:false} when idle).",
+      title: "Camera status",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to check camera helper state. INSTEAD OF `serve-sim camera status -d UDID`. Show a simulator's serve-sim camera helper state ({alive:false} when idle).",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
       },
@@ -491,7 +507,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "camera_stop",
     {
-      description: "Stop a simulator's serve-sim camera helper (terminates injected apps). Idempotent.",
+      title: "Stop camera",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to stop the camera helper. INSTEAD OF `serve-sim camera --stop-webcam -d UDID`. Stop a simulator's serve-sim camera helper (terminates injected apps). Idempotent.",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
       },
@@ -509,7 +527,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "sim_log_stream",
     {
-      description: "Capture live log output for a bounded window: unified log on a simulator (xcrun simctl spawn log stream), syslog relay on a real-device lease (go-ios; predicate/process are client-side substring/regex filters there, level is rejected).",
+      title: "Stream logs",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to watch live logs, tail, stream, or follow console output. INSTEAD OF `xcrun simctl spawn UDID log stream --style compact --level LEVEL [--predicate ...]` on sims, or `ios syslog --udid=UDID` on real devices. Capture live log output for a bounded window: unified log on a simulator (xcrun simctl spawn log stream), syslog relay on a real-device lease (go-ios; predicate/process are client-side substring/regex filters there, level is rejected).",
       inputSchema: {
         udid: z.string().describe("Simulator or device UDID."),
         predicate: z.string().optional().describe("Log predicate filter, e.g. 'process == \"MyApp\"'."),
@@ -539,7 +559,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "sim_log_show",
     {
-      description: "Show recent historical unified-log output from a simulator (xcrun simctl spawn log show --last). Real-device leases have no history (live-only relay): use sim_log_stream.",
+      title: "Show log history",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to read past log history. INSTEAD OF `xcrun simctl spawn UDID log show --style compact --last WINDOW [--info/--debug/--signpost]` (sims only; real devices have no history). Show recent historical unified-log output from a simulator (xcrun simctl spawn log show --last). Real-device leases have no history (live-only relay): use sim_log_stream.",
       inputSchema: {
         udid: z.string().describe("Simulator or device UDID."),
         last: z.string().optional().describe('Historical window, e.g. "30s", "5m", "2h". Default "5m".'),
@@ -573,8 +595,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "stream_start",
     {
+      title: "Start screen stream",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Start (or reuse) a live MJPEG stream for your lease: a serve-sim helper on a scanned port for simulators (idempotent); the single go-ios :3333 feed for real-device leases (single-flight across the host — one real stream at a time, ~2fps).",
+        "WHEN you want to watch the live screen as an MJPEG stream. INSTEAD OF `serve-sim --detach UDID --port PORT` on sims, or `ios screenshot --stream --udid=UDID` on real devices. Start (or reuse) a live MJPEG stream for your lease: a serve-sim helper on a scanned port for simulators (idempotent); the single go-ios :3333 feed for real-device leases (single-flight across the host — one real stream at a time, ~2fps).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
@@ -596,7 +620,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "stream_stop",
     {
-      description: "Stop the live stream for your lease. Idempotent: stopping twice succeeds.",
+      title: "Stop screen stream",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to stop the live screen stream. INSTEAD OF `serve-sim --kill UDID`. Stop the live stream for your lease. Idempotent: stopping twice succeeds.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
@@ -618,7 +644,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_open_url",
     {
-      description: "Open a URL on your lease (xcrun simctl openurl stock handler on a simulator; http(s) via Safari on a real-device lease, other schemes stay P2).",
+      title: "Open URL",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+      description: "WHEN you want to open a URL or deep link in the stock handler. INSTEAD OF `xcrun simctl openurl UDID URL` on sims, or `xcrun devicectl device process launch --device UDID --payload-url URL com.apple.mobilesafari` on real devices. Open a URL on your lease (xcrun simctl openurl stock handler on a simulator; http(s) via Safari on a real-device lease, other schemes stay P2).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         url: z.string().min(1).describe("URL to open, e.g. https://www.apple.com."),
@@ -639,7 +667,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_install",
     {
-      description: "Install an .app bundle onto your lease (xcrun simctl install on a simulator, go-ios install on a real-device lease).",
+      title: "Install app",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to install an .app bundle. INSTEAD OF `xcrun simctl install UDID <app-path>` on sims, or `ios install --path=<app-path> --udid=UDID` on real devices. Install an .app bundle onto your lease (xcrun simctl install on a simulator, go-ios install on a real-device lease).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         app_path: z.string().min(1).describe("Host path to the .app bundle to install."),
@@ -660,7 +690,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_uninstall",
     {
-      description: "Remove an app from your lease (xcrun simctl uninstall on a simulator, go-ios uninstall on a real-device lease).",
+      title: "Uninstall app",
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to remove or uninstall an app. INSTEAD OF `xcrun simctl uninstall UDID <bundle-id>` on sims, or `ios uninstall <bundle-id> --udid=UDID` on real devices. Remove an app from your lease (xcrun simctl uninstall on a simulator, go-ios uninstall on a real-device lease).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id to remove, e.g. com.example.App."),
@@ -681,8 +713,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_reinstall",
     {
+      title: "Reinstall app",
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
       description:
-        "Reinstall an app on your lease: uninstall then install from app_path in one call (xcrun simctl on a simulator, go-ios on a real-device lease). WIPES Documents/Keychain and logs out — the opposite of app_cache_clear. Requires confirm_data_loss: true.",
+        "WHEN you want to reinstall an app wiped fresh (logout expected). INSTEAD OF the `xcrun simctl uninstall` + `xcrun simctl install` pair (or the `ios uninstall` + `ios install` pair on real devices) in one call. Reinstall an app on your lease: uninstall then install from app_path in one call (xcrun simctl on a simulator, go-ios on a real-device lease). WIPES Documents/Keychain and logs out — the opposite of app_cache_clear. Requires confirm_data_loss: true.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id to remove and reinstall, e.g. com.example.App."),
@@ -729,7 +763,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_launch",
     {
-      description: "Launch an app by bundle id on your lease (xcrun simctl launch on a simulator, go-ios launch on a real-device lease). Returns its pid.",
+      title: "Launch app",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to launch an app by bundle id. INSTEAD OF `xcrun simctl launch UDID <bundle-id> [args]` on sims, or `ios launch <bundle-id> --arg=... --udid=UDID` on real devices. Launch an app by bundle id on your lease (xcrun simctl launch on a simulator, go-ios launch on a real-device lease). Returns its pid.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id to launch, e.g. com.apple.Preferences."),
@@ -752,7 +788,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_terminate",
     {
-      description: "Terminate an app by bundle id on your lease (xcrun simctl terminate on a simulator, go-ios kill on a real-device lease).",
+      title: "Terminate app",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to terminate or kill a running app. INSTEAD OF `xcrun simctl terminate UDID <bundle-id>` on sims, or `ios kill <bundle-id> --udid=UDID` on real devices. Terminate an app by bundle id on your lease (xcrun simctl terminate on a simulator, go-ios kill on a real-device lease).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id to terminate, e.g. com.apple.Preferences."),
@@ -774,8 +812,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_cache_clear",
     {
+      title: "Clear app cache",
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       description:
-        "Clear an app's Library/Caches on your lease without logging out (terminates the app first; never touches Documents/Keychain; relaunch left to caller). Real-device leases clear via ios fsync on developer-profile installs (device-side ios-fsync:// paths; plist_keys refused); container-denied apps fail fast with a precise P2.",
+        "WHEN you want to clear an app's caches without logging out. INSTEAD OF `xcrun simctl terminate` + `xcrun simctl get_app_container` + removing Library/Caches on sims, or `ios fsync tree/rm --app=<bid> --udid=UDID --path=...` on real devices. Clear an app's Library/Caches on your lease without logging out (terminates the app first; never touches Documents/Keychain; relaunch left to caller). Real-device leases clear via ios fsync on developer-profile installs (device-side ios-fsync:// paths; plist_keys refused); container-denied apps fail fast with a precise P2.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id whose caches to clear, e.g. com.example.App."),
@@ -817,8 +857,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "profile_trace",
     {
+      title: "Record trace",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "Record a bounded xctrace profile (Time Profiler by default) on your leased simulator or real device and save the .trace file. Real devices must be paired/trusted with Developer Mode on; prefer attach there (--attach resolves on hardware, unlike sims).",
+        "WHEN you want to profile CPU or record a trace. INSTEAD OF `xcrun xctrace record --template NAME --device UDID [--attach PID | --all-processes] --time-limit Ns --no-prompt --output PATH`. Record a bounded xctrace profile (Time Profiler by default) on your leased simulator or real device and save the .trace file. Real devices must be paired/trusted with Developer Mode on; prefer attach there (--attach resolves on hardware, unlike sims).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         duration_sec: z.number().positive().max(MAX_TRACE_SEC).optional().describe("Recording length in seconds. Default 5, max 60."),
@@ -848,8 +890,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_attach",
     {
+      title: "Attach debugger",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "Attach the llmdb debugger to a running target for your lease (one session per lease; re-attaching replaces it). Needs a debuggable (get-task-allow) build; stock Apple apps refuse attach.",
+        "WHEN you want to attach the debugger to a running app or pid. INSTEAD OF `llmdb attach --app <bundle-id>` or `llmdb attach --pid <pid>`. Attach the llmdb debugger to a running target for your lease (one session per lease; re-attaching replaces it). Needs a debuggable (get-task-allow) build; stock Apple apps refuse attach.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().optional().describe("App bundle id running in the booted Simulator (exactly one of bundle_id or pid)."),
@@ -891,8 +935,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_break",
     {
+      title: "Manage breakpoints",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "Manage breakpoints in your lease's debug session. Exactly one op per call: set (file+line for one, or breakpoints=[...] for several, with optional condition/hit_condition), list (list=true), delete (delete=<id> or [<ids>]), or exception filters (exception=[...], [] clears).",
+        "WHEN you want to set, list, delete, or clear breakpoints or exception filters. INSTEAD OF `llmdb break set <file:line> [--condition ...] [--hit-condition ...] --session S`, `llmdb break list|delete --session S`, or `llmdb break exception --session S`. Manage breakpoints in your lease's debug session. Exactly one op per call: set (file+line for one, or breakpoints=[...] for several, with optional condition/hit_condition), list (list=true), delete (delete=<id> or [<ids>]), or exception filters (exception=[...], [] clears).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         file: z.string().min(1).optional().describe("Source file path for set, e.g. ./Sources/App/main.swift."),
@@ -1000,7 +1046,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_continue",
     {
-      description: "Resume execution until the next stop (or the wait elapses). A client timeout auto-stops the session.",
+      title: "Continue execution",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to resume or continue execution until the next stop. INSTEAD OF `llmdb continue --wait N --session S`. Resume execution until the next stop (or the wait elapses). A client timeout auto-stops the session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         wait_sec: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Block up to this many seconds for the next stop. Default 60, max 600."),
@@ -1032,7 +1080,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_bt",
     {
-      description: "Structured backtrace for the stopped thread (or an explicit thread id) in your lease's debug session.",
+      title: "Backtrace",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want a backtrace of the stopped thread. INSTEAD OF `llmdb bt [--thread T] [--depth N] --session S`. Structured backtrace for the stopped thread (or an explicit thread id) in your lease's debug session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         depth: z.number().int().positive().optional().describe("Maximum stack depth. Default full stack."),
@@ -1060,7 +1110,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_locals",
     {
-      description: "Typed locals for a stack frame in your lease's debug session.",
+      title: "List locals",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want typed locals for a stack frame. INSTEAD OF `llmdb locals --frame N --session S`. Typed locals for a stack frame in your lease's debug session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         frame: z.number().int().min(0).optional().describe("Frame index. Default 0 (top frame)."),
@@ -1083,7 +1135,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_eval",
     {
-      description: "Evaluate an expression in the context of a frame in your lease's debug session.",
+      title: "Evaluate expression",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to eval or evaluate an expression in a frame. INSTEAD OF `llmdb expr <expression> --frame N --session S`. Evaluate an expression in the context of a frame in your lease's debug session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         expr: z.string().min(1).describe("Expression to evaluate, e.g. self.state.count."),
@@ -1107,7 +1161,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_step",
     {
-      description: "Step one source line in your lease's debug session: over (default) | in | out.",
+      title: "Step line",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to step one source line (over, in, or out). INSTEAD OF `llmdb step --over|--in|--out --session S`. Step one source line in your lease's debug session: over (default) | in | out.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         mode: z.enum(STEP_MODES).optional().describe("Step mode. Default over."),
@@ -1135,7 +1191,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_detach",
     {
-      description: "Detach your lease's debug session. Idempotent: detaching twice succeeds with stopped=false.",
+      title: "Detach debugger",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to detach the debug session. INSTEAD OF `llmdb stop --session S`. Detach your lease's debug session. Idempotent: detaching twice succeeds with stopped=false.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
@@ -1177,8 +1235,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_sessions",
     {
+      title: "List debug sessions",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "List active llmdb debug sessions across all agents on this host's daemon. lease_id is optional — when given, the lease is validated and the call is logged against it.",
+        "WHEN you want to list active debug sessions across agents. INSTEAD OF `llmdb sessions`. List active llmdb debug sessions across all agents on this host's daemon. lease_id is optional — when given, the lease is validated and the call is logged against it.",
       inputSchema: {
         lease_id: z.string().optional().describe("Your active lease id (validates + logs when given)."),
       },
@@ -1203,8 +1263,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_launch",
     {
+      title: "Launch under debugger",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "Launch a target under the debugger for your lease (one session per lease; re-launching replaces it). Exactly one of path or bundle_id: path launches a binary (or .app bundle) via `llmdb launch`; bundle_id launches a sim app via simctl then attaches via `llmdb attach --app` (llmdb 0.2.0 launch takes a filesystem path only — verified `llmdb launch --help` — so the bundle form is composed from existing primitives, never a new flag).",
+        "WHEN you want to launch a target under the debugger. INSTEAD OF `llmdb launch <path> [args]` (or `xcrun simctl launch` + `llmdb attach --app` composed for bundle_id). Launch a target under the debugger for your lease (one session per lease; re-launching replaces it). Exactly one of path or bundle_id: path launches a binary (or .app bundle) via `llmdb launch`; bundle_id launches a sim app via `xcrun simctl launch` then attaches via `llmdb attach --app` (llmdb 0.2.0 launch takes a filesystem path only — verified `llmdb launch --help` — so the bundle form is composed from existing primitives, never a new flag).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         path: z.string().min(1).optional().describe("Path to the binary (or .app bundle) to debug (exactly one of path or bundle_id)."),
@@ -1279,8 +1341,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_doctor",
     {
+      title: "Diagnose debugger",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Diagnose the local llmdb environment (lldb-dap, socket dir, daemon reachability). lease_id is optional — when given, the lease is validated and the call is logged against it.",
+        "WHEN you want to diagnose the debugger environment. INSTEAD OF `llmdb doctor`. Diagnose the local llmdb environment (lldb-dap, socket dir, daemon reachability). lease_id is optional — when given, the lease is validated and the call is logged against it.",
       inputSchema: {
         lease_id: z.string().optional().describe("Your active lease id (validates + logs when given)."),
       },
@@ -1305,7 +1369,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_threads",
     {
-      description: "List threads in your lease's stopped debug session.",
+      title: "List threads",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to list threads in the stopped session. INSTEAD OF `llmdb threads --session S`. List threads in your lease's stopped debug session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
@@ -1327,7 +1393,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_scopes",
     {
-      description: "List a frame's variable scopes (Locals, Globals, Registers) in your lease's debug session; expand a ref to read it.",
+      title: "List scopes",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want a frame's variable scopes. INSTEAD OF `llmdb scopes --frame N --session S`. List a frame's variable scopes (Locals, Globals, Registers) in your lease's debug session; expand a ref to read it.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         frame: z.number().int().min(0).optional().describe("Frame index. Default 0 (top frame)."),
@@ -1350,8 +1418,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_expand",
     {
+      title: "Expand value",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Expand a structured value into its children by variablesReference (the non-zero ref from a debug_locals/debug_scopes entry). Takes a ref, not an expression — use debug_eval for expressions.",
+        "WHEN you want to expand a structured value into its children. INSTEAD OF `llmdb expand <ref> --session S`. Expand a structured value into its children by variablesReference (the non-zero ref from a debug_locals/debug_scopes entry). Takes a ref, not an expression — use debug_eval for expressions.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         ref: z.number().int().positive().describe("variablesReference to expand (must be non-zero)."),
@@ -1374,7 +1444,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_set_var",
     {
-      description: "Assign a new value to a variable during a stop in your lease's debug session.",
+      title: "Set variable",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to assign a new value to a variable. INSTEAD OF `llmdb set-var <target> <value> --frame N --session S`. Assign a new value to a variable during a stop in your lease's debug session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         target: z.string().min(1).describe("Assignable target: a local name, or an expression like self.count or arr[0]."),
@@ -1399,7 +1471,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_output",
     {
-      description: "Print the debug target's captured stdout/stderr/console output.",
+      title: "Read target output",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to print the target's captured output. INSTEAD OF `llmdb output [--clear] --session S`. Print the debug target's captured stdout/stderr/console output.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         clear: z.boolean().optional().describe("Drain the buffer so the next call returns only newer output. Default false."),
@@ -1424,7 +1498,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_run_until",
     {
-      description: "Set a breakpoint at file:line and continue; returns when it hits (or the target terminates). A client timeout auto-stops the session.",
+      title: "Run until line",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to run until a file:line breakpoint hits. INSTEAD OF `llmdb run-until <file:line> --wait N --session S`. Set a breakpoint at file:line and continue; returns when it hits (or the target terminates). A client timeout auto-stops the session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         file: z.string().min(1).describe("Source file path, e.g. ./Sources/App/main.swift."),
@@ -1457,7 +1533,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_wait",
     {
-      description: "Block until your lease's debug session leaves `running` (stops or terminates). A client timeout auto-stops the session.",
+      title: "Wait for stop",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to wait until the session stops. INSTEAD OF `llmdb wait --timeout N --session S`. Block until your lease's debug session leaves `running` (stops or terminates). A client timeout auto-stops the session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         timeout: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Timeout in seconds. Default 60, max 600."),
@@ -1489,7 +1567,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "debug_interrupt",
     {
-      description: "Pause your lease's running debug session; returns once stopped. A client timeout auto-stops the session.",
+      title: "Interrupt execution",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to pause or interrupt the running session. INSTEAD OF `llmdb interrupt --wait N --session S`. Pause your lease's running debug session; returns once stopped. A client timeout auto-stops the session.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         wait_sec: z.number().positive().max(MAX_CONTINUE_WAIT_SEC).optional().describe("Block up to this many seconds. Default 10, max 600."),
@@ -1532,8 +1612,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "symbolicate",
     {
+      title: "Symbolicate addresses",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Symbolicate hex addresses against a Mach-O binary via atos (host-local, read-only; touches no simulator). Auto-detects -arch via lipo, a sibling dSYM, and load_addr from images text. lease_id is optional — when given, the lease is validated and the call is logged against it.",
+        "WHEN you want to symbolicate crash addresses. INSTEAD OF `atos -o <binary> [-arch A] [-l addr] <pcs>` (+ `lipo -info` for arch detection). Symbolicate hex addresses against a Mach-O binary via atos (host-local, read-only; touches no simulator). Auto-detects -arch via lipo, a sibling dSYM, and load_addr from images text. lease_id is optional — when given, the lease is validated and the call is logged against it.",
       inputSchema: {
         pcs: z
           .union([z.string().min(1), z.array(z.string().min(1)).min(1).max(100)])
@@ -1574,7 +1656,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "lease_actions",
     {
-      description: "Show the recent one-line action history recorded against a lease (ui_* calls, serve-sim ops, app ops, traces).",
+      title: "Lease action history",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to see the action history recorded against a lease. There is no raw CLI for this orchestrator log. Show the recent one-line action history recorded against a lease (ui_* calls, serve-sim ops, app ops, traces).",
       inputSchema: {
         lease_id: z.string().describe("Lease id."),
         limit: z.number().int().positive().max(100).optional().describe("Return at most this many newest entries. Default all (max 100)."),
@@ -1593,8 +1677,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "net_proxy_start",
     {
+      title: "Start HTTPS proxy",
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
       description:
-        "Start HTTPS interception for your leased simulator (mitmdump + generated rewrite addon + mitm CA in the sim keychain). HOST-WIDE while running: the macOS web proxy of every network service points at mitmdump, so other apps' traffic passes through it too. One holder at a time: fails when another lease holds the proxy. Idempotent for the holding lease.",
+        "WHEN you want to intercept, inspect, or mock HTTPS traffic. INSTEAD OF `xcrun simctl keychain UDID add-root-cert <ca>` + `mitmdump -p PORT -s <addon.py>` + `networksetup -setwebproxy/-setsecurewebproxy <svc> 127.0.0.1 PORT` (plus a pfctl anchor when blocking QUIC). Start HTTPS interception for your leased simulator (mitmdump + generated rewrite addon + mitm CA in the sim keychain). HOST-WIDE while running: the macOS web proxy of every network service points at mitmdump, so other apps' traffic passes through it too. One holder at a time: fails when another lease holds the proxy. Idempotent for the holding lease.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         rules: netProxyRulesSchema.optional().describe("Response-rewrite rules, first match wins. Default: none (transparent interception)."),
@@ -1625,8 +1711,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "net_proxy_set_rules",
     {
+      title: "Set proxy rules",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Replace the rewrite rules of the running network proxy (mitmdump restarts on the same port; the host proxy stays on). Only the holding lease may set rules. Pass [] to clear all rewrites (transparent interception).",
+        "WHEN you want to replace the proxy rewrite rules. INSTEAD OF regenerating the addon and restarting `mitmdump -p PORT -s <new-addon.py>`. Replace the rewrite rules of the running network proxy (mitmdump restarts on the same port; the host proxy stays on). Only the holding lease may set rules. Pass [] to clear all rewrites (transparent interception).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id (must hold the proxy)."),
         rules: netProxyRulesSchema.describe("Replacement rules, first match wins."),
@@ -1648,8 +1736,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "net_proxy_stop",
     {
+      title: "Stop HTTPS proxy",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Stop the network proxy and restore the host proxy snapshot. Idempotent: stopping twice succeeds with stopped=false. Only the holding lease may stop.",
+        "WHEN you want to stop the network proxy and restore the host proxy. INSTEAD OF killing mitmdump + `networksetup -setwebproxystate off` (+ pfctl flush when QUIC was blocked). Stop the network proxy and restore the host proxy snapshot. Idempotent: stopping twice succeeds with stopped=false. Only the holding lease may stop.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id (must hold the proxy)."),
       },
@@ -1674,8 +1764,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "net_proxy_status",
     {
+      title: "Proxy status",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Show the network proxy state: running flag, port/pid, QUIC-block flag, the holding lease/session when active, and the rule count. Any valid lease may view it.",
+        "WHEN you want to check proxy running state, holder, or rule count. There is no raw CLI for this proxy state view. Show the network proxy state: running flag, port/pid, QUIC-block flag, the holding lease/session when active, and the rule count. Any valid lease may view it.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
@@ -1720,8 +1812,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "net_capture_start",
     {
+      title: "Start packet capture",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Start a packet capture (tcpdump) on the host interface carrying simulator traffic. " +
+        "WHEN you want to capture packets the HTTP proxy cannot see (raw TCP/UDP, QUIC). INSTEAD OF `sudo -n tcpdump -i <iface> -s <snaplen> -w <pcap> [filter]`. Start a packet capture (tcpdump) on the host interface carrying simulator traffic. " +
         "Use for traffic the HTTP proxy cannot see: raw TCP/UDP sockets and QUIC (UDP/443). " +
         "Only one capture runs at a time; the holding lease owns it. " +
         "Capturing needs passwordless sudo for tcpdump.",
@@ -1756,8 +1850,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "net_capture_stop",
     {
+      title: "Stop packet capture",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Stop the packet capture and return a per-flow packet/byte summary plus the pcap path. " +
+        "WHEN you want to stop the packet capture and get the pcap summary. INSTEAD OF SIGINT + `tcpdump -n -r <pcap>` for the summary. Stop the packet capture and return a per-flow packet/byte summary plus the pcap path. " +
         "Idempotent: stopping twice succeeds with stopped=false. Only the holding lease may stop. " +
         "The pcap file stays on disk for manual inspection (tcpdump -r / Wireshark) until your lease's next capture overwrites it.",
       inputSchema: {
@@ -1785,8 +1881,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "net_capture_status",
     {
+      title: "Capture status",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Show the packet capture state: running flag, pid, filter, pcap path, and the holding lease/session when active. Any valid lease may view it.",
+        "WHEN you want to check capture running state or pcap path. There is no raw CLI for this capture state view. Show the packet capture state: running flag, pid, filter, pcap path, and the holding lease/session when active. Any valid lease may view it.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
@@ -1818,8 +1916,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "net_assert_flow",
     {
+      title: "Assert network flow",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Poll your holding proxy's flow log until min_count matching requests are seen (or the timeout elapses). Fails cleanly when the lease holds no running proxy.",
+        "WHEN you want to assert a URL was called by polling the flow log. There is no raw CLI for this flow-log poll (manual equivalent: read the flow log). Poll your holding proxy's flow log until min_count matching requests are seen (or the timeout elapses). Fails cleanly when the lease holds no running proxy.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id (must hold the proxy)."),
         url_regex: z
@@ -1905,8 +2005,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "map_local",
     {
+      title: "Mock response from file",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Serve a local file as the response for requests matching url_regex, without contacting upstream (missing-file reads at serve time return 502). Replaces a prior map_local for the same pattern; otherwise prepended (first match wins). Only the holding lease may map.",
+        "WHEN you want to mock a response by serving a local file. There is no raw CLI for this mitm rule upsert (manual equivalent: edit the addon + restart mitmdump). Serve a local file as the response for requests matching url_regex, without contacting upstream (missing-file reads at serve time return 502). Replaces a prior map_local for the same pattern; otherwise prepended (first match wins). Only the holding lease may map.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id (must hold the proxy)."),
         url_regex: z
@@ -1946,8 +2048,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "map_remote",
     {
+      title: "Redirect upstream URL",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Rewrite the upstream URL to a fixed URL for requests matching url_regex. Replaces a prior map_remote for the same pattern; otherwise prepended (first match wins). Only the holding lease may map.",
+        "WHEN you want to redirect matching requests to a fixed upstream URL. There is no raw CLI for this mitm rule upsert (manual equivalent: edit the addon + restart mitmdump). Rewrite the upstream URL to a fixed URL for requests matching url_regex. Replaces a prior map_remote for the same pattern; otherwise prepended (first match wins). Only the holding lease may map.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id (must hold the proxy)."),
         url_regex: z

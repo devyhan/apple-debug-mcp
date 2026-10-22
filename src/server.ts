@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { compactAxText } from "./ax-prune.js";
 import { isRealLease, requireSimLease } from "./devicekind.js";
+import { instrumentToolcalls } from "./toolcalls.js";
 import { registerDeviceExtras } from "./extras.js";
 import { Llmdb } from "./llmdb.js";
 import { appendM4Audit, maybeM4Decide, noteM4Ui } from "./m4.js";
@@ -72,6 +73,7 @@ function truncate(text: string, maxChars: number): { text: string; truncated: bo
 export function createMcpServer(deps: ServerDeps): McpServer {
   const { orchestrator: orch, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir } = deps;
   const server = new McpServer({ name: "apple-debug-mcp", version: getVersion() });
+  instrumentToolcalls(server); // P1 single choke point: one {t, tool, ok} line per tools/call; never logs arg values.
 
   /** UI backend for a resolved lease: AXe for sims, go-ios for real devices. */
   function uiFor(lease: Lease, verb: string): UiDriver {
@@ -87,8 +89,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "pool_status",
     {
+      title: "Pool status",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Show every simulator (UDID, device, OS, boot/slim state) overlaid with its current lease holder (sessionId/client) and the wait-queue depth. Also lists real devices (devicectl inventory) with availability and lease overlay.",
+        "WHEN you want to list, show, or check the status of simulators and devices, see who holds what lease, or check the wait-queue depth. There is no raw CLI for this orchestrator overlay (raw pieces: `simslim list --json` + `xcrun devicectl list devices`). Show every simulator (UDID, device, OS, boot/slim state) overlaid with its current lease holder (sessionId/client) and the wait-queue depth. Also lists real devices (devicectl inventory) with availability and lease overlay.",
       inputSchema: {},
     },
     async () => {
@@ -103,8 +107,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "sessions_list",
     {
+      title: "Sessions list",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Show which session is running on which simulator: groups active leases and queue tickets by caller-provided sessionId. Works for any client (Orca, Claude Code, TMA, scripts).",
+        "WHEN you want to see who is on which simulator, which session holds what, or what your own session is running. There is no raw CLI for this orchestrator state view. Show which session is running on which simulator: groups active leases and queue tickets by caller-provided sessionId. Works for any client (Orca, Claude Code, TMA, scripts).",
       inputSchema: {},
     },
     async () => {
@@ -119,7 +125,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "sim_boot",
     {
-      description: "Boot a simulator (waits for services). Prefer lease_acquire with autoBoot instead.",
+      title: "Boot simulator",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to boot or start a simulator. INSTEAD OF `simslim boot UDID --json`. Boot a simulator (waits for services). Prefer lease_acquire with autoBoot instead.",
       inputSchema: { udid: z.string().describe("Simulator UDID.") },
     },
     async ({ udid }) => {
@@ -135,7 +143,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "sim_shutdown",
     {
-      description: "Shut down a simulator. Refuses when leased unless force=true (which releases the lease and auto-dispatches the queue).",
+      title: "Shut down simulator",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to shut down a simulator. INSTEAD OF `simslim shutdown UDID --json`. Shut down a simulator. Refuses when leased unless force=true (which releases the lease and auto-dispatches the queue).",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
         force: z.boolean().optional().describe("Release the active lease first. Default false."),
@@ -165,8 +175,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "sim_slim",
     {
+      title: "Slim simulator",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Slim (disable background daemons) or restore a simulator via simslim. mode=on reboots unless noReboot=true; rebooting a leased sim needs force=true.",
+        "WHEN you want to slim a simulator for low RAM or restore its stock daemons. INSTEAD OF `simslim on UDID [--except categories] [--no-reboot]` or `simslim off UDID`. Slim (disable background daemons) or restore a simulator via simslim. mode=on reboots unless noReboot=true; rebooting a leased sim needs force=true.",
       inputSchema: {
         udid: z.string().describe("Simulator UDID."),
         mode: z.enum(["on", "off"]).describe("on = slim, off = restore stock."),
@@ -202,8 +214,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "lease_acquire",
     {
+      title: "Acquire lease",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "Acquire a simulator (or real-device, via device_kind) lease for your session. Returns a lease immediately when a matching device is free (booting a sim when autoBoot), otherwise a queue ticket — poll queue_status until it is assigned. Pass YOUR OWN sessionId (any client: Orca, Claude Code, TMA, script) plus a client label.",
+        "WHEN you want to get, lease, checkout, or acquire a simulator or real device for your session. There is no raw CLI for orchestrator leases (lease + wait queue + autoboot have no CLI equivalent). Acquire a simulator (or real-device, via device_kind) lease for your session. Returns a lease immediately when a matching device is free (booting a sim when autoBoot), otherwise a queue ticket — poll queue_status until it is assigned. Pass YOUR OWN sessionId (any client: Orca, Claude Code, TMA, script) plus a client label.",
       inputSchema: {
         session_id: sessionField("Your session id, in your own tool's format. Used for ownership and sessions_list."),
         client: z.string().optional().describe('Free-form client label, e.g. "orca", "claude-code", "tma". Default "unknown".'),
@@ -249,8 +263,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "lease_release",
     {
+      title: "Release lease",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "Release your lease when work is done. The freed simulator is immediately auto-dispatched to the oldest matching queue ticket.",
+        "WHEN you want to release, free, or return a leased device when work is done. There is no raw CLI for orchestrator lease release (state + queue auto-dispatch). Release your lease when work is done. The freed simulator is immediately auto-dispatched to the oldest matching queue ticket.",
       inputSchema: {
         lease_id: z.string().describe("Lease id from lease_acquire (or queue_status after assignment)."),
         session_id: sessionField("Must match the session that holds the lease."),
@@ -268,7 +284,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "lease_heartbeat",
     {
-      description: "Renew your lease TTL. Call periodically for long-running work.",
+      title: "Lease heartbeat",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to renew a lease TTL or send a keepalive for long-running work. There is no raw CLI for orchestrator lease heartbeats. Renew your lease TTL. Call periodically for long-running work.",
       inputSchema: {
         lease_id: z.string().describe("Lease id."),
         session_id: sessionField("Must match the session that holds the lease."),
@@ -286,7 +304,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "lease_list",
     {
-      description: "List all active leases with holder sessions and expiry state.",
+      title: "List leases",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to list active leases, holder sessions, or expiry state. There is no raw CLI for this orchestrator state view. List all active leases with holder sessions and expiry state.",
       inputSchema: {},
     },
     async () => {
@@ -301,8 +321,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "queue_status",
     {
+      title: "Queue status",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "Poll the wait queue. With ticket_id, returns your ticket: status becomes assigned with lease_id/udid once auto-dispatched — then use the lease directly.",
+        "WHEN you want to poll the wait queue or check whether your ticket was assigned a lease. There is no raw CLI for the orchestrator wait queue. Poll the wait queue. With ticket_id, returns your ticket: status becomes assigned with lease_id/udid once auto-dispatched — then use the lease directly.",
       inputSchema: {
         ticket_id: z.string().optional().describe("Your queue ticket id. Omit to list the whole queue."),
       },
@@ -319,7 +341,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "queue_cancel",
     {
-      description: "Cancel your waiting queue ticket.",
+      title: "Cancel queue ticket",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to cancel your waiting queue ticket. There is no raw CLI for the orchestrator wait queue. Cancel your waiting queue ticket.",
       inputSchema: {
         ticket_id: z.string().describe("Queue ticket id."),
         session_id: sessionField("Must match the session that owns the ticket."),
@@ -339,7 +363,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_describe",
     {
-      description: "Describe the accessibility UI hierarchy of your leased simulator or real device (AXe describe-ui; go-ios `ios ui source` on real devices).",
+      title: "Describe UI",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      description: "WHEN you want to see, read, or dump the UI hierarchy, or find an element, label, or button. INSTEAD OF `axe describe-ui --udid UDID [--point X,Y]` on sims, or `ios ui source --udid=UDID` on real devices. Describe the accessibility UI hierarchy of your leased simulator or real device (AXe describe-ui; go-ios `ios ui source` on real devices).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         x: z.number().optional().describe("With y: describe only the element at this point."),
@@ -385,7 +411,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_tap",
     {
-      description: "Tap a point or an accessibility element on your leased simulator or real device (AXe tap; go-ios `ios ui tap` with x/y only on real devices).",
+      title: "Tap UI",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to tap, click, or press an element or point. INSTEAD OF `axe tap --udid UDID (-x X -y Y | --id/--label/--value ...)` on sims, or coords-only `ios ui tap --x=X --y=Y --udid=UDID` on real devices. Tap a point or an accessibility element on your leased simulator or real device (AXe tap; go-ios `ios ui tap` with x/y only on real devices).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         x: z.number().optional().describe("X coordinate (with y)."),
@@ -479,7 +507,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_type",
     {
-      description: "Type text on your leased simulator or real device (AXe type; go-ios `ios ui type` on real devices). US-keyboard characters only.",
+      title: "Type text",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to type text into the focused field. INSTEAD OF `axe type --stdin --udid UDID` on sims, or `ios ui type --text=... --udid=UDID` on real devices. Type text on your leased simulator or real device (AXe type; go-ios `ios ui type` on real devices). US-keyboard characters only.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         text: z.string().min(1).describe("Text to type."),
@@ -500,7 +530,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_swipe",
     {
-      description: "Swipe from one point to another on your leased simulator or real device (AXe swipe; go-ios `ios ui api device.io.swipe` on real devices — the `ui swipe` CLI sends a param shape the runner rejects).",
+      title: "Swipe",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to swipe or drag from one point to another. INSTEAD OF `axe swipe --udid UDID --start-x X --start-y Y --end-x X --end-y Y [--duration S]` on sims, or `ios ui api --rpc-method=device.io.swipe --params={x1,y1,x2,y2}` on real devices. Swipe from one point to another on your leased simulator or real device (AXe swipe; go-ios `ios ui api device.io.swipe` on real devices — the `ui swipe` CLI sends a param shape the runner rejects).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         start_x: z.number().describe("Start X."),
@@ -525,7 +557,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_gesture",
     {
-      description: "Run a preset gesture on your leased simulator: scroll-up/down/left/right, swipe-from-left/right/top/bottom-edge. On real devices every preset fails with a precise unsupported error (no go-ios equivalent) — use ui_swipe with explicit coordinates.",
+      title: "Run gesture",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to scroll or swipe from a screen edge using a preset gesture. INSTEAD OF `axe gesture <preset> --udid UDID` on sims (no real-device equivalent — use ui_swipe there). Run a preset gesture on your leased simulator: scroll-up/down/left/right, swipe-from-left/right/top/bottom-edge. On real devices every preset fails with a precise unsupported error (no go-ios equivalent) — use ui_swipe with explicit coordinates.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         preset: z.enum(["scroll-up", "scroll-down", "scroll-left", "scroll-right", "swipe-from-left-edge", "swipe-from-right-edge", "swipe-from-top-edge", "swipe-from-bottom-edge"]),
@@ -547,7 +581,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_button",
     {
-      description: "Press a hardware button on your leased simulator or real device (AXe button; go-ios `ios ui button` with home/lock on real devices — siri/side-button/apple-pay and hold durations are precise unsupported errors there).",
+      title: "Press button",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to press a hardware button (home, lock, side-button, siri, apple-pay). INSTEAD OF `axe button <name> --udid UDID` on sims, or `ios ui button <home|lock> --udid=UDID` on real devices. Press a hardware button on your leased simulator or real device (AXe button; go-ios `ios ui button` with home/lock on real devices — siri/side-button/apple-pay and hold durations are precise unsupported errors there).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         button: z.enum(["apple-pay", "home", "lock", "side-button", "siri"]),
@@ -569,7 +605,9 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_screenshot",
     {
-      description: "Capture a PNG screenshot from your leased simulator or real device. Returns the image plus its saved path.",
+      title: "Take screenshot",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description: "WHEN you want to capture a screenshot or screen PNG. INSTEAD OF `axe screenshot --udid UDID --output PATH` on sims, or `ios screenshot --udid=UDID --output=PATH` on real devices. Capture a PNG screenshot from your leased simulator or real device. Returns the image plus its saved path.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
@@ -594,8 +632,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
   server.registerTool(
     "ui_batch",
     {
+      title: "Run UI batch",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "Run ordered interaction steps in one AXe session (faster than separate calls). Each step starts with tap|swipe|gesture|touch|type|button|key|key-sequence|key-combo|sleep, e.g. 'tap --label Sign\\ In' or \"type 'hello'\". On real devices tap/swipe/type/button/sleep steps run per-step via go-ios; gesture/touch/key steps fail with precise unsupported errors.",
+        "WHEN you want to run a batch of many interaction steps fast in one session. INSTEAD OF `axe batch --udid UDID --step ...` on sims, or per-step `ios ui ...` calls on real devices. Run ordered interaction steps in one AXe session (faster than separate calls). Each step starts with tap|swipe|gesture|touch|type|button|key|key-sequence|key-combo|sleep, e.g. 'tap --label Sign\\ In' or \"type 'hello'\". On real devices tap/swipe/type/button/sleep steps run per-step via go-ios; gesture/touch/key steps fail with precise unsupported errors.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         steps: z.array(z.string().min(1)).min(1).max(50).describe("Ordered steps, one AXe command fragment each."),
