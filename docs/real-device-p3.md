@@ -50,9 +50,19 @@ daemon owns stop/shutdown):
   grace windows and falsely reports "ignored SIGKILL" — this exact
   bug was caught by the live e2e and is pinned by
   `test/realstream.test.ts` (signal-death respawn case).
-- Seams for tests: `spawn` / `isPortFree` (exported from
-  `src/servesim.ts`, one implementation) / `httpStatus` /
-  timeouts / `sleep`.
+- Occupancy probe is CONNECT-based (`isStreamPortFree`: v4 OR v6
+  loopback connect ⇒ busy), never a test-bind: go-ios holds an
+  IPv6 `*:3333` socket that a `127.0.0.1` test-bind does not see
+  (measured: bind-probe said FREE while `ios` served — the prod
+  orphan incident below). serve-sim keeps its own v4 test-bind
+  (`src/servesim.ts`, private — correct there, untouched).
+- Reuse revalidation TERMINATES the old child before respawning
+  (and refuses to spawn when it will not die): abandoning a
+  slow-but-alive server orphans a `:3333` listener. Readiness
+  re-checks liveness after HTTP 200 so a foreign 200 never
+  tracks a corpse (bind-conflict TOCTOU).
+- Seams for tests: `spawn` / `isPortFree` (default
+  `isStreamPortFree`) / `httpStatus` / timeouts / `sleep`.
 
 ### 1.3 Orchestrator routing (`src/orchestrator.ts`)
 
@@ -100,6 +110,8 @@ session and DeviceKit/tunnel processes untouched).
 | Second concurrent `ios screenshot --stream` | Exit 1: `{"level":"ERROR","msg":"failed starting mjpeg","err":"listen tcp 0.0.0.0:3333: bind: address already in use"}` — first server keeps serving, still sole LISTEN on :3333 |
 | `HEAD /` | Empty response (GET-stream only; GET works as above) |
 | Signal death | SIGTERM ⇒ `EXIT` event `null`/`SIGTERM`, `exitCode` stays `null` forever (`signalCode` set) — liveness must check both (see §1.2) |
+| Occupancy probe | `isPortFree`-style `127.0.0.1` test-bind ⇒ FREE while `ios … TCP *:dec-notes (LISTEN)` served (IPv6 socket invisible to a v4 bind) — connect-probe (`127.0.0.1` OR `::1`) is the fix (see §1.2) |
+| Prod orphan incident | First production smoke: slow start (14.6s), reuse revalidation failed on the sluggish server, bind-probe said free, respawn tracked a bind-dead corpse while the abandoned child (pid 10534, PPID = daemon) kept serving. `stop` reported success (corpse already dead). Fixed by kill-before-respawn + connect probe + post-200 liveness; orphan reaped (`SIGTERM`, verified), e2e now asserts helper process counts |
 
 ### 1.5 Live e2e (`/tmp/e2e-realstream.mjs`, scratch daemon :3210)
 
@@ -118,10 +130,19 @@ strays (`lsof -i :3333` empty, no `ios screenshot` process after):
 7. Bonus: scratch SIGTERM ⇒ shutdown hook `stopAll` reaped the
    live helper (verified `lsof -i :3333` empty after).
 
-Covered by `test/realstream.test.ts` (20 cases: 11 unit + 9
-orchestrator routing, failing-first) plus updated
-`test/realacquire.test.ts` (auto-start positive + no-backend
-warning/streamError cases). Full suite: 50 files / 753 tests green.
+A second script (`/tmp/e2e-foreign.mjs`) pins the foreign-occupant
+path live: squat `:3333` with a v4 listener ⇒ `stream_start`
+fails `…port is already in use…` + `lsof -i :3333` hint; free it ⇒
+start/stop/release all succeed. Both scripts assert helper
+process counts (`pgrep`: exactly 1 while streaming, 0 after stop)
+— the blind spot that let the prod orphan through.
+
+Covered by `test/realstream.test.ts` (24 cases: 15 unit + 9
+orchestrator routing, failing-first — incl. kill-before-respawn,
+refuse-on-unkillable, corpse-TOCTOU, and real-socket v4/v6
+connect-probe cases) plus updated `test/realacquire.test.ts`
+(auto-start positive + no-backend warning/streamError cases).
+Full suite: 50 files / 757 tests green.
 
 Unblock conditions for per-lease ports (future): upstream go-ios
 honors `--port`. Until then the explicit single-flight semantic

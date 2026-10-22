@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -7,7 +8,7 @@ import type { PoolDevice } from "../src/realdevices.js";
 import type { StreamInfo, StreamOps } from "../src/servesim.js";
 import { FleetOps, SimDevice, SlimStatus } from "../src/simslim.js";
 import { Store } from "../src/store.js";
-import { REAL_STREAM_PORT, RealStreamer, StreamChild } from "../src/realstream.js";
+import { REAL_STREAM_PORT, RealStreamer, StreamChild, isStreamPortFree } from "../src/realstream.js";
 
 // ---------- stubs ----------
 
@@ -190,6 +191,87 @@ describe("RealStreamer (single-flight go-ios MJPEG)", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it("kills the abandoned child before respawning (never orphans a slow server)", async () => {
+    let failuresLeft = 0;
+    const children: StubChild[] = [];
+    const calls: { bin: string; args: string[] }[] = [];
+    const streamer = new RealStreamer({
+      spawn: stubSpawnFactory(children, calls),
+      isPortFree: async () => true,
+      httpStatus: async () => {
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new Error("socket hang up");
+        }
+        return 200;
+      },
+      readyTimeoutMs: 500,
+      readyPollMs: 5,
+      killGraceMs: 5,
+      killForceMs: 5,
+      sleep: async () => {},
+    });
+    await streamer.startStream(UDID);
+    failuresLeft = 1; // live prod incident: slow server fails revalidation…
+    await streamer.startStream(UDID);
+    expect(calls).toHaveLength(2);
+    // …so the old child is terminated (SIGTERM recorded), not abandoned alive.
+    expect(children[0]?.kills).toEqual(["SIGTERM"]);
+    // And the NEW child is the tracked one: stop kills it, not the old one.
+    await streamer.stopStream(UDID);
+    expect(children[1]?.kills).toEqual(["SIGTERM"]);
+    expect(children[0]?.kills).toHaveLength(1);
+  });
+
+  it("refuses to spawn when the abandoned child will not die", async () => {
+    let failuresLeft = 0;
+    const children: StubChild[] = [];
+    const calls: { bin: string; args: string[] }[] = [];
+    const streamer = new RealStreamer({
+      spawn: stubSpawnFactory(children, calls),
+      isPortFree: async () => true,
+      httpStatus: async () => {
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new Error("socket hang up");
+        }
+        return 200;
+      },
+      readyTimeoutMs: 500,
+      readyPollMs: 5,
+      killGraceMs: 5,
+      killForceMs: 5,
+      sleep: async () => {},
+    });
+    await streamer.startStream(UDID);
+    children[0]!.failKill = true; // SIGTERM+SIGKILL both fail, child stays alive
+    failuresLeft = 1;
+    await expect(streamer.startStream(UDID)).rejects.toThrow(/did not stop/);
+    expect(calls).toHaveLength(1); // no spawn into uncertainty
+  });
+
+  it("never tracks a corpse: child dead but HTTP answered (foreign server TOCTOU)", async () => {
+    const children: StubChild[] = [];
+    const calls: { bin: string; args: string[] }[] = [];
+    const streamer = new RealStreamer({
+      spawn: stubSpawnFactory(children, calls),
+      isPortFree: async () => true,
+      httpStatus: async () => {
+        // Our child died (bind conflict), but SOME server answers — not ours.
+        children[children.length - 1]?.die(1);
+        return 200;
+      },
+      readyTimeoutMs: 500,
+      readyPollMs: 5,
+      sleep: async () => {},
+    });
+    await expect(streamer.startStream(UDID)).rejects.toThrow(/failed to start/);
+    expect(calls).toHaveLength(1);
+    // State cleared: a retry spawns fresh instead of reusing the corpse.
+    await expect(streamer.startStream(UDID)).rejects.toThrow(/failed to start/);
+    expect(calls).toHaveLength(2);
+  });
+
   it("reports a foreign :3333 occupant (no tracked child) with an lsof hint", async () => {
     const { streamer, calls } = rig({ portFree: false });
     await expect(streamer.startStream(UDID)).rejects.toThrow(/already in use/);
@@ -275,6 +357,33 @@ describe("RealStreamer (single-flight go-ios MJPEG)", () => {
     expect(children[0]?.signalCode).toBe("SIGTERM");
     await streamer.startStream(UDID);
     expect(calls).toHaveLength(2);
+  });
+
+  it("isStreamPortFree detects v4, v6, and dual listeners (connect, not bind)", async () => {
+    // A port nobody holds reads free.
+    expect(await isStreamPortFree(18923)).toBe(true);
+    // A v4 listener reads busy.
+    const v4 = net.createServer();
+    await new Promise<void>((resolve) => v4.listen(0, "127.0.0.1", resolve));
+    const v4port = (v4.address() as net.AddressInfo).port;
+    try {
+      expect(await isStreamPortFree(v4port)).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => v4.close(() => resolve()));
+    }
+    expect(await isStreamPortFree(v4port)).toBe(true);
+    // A v6 ANY listener (the go-ios shape: *:3333 IPv6) reads busy — this is
+    // the case the old 127.0.0.1 test-bind missed (it said FREE while ios served).
+    for (const ipv6Only of [false, true]) {
+      const v6 = net.createServer();
+      await new Promise<void>((resolve) => v6.listen({ port: 0, host: "::", ipv6Only }, resolve));
+      const v6port = (v6.address() as net.AddressInfo).port;
+      try {
+        expect(await isStreamPortFree(v6port)).toBe(false);
+      } finally {
+        await new Promise<void>((resolve) => v6.close(() => resolve()));
+      }
+    }
   });
 
   it("stopAll never throws and always clears (shutdown path)", async () => {

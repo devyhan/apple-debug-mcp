@@ -370,8 +370,7 @@ export async function findFreePort(base: number, maxAttempts = MAX_PORT_SCAN): P
   throw new Error(`No free port found in range ${base}-${base + maxAttempts - 1}`);
 }
 
-/** True when nothing listens on 127.0.0.1:port (reused by the real-device streamer). */
-export function isPortFree(port: number): Promise<boolean> {
+function isPortFree(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const server = net.createServer();
     server.once("error", () => resolve(false));

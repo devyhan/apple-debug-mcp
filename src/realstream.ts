@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import http from "node:http";
-import { isPortFree } from "./servesim.js";
+import net from "node:net";
 import type { StreamInfo, StreamOps } from "./servesim.js";
 
 /**
@@ -60,7 +60,7 @@ export class RealStreamer implements StreamOps {
   constructor(opts: RealStreamerOpts = {}) {
     this.iosBin = opts.iosBin ?? "ios";
     this.spawnFn = opts.spawn ?? defaultSpawn;
-    this.isPortFreeFn = opts.isPortFree ?? isPortFree;
+    this.isPortFreeFn = opts.isPortFree ?? isStreamPortFree;
     this.httpStatusFn = opts.httpStatus ?? defaultHttpStatus;
     this.readyTimeoutMs = opts.readyTimeoutMs ?? 15_000;
     this.readyPollMs = opts.readyPollMs ?? 250;
@@ -74,7 +74,11 @@ export class RealStreamer implements StreamOps {
     void opts;
     if (this.child && this.ownedUdid === udid && !isDead(this.child)) {
       if (await this.isServing()) return { url: REAL_STREAM_URL, port: REAL_STREAM_PORT };
-      this.clearTracked(); // Half-dead server: fall through to a fresh spawn.
+      // Half-dead OR slow server: terminate before respawning. Abandoning it
+      // alive orphans a :3333 listener (live prod incident 2026-10-22); when
+      // it will not die the throw below propagates and nothing spawns.
+      await this.terminate(this.child, udid);
+      this.clearTracked();
     }
     if (this.child && !isDead(this.child) && this.ownedUdid !== undefined && this.ownedUdid !== udid) {
       throw new Error(
@@ -148,18 +152,18 @@ export class RealStreamer implements StreamOps {
   private async waitReady(child: StreamChild, udid: string, stderrTail: () => string): Promise<void> {
     const deadline = Date.now() + this.readyTimeoutMs;
     for (;;) {
-      if (isDead(child)) {
-        const tail = stderrTail();
-        const reason = child.exitCode !== null
-          ? `helper exited with code ${child.exitCode}`
-          : `helper died on ${child.signalCode}`;
-        throw new Error(`Real-device stream failed to start for ${udid}: ${tail || reason}`);
-      }
+      if (isDead(child)) throw startFailure(udid, stderrTail(), child);
+      let code: number | undefined;
       try {
-        const code = await this.httpStatusFn(REAL_STREAM_URL, 2_000);
-        if (code >= 200 && code < 300) return;
+        code = await this.httpStatusFn(REAL_STREAM_URL, 2_000);
       } catch {
-        // Not ready yet; the exit check above turns a dead helper into a fast error.
+        // Not ready yet; the dead check above turns a dead helper into a fast error.
+      }
+      if (code !== undefined && code >= 200 && code < 300) {
+        // The 200 may come from a FOREIGN server (ours died on a bind
+        // conflict): never track a corpse.
+        if (isDead(child)) throw startFailure(udid, stderrTail(), child);
+        return;
       }
       if (Date.now() >= deadline) break;
       await this.sleepFn(this.readyPollMs);
@@ -209,6 +213,42 @@ export class RealStreamer implements StreamOps {
  */
 function isDead(child: StreamChild): boolean {
   return child.exitCode !== null || child.signalCode !== null;
+}
+
+/** Fail-fast error for a helper that exited during readiness (stderr tail preferred). */
+function startFailure(udid: string, tail: string, child: StreamChild): Error {
+  const reason = child.exitCode !== null
+    ? `helper exited with code ${child.exitCode}`
+    : `helper died on ${child.signalCode}`;
+  return new Error(`Real-device stream failed to start for ${udid}: ${tail || reason}`);
+}
+
+/**
+ * Occupancy probe by CONNECT (not test-bind): go-ios holds an IPv6 `*:3333`
+ * socket that a `127.0.0.1` test-bind does not see (measured 2026-10-22:
+ * bind-probe said FREE while `ios` served) — so a bind probe spawns into a
+ * held port and orphans the abandoned child. Busy when v4 OR v6 loopback
+ * accepts a connection.
+ */
+export async function isStreamPortFree(port: number): Promise<boolean> {
+  const [v4, v6] = await Promise.all([canConnect("127.0.0.1", port), canConnect("::1", port)]);
+  return !v4 && !v6;
+}
+
+function canConnect(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(v);
+    };
+    const socket = net.connect({ host, port });
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+    socket.setTimeout(500, () => done(false));
+  });
 }
 
 function defaultSpawn(bin: string, args: string[]): StreamChild {
