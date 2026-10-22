@@ -10,6 +10,7 @@ import { MAX_ASSERT_FLOW_SEC, MAX_PROXY_RULES } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import type { AppOps } from "./appops.js";
 import type { LogOps } from "./logops.js";
+import { GO_IOS_INSTALL_HINT } from "./realdevices.js";
 import { Lease } from "./store.js";
 import { Symbolicator } from "./symbolicate.js";
 import { CA_DEBUG_OPTIONS, CAMERA_MIRROR_MODES, CAMERA_SOURCES, ORIENTATIONS, ServeSim } from "./servesim.js";
@@ -30,7 +31,6 @@ export interface ExtrasDeps {
   realLog?: LogOps;
 }
 
-const STREAM_REAL_DETAIL = "real-device screen streaming";
 const DEBUG_REAL_DETAIL = "remote debug sessions";
 const NET_REAL_DETAIL = "real-device network interception (manual CA-profile install replacing the keychain step)";
 
@@ -73,6 +73,15 @@ function serveSimError(err: unknown): string {
   }
   if (/serve-sim.*(not found|ENOENT)|spawn serve-sim/i.test(msg)) {
     return `${msg}. serve-sim is not installed; run: npm install -g serve-sim (or set SERVE_SIM_BIN)`;
+  }
+  return msg;
+}
+
+/** Missing-binary errors get a go-ios install hint; everything else passes through. */
+function realStreamError(err: unknown): string {
+  const msg = (err as Error).message;
+  if (/spawn ios ENOENT|\bios\b.*ENOENT/i.test(msg)) {
+    return `${msg}. go-ios (\`ios\`) is not installed; install with: ${GO_IOS_INSTALL_HINT} (or set IOS_BIN).`;
   }
   return msg;
 }
@@ -565,20 +574,21 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     "stream_start",
     {
       description:
-        "Start (or reuse) a live MJPEG stream for your leased simulator via a serve-sim helper on a scanned port. Idempotent: returns the existing URL when already streaming.",
+        "Start (or reuse) a live MJPEG stream for your lease: a serve-sim helper on a scanned port for simulators (idempotent); the single go-ios :3333 feed for real-device leases (single-flight across the host — one real stream at a time, ~2fps).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
       },
     },
     async ({ lease_id }) => {
+      let mapError = serveSimError;
       try {
         const held = await orch.leaseById(lease_id);
-        if (held) requireSimLease(held, { verb: "stream_start", phase: "P3", detail: STREAM_REAL_DETAIL });
+        if (held && isRealLease(held)) mapError = realStreamError;
         const { lease, url, port } = await orch.startLeaseStream(lease_id);
         await orch.logAction(lease_id, "stream_start", `stream ${url}`);
         return ok({ lease_id, udid: lease.udid, url, port });
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(mapError(err));
       }
     },
   );
@@ -592,14 +602,15 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
       },
     },
     async ({ lease_id }) => {
+      let mapError = serveSimError;
       try {
         const held = await orch.leaseById(lease_id);
-        if (held) requireSimLease(held, { verb: "stream_stop", phase: "P3", detail: STREAM_REAL_DETAIL });
+        if (held && isRealLease(held)) mapError = realStreamError;
         const { lease, stopped } = await orch.stopLeaseStream(lease_id);
         await orch.logAction(lease_id, "stream_stop", stopped ? "stream stopped" : "stream already stopped");
         return ok({ lease_id, udid: lease.udid, stopped });
       } catch (err) {
-        return fail(serveSimError(err));
+        return fail(mapError(err));
       }
     },
   );

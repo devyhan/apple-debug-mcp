@@ -12,6 +12,7 @@ import { NetProxy } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import { GO_IOS_INSTALL_HINT, RealDeviceApps, RealDevices } from "./realdevices.js";
 import { RealSyslog } from "./realsyslog.js";
+import { RealStreamer } from "./realstream.js";
 import { RealUiDriver } from "./realui.js";
 import { createMcpServer } from "./server.js";
 import { ServeSim } from "./servesim.js";
@@ -69,6 +70,7 @@ async function main(): Promise<void> {
   const realApps = new RealDeviceApps({ iosBin: config.iosBin, execTimeoutMs: config.execTimeoutMs });
   const realLog = new RealSyslog({ iosBin: config.iosBin });
   const realUi = new RealUiDriver({ iosBin: config.iosBin, execTimeoutMs: config.execTimeoutMs });
+  const realStreamer = new RealStreamer({ iosBin: config.iosBin });
 
   for (const [name, check] of [
     ["simslim", () => simslim.checkAvailable()],
@@ -147,14 +149,14 @@ async function main(): Promise<void> {
   }
 
   // Optional dependency: the daemon starts without go-ios; the real-lease
-  // app verbs, syslog relay and ui_* fail at call time with an install hint.
+  // app verbs, syslog relay, ui_* and stream_* fail at call time with an install hint.
   try {
     const version = await realApps.checkAvailable();
     console.log(`[sim-mcp] ios: ${version.split("\n")[0]}`);
   } catch {
     console.warn(
       `[sim-mcp] WARNING: optional binary "${config.iosBin}" is not usable; ` +
-        `app_install/app_uninstall/app_launch/app_terminate, sim_log_stream and ui_screenshot/ui_describe/ui_tap/ui_type/ui_swipe/ui_button/ui_batch on real-device leases ` +
+        `app_install/app_uninstall/app_launch/app_terminate, sim_log_stream, stream_start/stream_stop and ui_screenshot/ui_describe/ui_tap/ui_type/ui_swipe/ui_button/ui_batch on real-device leases ` +
         `will fail until it is installed (${GO_IOS_INSTALL_HINT}, or set IOS_BIN)`,
     );
   }
@@ -164,6 +166,7 @@ async function main(): Promise<void> {
     defaultTtlMs: config.leaseTtlMs,
     maxSims: config.maxSims,
     streamer: serveSim,
+    realStreamer,
     streamPortBase: config.serveSimPortBase,
     debugger: lldmdb,
     proxy: netProxy,
@@ -297,6 +300,7 @@ async function main(): Promise<void> {
     void (async () => {
       await netProxy.forceStop();
       await netCapture.forceStop();
+      await realStreamer.stopAll();
       httpServer.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 2000).unref();
     })();

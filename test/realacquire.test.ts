@@ -55,7 +55,26 @@ function tmpState(): string {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-realacq-")), "state.json");
 }
 
-function makeOrch(opts: { sims?: SimDevice[]; real?: PoolDevice[]; realApps?: (udid: string) => Promise<Set<string>> }) {
+class FakeRealStreamer {
+  starts: string[] = [];
+  stops: string[] = [];
+
+  async startStream(udid: string): Promise<{ url: string; port: number }> {
+    this.starts.push(udid);
+    return { url: "http://127.0.0.1:3333/", port: 3333 };
+  }
+
+  async stopStream(udid: string): Promise<void> {
+    this.stops.push(udid);
+  }
+}
+
+function makeOrch(opts: {
+  sims?: SimDevice[];
+  real?: PoolDevice[];
+  realApps?: (udid: string) => Promise<Set<string>>;
+  realStreamer?: FakeRealStreamer;
+}) {
   const fleet = new FakeFleet(opts.sims ?? []);
   const realFleet = opts.real ? new FakeRealFleet(opts.real) : undefined;
   const store = Store.load(tmpState());
@@ -64,6 +83,7 @@ function makeOrch(opts: { sims?: SimDevice[]; real?: PoolDevice[]; realApps?: (u
     contaminationCheckMinIntervalMs: 0,
     ...(realFleet ? { realFleet } : {}),
     ...(opts.realApps ? { realApps: { listRunning: opts.realApps } } : {}),
+    ...(opts.realStreamer ? { realStreamer: opts.realStreamer } : {}),
   });
   return { fleet, realFleet, store, orch };
 }
@@ -140,12 +160,22 @@ describe("real acquire", () => {
     expect(res.ticket.requirements.deviceKind).toBe("real");
   });
 
-  it("turns stream:true into a warning (never auto-streams)", async () => {
+  it("auto-starts the stream for stream:true via the real streamer", async () => {
+    const realStreamer = new FakeRealStreamer();
+    const { orch } = makeOrch({ real: [dev("R1")], realStreamer });
+    const res = await orch.acquire({ sessionId: "s1", stream: true, requirements: { deviceKind: "real" } });
+    if (!res.ok || res.queued) throw new Error("expected lease");
+    expect(res.lease.streamUrl).toBe("http://127.0.0.1:3333/");
+    expect(realStreamer.starts).toEqual(["R1"]);
+    expect(res.warnings?.join(" ") ?? "").not.toContain("P3");
+  });
+
+  it("turns stream:true into a warning without a real streamer (lease stands)", async () => {
     const { orch } = makeOrch({ real: [dev("R1")] });
     const res = await orch.acquire({ sessionId: "s1", stream: true, requirements: { deviceKind: "real" } });
     if (!res.ok || res.queued) throw new Error("expected lease");
     expect(res.lease.streamUrl).toBeUndefined();
-    expect(res.warnings?.join(" ")).toContain("never auto-stream");
+    expect(res.warnings?.join(" ")).toContain("no real streamer");
   });
 
   it("fails without an injected real fleet", async () => {
@@ -185,14 +215,27 @@ describe("real dispatch + liveness", () => {
     expect(dispatched[0]).toMatchObject({ ticketId: queued.ticket.ticketId, udid: "R1", sessionId: "s2" });
   });
 
-  it("a dispatched real ticket with stream:true lands streamError (no serve-sim call)", async () => {
+  it("a dispatched real ticket with stream:true auto-starts via the real streamer", async () => {
+    const realStreamer = new FakeRealStreamer();
+    const { orch } = makeOrch({ real: [dev("R1")], realStreamer });
+    const held = await orch.acquire({ sessionId: "s1", requirements: { deviceKind: "real" } });
+    if (!held.ok || held.queued) throw new Error("expected lease");
+    const queued = await orch.acquire({ sessionId: "s2", stream: true, requirements: { deviceKind: "real" } });
+    if (!queued.ok || !queued.queued) throw new Error("expected ticket");
+    const { dispatched } = await orch.release(held.lease.leaseId, "s1");
+    expect(dispatched[0]?.streamUrl).toBe("http://127.0.0.1:3333/");
+    expect(dispatched[0]?.streamError).toBeUndefined();
+    expect(realStreamer.starts).toEqual(["R1"]);
+  });
+
+  it("a dispatched real ticket with stream:true lands streamError without a real streamer", async () => {
     const { orch } = makeOrch({ real: [dev("R1")] });
     const held = await orch.acquire({ sessionId: "s1", requirements: { deviceKind: "real" } });
     if (!held.ok || held.queued) throw new Error("expected lease");
     const queued = await orch.acquire({ sessionId: "s2", stream: true, requirements: { deviceKind: "real" } });
     if (!queued.ok || !queued.queued) throw new Error("expected ticket");
     const { dispatched } = await orch.release(held.lease.leaseId, "s1");
-    expect(dispatched[0]?.streamError).toContain("never auto-stream");
+    expect(dispatched[0]?.streamError).toContain("no real streamer");
     expect(dispatched[0]?.streamUrl).toBeUndefined();
   });
 

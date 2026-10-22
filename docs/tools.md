@@ -77,7 +77,9 @@ Key behaviors:
   `ui_screenshot` is cheaper for stills. Ports scan upward from
   `SERVE_SIM_PORT_BASE` because serve-sim kills whatever occupies its requested
   port instead of scanning (and its `:3100` default would collide with this
-  daemon).
+  daemon). Real-device leases stream via the single go-ios `:3333` MJPEG feed
+  (single-flight across the host — one real stream at a time, ~2fps; a second
+  udid gets a busy error naming the holder). See `docs/real-device-p3.md` §1.
 - Debugging wraps the llmdb CLI (an lldb-dap wrapper with session JSON):
   `debug_attach {bundle_id|pid}` (exactly one) or `debug_launch {path|bundle_id, args?}`
   opens one session per lease, then break/continue/inspect. Needs a debuggable

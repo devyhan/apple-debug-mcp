@@ -147,6 +147,7 @@ export class Orchestrator {
   private readonly defaultTtlMs: number;
   private readonly maxSims: number;
   private readonly streamer?: StreamOps;
+  private readonly realStreamer?: StreamOps;
   private readonly streamPortBase: number;
   private readonly debugger?: DebugOps;
   private readonly netProxy?: ProxyOps;
@@ -167,6 +168,8 @@ export class Orchestrator {
       defaultTtlMs: number;
       maxSims?: number;
       streamer?: StreamOps;
+      /** Real-device MJPEG backend (single-flight go-ios). Absent ⇒ real stream_start fails fast. */
+      realStreamer?: StreamOps;
       streamPortBase?: number;
       debugger?: DebugOps;
       proxy?: ProxyOps;
@@ -186,6 +189,7 @@ export class Orchestrator {
     this.defaultTtlMs = opts.defaultTtlMs;
     this.maxSims = opts.maxSims ?? 0;
     this.streamer = opts.streamer;
+    this.realStreamer = opts.realStreamer;
     this.streamPortBase = opts.streamPortBase ?? DEFAULT_STREAM_PORT_BASE;
     this.debugger = opts.debugger;
     this.netProxy = opts.proxy;
@@ -405,11 +409,9 @@ export class Orchestrator {
           .sort((a, b) => a.udid.localeCompare(b.udid));
         if (free.length > 0) {
           const target = free[0]!;
-          if (input.stream === true) {
-            warnings.push("Stream requested but real leases never auto-stream (screen streaming is P3); continuing without a live stream");
-          }
           const lease = await this.createLease(target.udid, input, client);
           await this.captureBaseline(lease.leaseId, target.udid, "real");
+          await this.maybeStartStream(lease, input.stream === true, warnings);
           return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
         }
         if (!queue) {
@@ -494,8 +496,7 @@ export class Orchestrator {
         return { value: lease, dirty: true };
       });
       // Stop BEFORE dispatch: a waiter reusing this sim may start its own stream.
-      // Real leases never had a serve-sim helper; keep the release hermetic.
-      if (!isRealLease(removed)) await this.stopStreamQuiet(removed.udid);
+      await this.stopStreamQuiet(removed.udid, deviceKindOf(removed));
       await this.stopDebugQuiet(removed.debugSessionId);
       await this.stopProxyQuiet(removed.leaseId);
       await this.stopCaptureQuiet(removed.leaseId);
@@ -561,7 +562,7 @@ export class Orchestrator {
           s.leases = s.leases.filter((l) => l.leaseId !== leaseId);
           return { value: undefined, dirty: true };
         });
-        if (!isRealLease(lease)) await this.stopStreamQuiet(lease.udid);
+        await this.stopStreamQuiet(lease.udid, deviceKindOf(lease));
         await this.stopDebugQuiet(lease.debugSessionId);
         await this.stopProxyQuiet(leaseId);
         await this.stopCaptureQuiet(leaseId);
@@ -607,7 +608,7 @@ export class Orchestrator {
           s.leases = s.leases.filter((l) => l.leaseId !== leaseId);
           return { value: undefined, dirty: true };
         });
-        await this.stopStreamQuiet(lease.udid);
+        await this.stopStreamQuiet(lease.udid, deviceKindOf(lease));
         await this.stopDebugQuiet(lease.debugSessionId);
         await this.stopProxyQuiet(leaseId);
         await this.stopCaptureQuiet(leaseId);
@@ -742,7 +743,7 @@ export class Orchestrator {
 
   private async sweepLocked(): Promise<string[]> {
     const now = Date.now();
-    const sweptUdids: string[] = [];
+    const sweptStreams: { udid: string; kind: DeviceKind }[] = [];
     const sweptDebugSessions: (string | undefined)[] = [];
     const sweptLeaseIds: string[] = [];
     const swept = await this.store.mutate((s) => {
@@ -750,7 +751,7 @@ export class Orchestrator {
       s.leases = s.leases.filter((l) => {
         if (isExpired(l, now)) {
           ids.push(l.leaseId);
-          if (!isRealLease(l)) sweptUdids.push(l.udid);
+          sweptStreams.push({ udid: l.udid, kind: deviceKindOf(l) });
           sweptDebugSessions.push(l.debugSessionId);
           sweptLeaseIds.push(l.leaseId);
           return false;
@@ -767,7 +768,7 @@ export class Orchestrator {
       return { value: ids, dirty: ids.length > 0 };
     });
     // Callers dispatch after sweeping, so stopping here never kills a new lease's stream.
-    for (const udid of sweptUdids) await this.stopStreamQuiet(udid);
+    for (const { udid, kind } of sweptStreams) await this.stopStreamQuiet(udid, kind);
     for (const sessionId of sweptDebugSessions) await this.stopDebugQuiet(sessionId);
     for (const leaseId of sweptLeaseIds) await this.stopProxyQuiet(leaseId);
     for (const leaseId of sweptLeaseIds) await this.stopCaptureQuiet(leaseId);
@@ -819,7 +820,7 @@ export class Orchestrator {
         };
         await this.captureBaseline(leaseId, target.udid, "real");
         if (ticket.stream === true) {
-          assignment.streamError = "real leases never auto-stream (screen streaming is P3)";
+          await this.startDispatchedStream(leaseId, target.udid, assignment, "real");
         }
         assigned.push(assignment);
         continue;
@@ -857,7 +858,7 @@ export class Orchestrator {
         udid: target.udid,
       };
       await this.captureBaseline(leaseId, target.udid);
-      if (ticket.stream === true) await this.startDispatchedStream(leaseId, target.udid, assignment);
+      if (ticket.stream === true) await this.startDispatchedStream(leaseId, target.udid, assignment, "sim");
       assigned.push(assignment);
     }
     return assigned;
@@ -947,8 +948,8 @@ export class Orchestrator {
     return this.mutex.run(async () => {
       const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
       if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
-      if (!this.streamer) throw new LeaseError("Live streaming is unavailable: no streamer is configured");
-      const { url, port } = await this.streamer.startStream(found.udid, { portBase: this.streamPortBase });
+      const streamer = this.streamerFor(deviceKindOf(found));
+      const { url, port } = await streamer.startStream(found.udid, { portBase: this.streamPortBase });
       const lease = await this.store.mutate((s) => {
         const rec = s.leases.find((l) => l.leaseId === leaseId);
         if (!rec) throw new LeaseError(`Unknown lease ${leaseId}`);
@@ -969,7 +970,8 @@ export class Orchestrator {
       const found = await this.store.read((s) => s.leases.find((l) => l.leaseId === leaseId));
       if (!found) throw new LeaseError(`Unknown lease ${leaseId}`);
       const hadStream = found.streamUrl !== undefined;
-      if (this.streamer) await this.streamer.stopStream(found.udid);
+      const streamer = deviceKindOf(found) === "real" ? this.realStreamer : this.streamer;
+      if (streamer) await streamer.stopStream(found.udid);
       const lease = await this.store.mutate((s) => {
         const rec = s.leases.find((l) => l.leaseId === leaseId);
         if (!rec) throw new LeaseError(`Unknown lease ${leaseId}`);
@@ -981,15 +983,34 @@ export class Orchestrator {
     });
   }
 
+  /** Kind-routed streamer for explicit starts; throws when the arm is unconfigured. */
+  private streamerFor(kind: DeviceKind): StreamOps {
+    const streamer = kind === "real" ? this.realStreamer : this.streamer;
+    if (!streamer) {
+      throw new LeaseError(
+        kind === "real"
+          ? "Live streaming is unavailable: no real streamer is configured"
+          : "Live streaming is unavailable: no streamer is configured",
+      );
+    }
+    return streamer;
+  }
+
   /** Start the requested stream for a fresh acquire; failures become warnings, never errors. */
   private async maybeStartStream(lease: Lease, wantStream: boolean, warnings: string[]): Promise<void> {
     if (!wantStream) return;
-    if (!this.streamer) {
-      warnings.push("Stream requested but no streamer is configured; continuing without a live stream");
+    const kind = deviceKindOf(lease);
+    const streamer = kind === "real" ? this.realStreamer : this.streamer;
+    if (!streamer) {
+      warnings.push(
+        kind === "real"
+          ? "Stream requested but no real streamer is configured; continuing without a live stream"
+          : "Stream requested but no streamer is configured; continuing without a live stream",
+      );
       return;
     }
     try {
-      const { url, port } = await this.streamer.startStream(lease.udid, { portBase: this.streamPortBase });
+      const { url, port } = await streamer.startStream(lease.udid, { portBase: this.streamPortBase });
       lease.streamUrl = url;
       lease.streamPort = port;
       await this.store.mutate((s) => {
@@ -1010,13 +1031,15 @@ export class Orchestrator {
     leaseId: string,
     udid: string,
     assignment: DispatchAssignment,
+    kind: DeviceKind,
   ): Promise<void> {
-    if (!this.streamer) {
-      assignment.streamError = "no streamer is configured";
+    const streamer = kind === "real" ? this.realStreamer : this.streamer;
+    if (!streamer) {
+      assignment.streamError = kind === "real" ? "no real streamer is configured" : "no streamer is configured";
       return;
     }
     try {
-      const { url, port } = await this.streamer.startStream(udid, { portBase: this.streamPortBase });
+      const { url, port } = await streamer.startStream(udid, { portBase: this.streamPortBase });
       assignment.streamUrl = url;
       await this.store.mutate((s) => {
         const rec = s.leases.find((l) => l.leaseId === leaseId);
@@ -1032,10 +1055,11 @@ export class Orchestrator {
   }
 
   /** Best-effort stream teardown for release/sweep/expire paths; never throws. */
-  private async stopStreamQuiet(udid: string): Promise<void> {
-    if (!this.streamer) return;
+  private async stopStreamQuiet(udid: string, kind: DeviceKind): Promise<void> {
+    const streamer = kind === "real" ? this.realStreamer : this.streamer;
+    if (!streamer) return;
     try {
-      await this.streamer.stopStream(udid);
+      await streamer.stopStream(udid);
     } catch (err) {
       console.error(`[orchestrator] Failed to stop stream for ${udid}: ${(err as Error).message}`);
     }
