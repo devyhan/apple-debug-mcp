@@ -39,7 +39,11 @@ export interface PoolDevice {
   platform?: string;
   osVersion?: string;
   kind: "real";
-  /** Best-effort heuristic from tunnelState (connected ⇒ usb, disconnected ⇒ wifi). */
+  /**
+   * Bearer from connectionProperties.transportType ("wired" ⇒ usb).
+   * tunnelState does NOT encode the bearer (a USB-attached iPhone reports
+   * tunnelState "disconnected"). Absent/unknown values map to undefined.
+   */
   transport?: DeviceTransport;
   trust: { paired: boolean; developerMode: string | null };
   /** CoreDevice `identifier`: escape hatch for `devicectl --device` if the udid form ever fails. */
@@ -60,6 +64,7 @@ interface DevicectlDeviceJson {
   connectionProperties?: {
     pairingState?: unknown;
     tunnelState?: unknown;
+    transportType?: unknown;
   };
 }
 
@@ -77,7 +82,7 @@ export function mapDevicectlDevice(device: DevicectlDeviceJson): PoolDevice | nu
   const platform = str(device.hardwareProperties?.platform);
   const osVersion = str(device.deviceProperties?.osVersionNumber);
   const transport: DeviceTransport | undefined =
-    tunnelState === "connected" ? "usb" : tunnelState === "disconnected" ? "wifi" : undefined;
+    str(device.connectionProperties?.transportType) === "wired" ? "usb" : undefined;
   return {
     udid,
     name: str(device.deviceProperties?.name) ?? udid,
@@ -263,7 +268,9 @@ export class RealDeviceApps implements AppOps {
     try {
       const [processesJson, appsJson] = await Promise.all([
         runDevicectlJson(this.run, ["device", "info", "processes", "--device", udid], this.execTimeoutMs),
-        runDevicectlJson(this.run, ["device", "info", "apps", "--device", udid], this.execTimeoutMs),
+        // --include-all-apps: the default view lists developer apps only, which
+        // misses every App Store process in the join (observed live).
+        runDevicectlJson(this.run, ["device", "info", "apps", "--include-all-apps", "--device", udid], this.execTimeoutMs),
       ]);
       const byUuid = new Map<string, string>();
       const apps = (appsJson as DevicectlAppsJson)?.result?.apps;
@@ -311,7 +318,11 @@ function iosError(iosBin: string, verb: string, udid: string, err: unknown): Err
         `For iOS 17+ devices also run: sudo ios tunnel start`,
     );
   }
-  if (new RegExp(`${iosBin}.*(not found|ENOENT)|spawn ${iosBin}`, "i").test(msg)) {
+  // Fallback for non-ExecError spawn failures: match ONLY launcher-level
+  // signals. Never `.*not found`: device errors like `process not found`
+  // (kill of a non-running app, measured live) must keep their own text.
+  const escapedBin = iosBin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`spawn ${escapedBin} ENOENT|${escapedBin}: command not found`, "i").test(msg)) {
     return new Error(
       `${msg}. go-ios (\`ios\`) is not installed; install with: ${GO_IOS_INSTALL_HINT} (or set IOS_BIN). ` +
         `For iOS 17+ devices also run: sudo ios tunnel start`,

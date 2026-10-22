@@ -11,6 +11,10 @@ import type { BoundedRunner, ShowOptions, StreamOptions } from "./simlog.js";
  * keep their meaning and the sim_log_* response shapes are unchanged.
  *
  * Semantic differences from sim (documented, never silent):
+ * - The relay emits one JSON object per line (`{"msg":"..."}` with Go
+ *   `\uXXXX` HTML-escapes, measured 2026-10-22); each line is decoded to its
+ *   plain-text `msg` so filters and consumers see sim-like rows. Lines that
+ *   are not JSON objects with a string `msg` pass through verbatim.
  * - The relay is live-only: `show` (--last history) has no device equivalent
  *   and fails with stream-instead guidance.
  * - NSPredicate syntax is NOT supported: `predicate`/`process` become
@@ -47,7 +51,7 @@ export class RealSyslog implements LogOps {
       maxChars,
       keep: "tail",
     });
-    const filtered = applyLineFilters(captured.stdout, filters);
+    const filtered = applyLineFilters(decodeRelayLines(captured.stdout), filters);
     if (filtered.length <= maxChars) {
       return { stdout: filtered, truncated: captured.truncated, timedOut: captured.timedOut };
     }
@@ -64,6 +68,33 @@ export class RealSyslog implements LogOps {
         "Use sim_log_stream with a timeout_sec window instead.",
     );
   }
+}
+
+/**
+ * Decode go-ios relay lines to plain text. A line that parses as a JSON
+ * object with a string `msg` becomes that message (this also resolves the
+ * Go `\u003c`-style HTML-escapes, so `<Notice>`/`<Error>` match again);
+ * anything else — truncation markers, a tail-cut partial head line, future
+ * go-ios formats — passes through verbatim. Never throws.
+ */
+function decodeRelayLines(stdout: string): string {
+  if (!stdout.includes("{")) return stdout;
+  return stdout
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("{")) return line;
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (typeof parsed === "object" && parsed !== null && typeof (parsed as { msg?: unknown }).msg === "string") {
+          return (parsed as { msg: string }).msg;
+        }
+      } catch {
+        // Not JSON (partial head line, marker text): keep verbatim.
+      }
+      return line;
+    })
+    .join("\n");
 }
 
 /** One line predicate; a line survives only when every filter matches. */

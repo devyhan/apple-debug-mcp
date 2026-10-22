@@ -21,6 +21,9 @@ const LINES = [
   '{"app":"Prefs","msg":"opened"}',
   '{"app":"Maps","msg":"route done"}',
 ].join("\n");
+// Relay lines decode to their plain-text msg (extra JSON fields are dropped:
+// measured go-ios syslog lines carry only {"msg": ...}).
+const DECODED = ["route started", "opened", "route done"].join("\n");
 
 describe("LogOps seam", () => {
   it("SimLog satisfies LogOps and routes through it", async () => {
@@ -35,7 +38,7 @@ describe("LogOps seam", () => {
     const run = stubBounded(() => ({ stdout: LINES, truncated: false, timedOut: true }));
     const log: LogOps = new RealSyslog({ runner: run });
     const r = await log.stream("R1", { timeoutSec: 5 });
-    expect(r.stdout).toBe(LINES);
+    expect(r.stdout).toBe(DECODED);
     expect(r.timedOut).toBe(true);
   });
 });
@@ -49,19 +52,19 @@ describe("RealSyslog.stream", () => {
       args: ["syslog", "--udid=R1"],
       opts: { timeoutMs: 7000, maxChars: 500, keep: "tail" },
     });
-    expect(r).toMatchObject({ stdout: LINES, truncated: false, timedOut: true });
+    expect(r).toMatchObject({ stdout: DECODED, truncated: false, timedOut: true });
   });
 
   it("filters by process substring", async () => {
     const run = stubBounded(() => ({ stdout: LINES, truncated: false, timedOut: true }));
-    const r = await new RealSyslog({ runner: run }).stream("R1", { process: "Prefs" });
-    expect(r.stdout).toBe('{"app":"Prefs","msg":"opened"}');
+    const r = await new RealSyslog({ runner: run }).stream("R1", { process: "opened" });
+    expect(r.stdout).toBe("opened");
   });
 
   it("extracts process == clauses as substring filters", async () => {
     const run = stubBounded(() => ({ stdout: LINES, truncated: false, timedOut: true }));
-    const r = await new RealSyslog({ runner: run }).stream("R1", { predicate: 'process == "Maps"' });
-    expect(r.stdout).toBe('{"app":"Maps","msg":"route started"}\n{"app":"Maps","msg":"route done"}');
+    const r = await new RealSyslog({ runner: run }).stream("R1", { predicate: 'process == "route"' });
+    expect(r.stdout).toBe("route started\nroute done");
   });
 
   it("treats other predicates as full-text regex, with literal fallback", async () => {
@@ -69,8 +72,8 @@ describe("RealSyslog.stream", () => {
     const log = new RealSyslog({ runner: run });
     const re = await log.stream("R1", { predicate: "route (started|done)" });
     expect(re.stdout.split("\n")).toHaveLength(2);
-    const lit = await log.stream("R1", { predicate: '{"app":"Prefs"' });
-    expect(lit.stdout).toBe('{"app":"Prefs","msg":"opened"}');
+    const lit = await log.stream("R1", { predicate: "opened" });
+    expect(lit.stdout).toBe("opened");
     const invalidRe = await log.stream("R1", { predicate: "route (started" });
     expect(invalidRe.stdout).toBe(""); // invalid regex ⇒ literal substring, no line contains it
   });
@@ -89,7 +92,7 @@ describe("RealSyslog.stream", () => {
     const r = await new RealSyslog({ runner: run }).stream("R1", { maxChars: 10 });
     expect(r.truncated).toBe(true);
     expect(r.stdout.length).toBeGreaterThan(10); // marker + last 10 chars
-    expect(r.stdout.endsWith(LINES.slice(-10))).toBe(true);
+    expect(r.stdout.endsWith(DECODED.slice(-10))).toBe(true);
   });
 
   it("preserves the runner truncated flag when filtering keeps everything", async () => {
@@ -105,6 +108,39 @@ describe("RealSyslog.stream", () => {
     await expect(log.stream("R1", { timeoutSec: 0 })).rejects.toThrow(/timeoutSec/);
     await expect(log.stream("R1", { timeoutSec: 61 })).rejects.toThrow(/timeoutSec/);
     expect(run.calls).toHaveLength(0);
+  });
+});
+
+describe("RealSyslog relay decoding (live shape 2026-10-22)", () => {
+  it("emits the decoded msg of each JSON relay line", async () => {
+    const run = stubBounded(() => ({
+      stdout: '{"msg":"Oct 22 13:28:47 iPhone kernel[0] \\u003cNotice\\u003e: ok"}',
+      truncated: false,
+      timedOut: true,
+    }));
+    const r = await new RealSyslog({ runner: run }).stream("R1", {});
+    expect(r.stdout).toBe("Oct 22 13:28:47 iPhone kernel[0] <Notice>: ok");
+  });
+
+  it("passes non-JSON lines (truncation markers, partial head) through verbatim", async () => {
+    const run = stubBounded(() => ({
+      stdout: "…[truncated 26 chars]\npartial-head frag\nnot json at all",
+      truncated: true,
+      timedOut: true,
+    }));
+    const r = await new RealSyslog({ runner: run }).stream("R1", {});
+    expect(r.stdout).toBe("…[truncated 26 chars]\npartial-head frag\nnot json at all");
+  });
+
+  it("matches process/predicate filters against decoded text", async () => {
+    const run = stubBounded(() => ({
+      stdout: '{"msg":"kernel[0] \\u003cError\\u003e: stuck"}\n{"msg":"other line"}',
+      truncated: false,
+      timedOut: true,
+    }));
+    const log = new RealSyslog({ runner: run });
+    const r = await log.stream("R1", { predicate: "<Error>" });
+    expect(r.stdout).toBe("kernel[0] <Error>: stuck");
   });
 });
 

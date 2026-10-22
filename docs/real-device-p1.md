@@ -31,14 +31,18 @@ Probed with the exact commands below; outputs recorded verbatim in §1.1.
 
 devicectl 518.33. `list devices` table: 9× `unavailable`, 1×
 `available (paired)` (`000A1FED-73CC-57FF-9285-339181AB988E`, tunnelState
-`disconnected`, i.e. wifi-paired, reachable on demand — the `processes` probe
-below acquired a tunnel successfully). All 10 report `pairingState: paired`;
-all but the Watch report `developerModeStatus: enabled`.
+`disconnected`, reachable on demand — the `processes` probe below succeeded
+live: 482 procs, 25 apps). All 10 report `pairingState: paired`; all but the
+Watch report `developerModeStatus: enabled`.
 
-No USB-attached device was observed (no `tunnelState: connected`); the live
-gate for P1 verification is the wifi-paired iPhone 16 Pro Max above. A USB
-device would additionally exercise `transport: usb` matching — record which
-transport the live run used.
+CORRECTION (parent, live 2026-10-22): the available device above is
+USB-attached (`connectionProperties.transportType: "wired"`). `tunnelState`
+does NOT encode the bearer — "disconnected" appears on USB devices too — so
+the tunnelState⇒transport heuristic drafted below was replaced before
+implementation: bearer [REDACTED] ONLY from `transportType`
+("wired" ⇒ `usb`; absent/unknown ⇒ undefined). No `tunnelState: connected`
+was ever observed; no wifi-bearer `transportType` value has been observed
+either (a wifi device would show the wireless value — record it if seen).
 
 ## 2. Scope
 
@@ -89,7 +93,7 @@ unlink after parse (best-effort); never a fixed path (concurrent calls).
     "marketingName": "iPhone 14", "platform": "iOS", "productType": "iPhone14,7",
     "serialNumber": "M2N777KVN6", "...": "..." },
   "connectionProperties": { "pairingState": "paired|…", "tunnelState": "unavailable|disconnected|…",
-    "authenticationType": "manualPairing", "...": "..." },
+    "transportType": "wired|…", "authenticationType": "manualPairing", "...": "..." },
   "capabilities": [ "..." ], "tags": [], "visibilityClass": "default"
 }
 ```
@@ -111,7 +115,7 @@ export interface PoolDevice {
   platform?: string;   // hardwareProperties.platform ("iOS"/"watchOS"/…)
   osVersion?: string;  // deviceProperties.osVersionNumber
   kind: "real";        // literal: lets pool_status rows self-describe
-  transport?: DeviceTransport;  // usb when tunnelState === "connected" via usb… see note
+  transport?: DeviceTransport;  // "usb" iff transportType === "wired"; else undefined (see note)
   trust: { paired: boolean; developerMode: string | null };  // pairingState === "paired", developerModeStatus
   coredeviceId: string;  // identifier (escape hatch for devicectl --device if udid form ever fails)
 }
@@ -125,11 +129,13 @@ device reports `disconnected`, all unavailable ones `unavailable`).
 Only `available` devices are acquirable; unavailable ones appear in
 `pool_status` with `lease: null` (same shape as shutdown sims).
 
-Transport note: devicectl JSON exposes no explicit usb/wifi bearer field.
-`tunnelState: connected` arises for attached devices; P1 maps transport
-heuristically (connected ⇒ `usb`, disconnected ⇒ `wifi`) and marks the field
-**best-effort** in the tool description. `requirements.transport` filters on
-this field when present; omitted transport matches either.
+Transport note: the Bearer [REDACTED] `connectionProperties.transportType`
+("wired" ⇒ `usb`; observed live on the USB-attached iPhone 16 Pro Max).
+`tunnelState` does NOT encode the bearer (USB devices report "disconnected"),
+so it is used only for the available/unavailable state mapping, never for
+transport. `requirements.transport` filters on this field when present;
+omitted transport matches either; unknown/absent transportType ⇒ undefined
+(never a guess).
 
 **listRunning join (VERIFIED live)** — two calls:
 
@@ -218,8 +224,11 @@ justified: no longer speculative):
   `timedOut/truncated` keep their meaning and the `sim_log_*` response shapes
   (`{udid, log, truncated, timedOut}`, `src/extras.ts:501,536`) are unchanged.
   - `stream`: relay until the window elapses; **client-side predicate
-    filtering** — go-ios syslog emits plain text, so `predicate`/`process`
-    become substring/regex line filters applied after capture (document the
+    filtering** — go-ios syslog emits one JSON `{"msg": ...}` object per
+    line with Go `\uXXXX` HTML-escapes (measured 2026-10-22, correcting the
+    plain-text assumption); lines decode to plain-text `msg` first, then
+    `predicate`/`process` become substring/regex line filters applied after
+    capture (document the
     semantic difference: NSPredicate syntax is NOT supported on real; a
     best-effort `process == "X"` → substring `X` extraction plus full-text
     regex fallback; invalid-as-regex ⇒ literal substring). `level` is
@@ -476,9 +485,13 @@ Gates (in order): focused new tests → `npx vitest run` (full suite green) →
   transport errors on an acquirable lease. Mitigation: `RealDeviceApps` errors
   include the udid + "visible to devicectl but unreachable via go-ios?"
   checklist line.
-- **Transport heuristic.** usb/wifi mapping from `tunnelState` is best-effort
-  (§3.1). A wrong guess misroutes `transport`-filtered acquires; default
-  (omitted transport) is unaffected. Revisit if devicectl exposes a bearer.
+- **Transport bearer (RESOLVED live).** devicectl DOES expose a bearer:
+  `connectionProperties.transportType` ("wired" observed on the USB-attached
+  iPhone 16 Pro Max ⇒ `usb`). The earlier `tunnelState` heuristic was wrong
+  (USB devices report `tunnelState: disconnected`) and was removed before
+  implementation. Residual: no wireless `transportType` value observed yet —
+  record it if a wifi device appears (map unknown values to undefined, never
+  guess).
 - **Contamination semantics on real.** `listRunning` needs TWO devicectl calls
   (tunnel setup each — observed ~1s for processes live); the resolveLease path
   calls it on every verb. Mitigation: existing min-interval throttle

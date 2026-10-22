@@ -41,6 +41,7 @@
     "connectionProperties": {
      "pairingState": "paired",
      "tunnelState": "disconnected",
+     "transportType": "wired",
      "authenticationType": "manualPairing"
     }
    },

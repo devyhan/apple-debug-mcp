@@ -62,7 +62,7 @@ describe("RealDevices inventory", () => {
       platform: "iOS",
       osVersion: "27.0.1",
       kind: "real",
-      transport: "wifi",
+      transport: "usb",
       trust: { paired: true, developerMode: "enabled" },
     });
     expect(avail.coredeviceId).toBe("000A1FED-73CC-57FF-9285-339181AB988E");
@@ -91,14 +91,26 @@ describe("RealDevices inventory", () => {
     await expect(new RealDevices({ runner: run }).list()).rejects.toThrow(/unexpected JSON.*devices/);
   });
 
-  it("maps connected tunnel state to usb transport", () => {
+  it("maps transportType wired to usb (tunnelState disconnected does NOT mean wifi)", () => {
+    // Observed live: USB-attached iPhone reports tunnelState "disconnected"
+    // with transportType "wired". Bearer comes ONLY from transportType.
     const row = mapDevicectlDevice({
       identifier: "core-1",
-      deviceProperties: { name: "USB Phone", osVersionNumber: "26.1", developerModeStatus: "enabled" },
+      deviceProperties: { name: "USB Phone", osVersionNumber: "27.0.1", developerModeStatus: "enabled" },
       hardwareProperties: { udid: "USB-UDID", platform: "iOS" },
-      connectionProperties: { pairingState: "paired", tunnelState: "connected" },
+      connectionProperties: { pairingState: "paired", tunnelState: "disconnected", transportType: "wired" },
     });
     expect(row).toMatchObject({ state: "available", transport: "usb", trust: { paired: true, developerMode: "enabled" } });
+  });
+
+  it("leaves transport undefined when transportType is absent", () => {
+    const row = mapDevicectlDevice({
+      identifier: "core-2",
+      hardwareProperties: { udid: "U2" },
+      connectionProperties: { pairingState: "paired", tunnelState: "disconnected" },
+    });
+    expect(row).toMatchObject({ state: "available" });
+    expect(row!.transport).toBeUndefined();
   });
 
   it("checkAvailable resolves with the devicectl version", async () => {
@@ -165,6 +177,17 @@ describe("RealDeviceApps", () => {
     );
   });
 
+  it("kill of a non-running app keeps the device error, never the install hint (live: process not found)", async () => {
+    const run = stubRunner({
+      ios: () => {
+        throw new ExecError("ios", ["kill", "com.example.App", "--udid=R1"], 1, "", "process not found");
+      },
+    });
+    const err = await new RealDeviceApps({ runner: run }).terminate("R1", "com.example.App").catch((e) => e);
+    expect(String(err?.message ?? err)).toContain("process not found");
+    expect(String(err?.message ?? err)).not.toContain("is not installed");
+  });
+
   it("ios failures name the devicectl/go-ios seam checklist", async () => {
     const run = stubRunner({
       ios: () => {
@@ -206,6 +229,16 @@ describe("RealDeviceApps.listRunning (devicectl join)", () => {
     const infos = run.calls.filter((c) => c.args.includes("info"));
     expect(infos).toHaveLength(2);
     for (const c of infos) expect(c.args).toContain("R1");
+  });
+
+  it("lists apps with --include-all-apps (default view omits App Store apps)", async () => {
+    // Observed live: without the flag only 25 developer apps return, so the
+    // join misses every App Store process (KakaoTalk, Toss, …).
+    const run = joinRunner();
+    await new RealDeviceApps({ runner: run }).listRunning("R1");
+    const apps = run.calls.filter((c) => c.args.includes("apps"));
+    expect(apps).toHaveLength(1);
+    expect(apps[0]!.args).toContain("--include-all-apps");
   });
 
   it("never throws: devicectl failure yields an empty set", async () => {
