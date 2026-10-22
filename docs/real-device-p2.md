@@ -231,7 +231,10 @@ ios screenshot --udid=<udid> --output=<file>
 
 Live-verified end-to-end 2026-10-22 on the paired iPhone 16 Pro Max
 (`00008140-000555603453001C`): exit 0,
-`{"msg":"File saved successfully"}`, genuine 1320x2868 PNG on disk.
+`{"msg":"File saved successfully"}`, genuine 1320x2868 PNG on disk —
+plus a full daemon MCP roundtrip (real `lease_acquire` →
+`ui_screenshot` → `lease_release`): ok + `image/png` content block,
+956KB file with valid PNG magic.
 
 Handler routing (`src/server.ts`): new optional `ServerDeps.realUi`
 (parallel to `realApps`/`realLog`, constructed + wired in `index.ts`)
