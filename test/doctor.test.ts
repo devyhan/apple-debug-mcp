@@ -24,6 +24,8 @@ const ALL_OK: Record<string, string> = {
   "llmdb --version": "llmdb 3.0.0",
   "mitmdump --version": "mitmdump 11",
   "tcpdump --version": "tcpdump version 4.99.1",
+  "xcrun devicectl --version": "devicectl 518.33",
+  "ios --version": "go-ios 1.0.0",
   "launchctl list": "not used",
 };
 
@@ -90,6 +92,8 @@ describe("doctor (stubbed runner)", () => {
         "llmdb --version": fail,
         "mitmdump --version": fail,
         "tcpdump --version": fail,
+        "xcrun devicectl --version": fail,
+        "ios --version": fail,
       }),
       homeDir: tmpHome(true),
       fetchHealth: async () => ({ ok: true, version: "0.1.0" }),
@@ -101,6 +105,11 @@ describe("doctor (stubbed runner)", () => {
     expect(byName["mitmdump"]!.fix).toMatch(/brew install mitmproxy/);
     expect(byName["tcpdump"]!.status).toBe("warn");
     expect(byName["tcpdump"]!.fix).toMatch(/TCPDUMP_BIN/);
+    expect(byName["devicectl"]!.status).toBe("warn");
+    expect(byName["devicectl"]!.fix).toMatch(/xcode-select/);
+    expect(byName["ios"]!.status).toBe("warn");
+    expect(byName["ios"]!.fix).toMatch(/npm install -g go-ios/);
+    expect(byName["ios"]!.fix).toMatch(/IOS_BIN/);
     expect(formatDoctorReport(checks).exitCode).toBe(0);
   });
 

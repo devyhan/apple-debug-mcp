@@ -30,17 +30,3 @@ export function requireSimLease(
   );
 }
 
-export const REAL_LEASE_ENV = "SIM_MCP_REAL_LEASE";
-
-/**
- * Experimental-hatch gate: `SIM_MCP_REAL_LEASE=1` allows constructing real-kind
- * leases with an explicit udid for live observability of the P0 fail-fast
- * errors. Default OFF. Fail-soft like the other env gates. P1 deletes this.
- */
-export function allowRealLease(env: NodeJS.ProcessEnv = process.env): boolean {
-  try {
-    return env[REAL_LEASE_ENV] === "1";
-  } catch {
-    return false;
-  }
-}

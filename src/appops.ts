@@ -9,9 +9,8 @@ export interface LaunchResult {
 
 /**
  * App-lifecycle driver seam: the full `SimApps` public surface,
- * method-for-method. P2 adds a real-device (devicectl-backed) implementation;
- * P0 only relies on the interface existing (`SimApps implements AppOps`,
- * zero changes).
+ * method-for-method. `SimApps implements AppOps` (simctl); P1 adds the
+ * real-device `RealDeviceApps` implementer (go-ios + devicectl join).
  */
 export interface AppOps {
   openUrl(udid: string, url: string): Promise<void>;

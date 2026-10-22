@@ -1,9 +1,11 @@
 import { AppOps } from "./appops.js";
-import { allowRealLease, isRealLease } from "./devicekind.js";
+import { deviceKindOf, isRealLease } from "./devicekind.js";
+import type { DeviceKind } from "./devicekind.js";
 import { DebugOps } from "./llmdb.js";
 import { CaptureOps, CaptureStartSpec, CaptureStatus, CaptureStopResult } from "./netcapture.js";
 import { AssertFlowResult, AssertFlowSpec, NetProxyRule, NetProxyStatus, ProxyOps } from "./netproxy.js";
 import { DEFAULT_STREAM_PORT_BASE, StreamOps } from "./servesim.js";
+import type { PoolDevice, RealDevices } from "./realdevices.js";
 import { FleetOps, SimDevice } from "./simslim.js";
 import { Lease, Requirements, Store, Ticket, nextId } from "./store.js";
 import { traceHook } from "./trace.js";
@@ -68,6 +70,14 @@ export interface PoolSimulator extends SimDevice {
   lease: Pick<Lease, "leaseId" | "sessionId" | "client" | "task" | "streamUrl" | "streamPort" | "contended" | "contendedSince"> | null;
 }
 
+/** pool_status row for a real device: inventory + lease overlay (slim/ram have no hardware meaning). */
+export interface PoolDeviceView extends PoolDevice {
+  slim: null;
+  slimDetail: null;
+  ramBytes: null;
+  lease: Pick<Lease, "leaseId" | "sessionId" | "client" | "task" | "streamUrl" | "streamPort" | "contended" | "contendedSince"> | null;
+}
+
 /**
  * Bundles running that the lease neither inherited (baseline) nor launched
  * itself. `com.apple.*` system bundles are ignored — launchctl output cannot
@@ -92,11 +102,23 @@ interface ContaminationState {
 }
 
 function matches(dev: SimDevice, req: Requirements): boolean {
-  if ((req.deviceKind ?? "sim") !== "sim") return false; // P0 fleet is sims only; P1 adds the real fleet
+  if ((req.deviceKind ?? "sim") !== "sim") return false;
   if (req.udid && dev.udid !== req.udid) return false;
   if (req.device && !dev.name.toLowerCase().includes(req.device.toLowerCase())) return false;
   if (req.osVersion && !(dev.osVersion ?? "").startsWith(req.osVersion)) return false;
   if (req.platform && (dev.platform ?? "").toLowerCase() !== req.platform.toLowerCase()) return false;
+  return true;
+}
+
+/** Real-fleet match: same udid/device/osVersion/platform semantics plus transport + availability. */
+function matchesReal(dev: PoolDevice, req: Requirements): boolean {
+  if ((req.deviceKind ?? "sim") !== "real") return false;
+  if (dev.state !== "available") return false;
+  if (req.udid && dev.udid !== req.udid) return false;
+  if (req.device && !dev.name.toLowerCase().includes(req.device.toLowerCase())) return false;
+  if (req.osVersion && !(dev.osVersion ?? "").startsWith(req.osVersion)) return false;
+  if (req.platform && (dev.platform ?? "").toLowerCase() !== req.platform.toLowerCase()) return false;
+  if (req.transport && dev.transport !== req.transport) return false;
   return true;
 }
 
@@ -130,10 +152,11 @@ export class Orchestrator {
   private readonly netProxy?: ProxyOps;
   private readonly netCapture?: CaptureOps;
   private readonly apps?: Pick<AppOps, "listRunning">;
+  private readonly realFleet?: Pick<RealDevices, "list">;
+  private readonly realApps?: Pick<AppOps, "listRunning">;
   private readonly contaminationCheck: boolean;
   private readonly contaminationCheckMinIntervalMs: number;
   private readonly traceDir?: string;
-  private readonly env: NodeJS.ProcessEnv;
   private readonly actions = new Map<string, LeaseAction[]>();
   private readonly contamination = new Map<string, ContaminationState>();
 
@@ -149,11 +172,13 @@ export class Orchestrator {
       proxy?: ProxyOps;
       capture?: CaptureOps;
       apps?: Pick<AppOps, "listRunning">;
+      /** Real-device inventory provider (devicectl-backed). Absent ⇒ real acquire fails. */
+      realFleet?: Pick<RealDevices, "list">;
+      /** Real-device listRunning (devicectl join) for contamination baselines. */
+      realApps?: Pick<AppOps, "listRunning">;
       contaminationCheck?: boolean;
       contaminationCheckMinIntervalMs?: number;
       traceDir?: string;
-      /** Injected env for gates (tests); defaults to process.env. */
-      env?: NodeJS.ProcessEnv;
     },
   ) {
     this.fleet = fleet;
@@ -166,10 +191,11 @@ export class Orchestrator {
     this.netProxy = opts.proxy;
     this.netCapture = opts.capture;
     this.apps = opts.apps;
+    this.realFleet = opts.realFleet;
+    this.realApps = opts.realApps;
     this.contaminationCheck = opts.contaminationCheck ?? true;
     this.contaminationCheckMinIntervalMs = opts.contaminationCheckMinIntervalMs ?? 30_000;
     this.traceDir = opts.traceDir;
-    this.env = opts.env ?? process.env;
   }
 
   // ---------- state views (read-only, never mutate) ----------
@@ -178,12 +204,25 @@ export class Orchestrator {
     simulators: PoolSimulator[];
     counts: { total: number; booted: number; leased: number; free: number };
     queue: { waiting: number };
+    devices: PoolDeviceView[];
+    countsReal: { total: number; available: number; leased: number };
+    /** Present only when the real fleet was probed and failed; the sim view stays intact. */
+    realError?: string;
   }> {
     const [devices, leases, tickets] = await Promise.all([
       this.fleet.list(),
       this.store.read((s) => s.leases),
       this.store.read((s) => s.tickets.filter((t) => t.status === "waiting")),
     ]);
+    let realDevices: PoolDevice[] = [];
+    let realError: string | undefined;
+    if (this.realFleet) {
+      try {
+        realDevices = await this.realFleet.list();
+      } catch (err) {
+        realError = (err as Error).message;
+      }
+    }
     const byUdid = new Map(leases.map((l) => [l.udid, l]));
     const now = Date.now();
 
@@ -225,10 +264,36 @@ export class Orchestrator {
     });
     const booted = devices.filter(isBooted).length;
     const leased = simulators.filter((s) => s.lease !== null).length;
+    const deviceRows: PoolDeviceView[] = realDevices.map((d) => {
+      const lease = byUdid.get(d.udid);
+      return {
+        ...d,
+        slim: null,
+        slimDetail: null,
+        ramBytes: null,
+        lease: lease && !isExpired(lease, now)
+          ? {
+            leaseId: lease.leaseId,
+            sessionId: lease.sessionId,
+            client: lease.client,
+            task: lease.task,
+            streamUrl: lease.streamUrl,
+            streamPort: lease.streamPort,
+            contended: this.contamination.get(lease.leaseId)?.contended ?? false,
+            contendedSince: this.contamination.get(lease.leaseId)?.contendedSince ?? null,
+          }
+          : null,
+      };
+    });
+    const availableReal = realDevices.filter((d) => d.state === "available").length;
+    const leasedReal = deviceRows.filter((s) => s.lease !== null).length;
     return {
       simulators,
       counts: { total: devices.length, booted, leased, free: booted - leased },
       queue: { waiting: tickets.length },
+      devices: deviceRows,
+      countsReal: { total: realDevices.length, available: availableReal, leased: leasedReal },
+      ...(realError !== undefined ? { realError } : {}),
     };
   }
 
@@ -318,22 +383,43 @@ export class Orchestrator {
       const warnings = expiredSwept.map((id) => `Swept expired lease ${id}`);
 
       if ((req.deviceKind ?? "sim") === "real") {
-        if (allowRealLease(this.env)) {
-          if (!req.udid) {
-            return { ok: false, reason: "Experimental real leases require an explicit udid (SIM_MCP_REAL_LEASE=1 hatch; P1 owns real matching)." };
-          }
-          // Experimental hatch (§8.2): no fleet lookup, no boot, no slim, no
-          // baseline capture, no auto-stream. P1 deletes this branch.
+        if (!this.realFleet) {
+          return {
+            ok: false,
+            reason: "kind=real acquisition needs the real-device inventory transport (devicectl), which is unavailable in this embedding.",
+          };
+        }
+        let realDevices: PoolDevice[];
+        try {
+          realDevices = await this.realFleet.list();
+        } catch (err) {
+          const reason = `Real-device inventory failed: ${(err as Error).message}`;
+          if (!queue) return { ok: false, reason };
+          const { ticket, position } = await this.createTicket(input, client, req, false, false);
+          return { ok: true, queued: true, ticket, position, note: reason };
+        }
+        const leases = await this.store.read((s) => s.leases);
+        const held = new Set(leases.map((l) => l.udid));
+        const free = realDevices
+          .filter((d) => !held.has(d.udid) && matchesReal(d, req))
+          .sort((a, b) => a.udid.localeCompare(b.udid));
+        if (free.length > 0) {
+          const target = free[0]!;
           if (input.stream === true) {
-            warnings.push("Stream requested but experimental real leases never auto-stream; continuing without a live stream");
+            warnings.push("Stream requested but real leases never auto-stream (screen streaming is P3); continuing without a live stream");
           }
-          const lease = await this.createLease(req.udid, input, client);
+          const lease = await this.createLease(target.udid, input, client);
+          await this.captureBaseline(lease.leaseId, target.udid, "real");
           return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
         }
-        return {
-          ok: false,
-          reason: 'kind=real acquisition lands in P1 (real-device fleet: devicectl inventory, pairing, transport). Omit device_kind (default sim) for a simulator lease.',
-        };
+        if (!queue) {
+          return {
+            ok: false,
+            reason: "No matching real device is free and queue=false (see pool_status devices[]; checklist: paired, trusted, Developer Mode on, reachable)",
+          };
+        }
+        const { ticket, position } = await this.createTicket(input, client, req, false, false);
+        return { ok: true, queued: true, ticket, position };
       }
 
       const devices = await this.fleet.list();
@@ -485,7 +571,34 @@ export class Orchestrator {
       this.contamination.delete(leaseId);
       throw new LeaseError(`Lease ${leaseId} expired and was released`);
     }
-    if (isRealLease(lease)) return lease; // P0: validity only; every sim-assuming verb fail-fasts itself (§6)
+    if (isRealLease(lease)) {
+      if (this.realFleet) {
+        let present = false;
+        try {
+          const realDevices = await this.realFleet.list();
+          present = realDevices.some((d) => d.udid === lease.udid && d.state === "available");
+        } catch {
+          present = true; // Inventory failure means unknown, not gone: keep the lease.
+        }
+        if (!present) {
+          await this.mutex.run(async () => {
+            await this.store.mutate((s) => {
+              s.leases = s.leases.filter((l) => l.leaseId !== leaseId);
+              return { value: undefined, dirty: true };
+            });
+            await this.stopDebugQuiet(lease.debugSessionId);
+            await this.stopProxyQuiet(leaseId);
+            await this.stopCaptureQuiet(leaseId);
+            await this.dispatchLocked();
+          });
+          this.actions.delete(leaseId);
+          this.contamination.delete(leaseId);
+          throw new LeaseError(`Real device ${lease.udid} is no longer available; lease ${leaseId} was released`);
+        }
+      }
+      await this.checkContamination(lease);
+      return lease;
+    }
     const devices = await this.fleet.list();
     const dev = devices.find((d) => d.udid === lease.udid);
     if (!dev || !isBooted(dev)) {
@@ -576,11 +689,17 @@ export class Orchestrator {
    * failed snapshot leaves an empty baseline plus an action note — the acquire
    * still succeeds.
    */
-  private async captureBaseline(leaseId: string, udid: string): Promise<void> {
+  /** Backend for contamination snapshots, selected by lease kind (sim vs real). */
+  private appsFor(kind: DeviceKind): Pick<AppOps, "listRunning"> | undefined {
+    return kind === "real" ? this.realApps : this.apps;
+  }
+
+  private async captureBaseline(leaseId: string, udid: string, kind: DeviceKind = "sim"): Promise<void> {
     const state = this.ensureContamination(leaseId);
-    if (!this.contaminationCheck || !this.apps) return;
+    const apps = this.appsFor(kind);
+    if (!this.contaminationCheck || !apps) return;
     try {
-      state.baseline = await this.apps.listRunning(udid);
+      state.baseline = await apps.listRunning(udid);
       state.lastCheck = Date.now();
     } catch (err) {
       state.baseline = new Set();
@@ -596,14 +715,14 @@ export class Orchestrator {
    */
   private async checkContamination(lease: Lease): Promise<void> {
     try {
-      if (!this.contaminationCheck || !this.apps) return;
-      if (isRealLease(lease)) return; // listRunning is simctl-based; keep real leases offline
+      const apps = this.appsFor(deviceKindOf(lease));
+      if (!this.contaminationCheck || !apps) return;
       const state = this.contamination.get(lease.leaseId);
       if (!state) return;
       if (Date.now() - state.lastCheck < this.contaminationCheckMinIntervalMs) return;
       let running: Set<string>;
       try {
-        running = await this.apps.listRunning(lease.udid);
+        running = await apps.listRunning(lease.udid);
       } catch {
         return; // Unknown, not contended.
       }
@@ -660,7 +779,8 @@ export class Orchestrator {
 
   /**
    * Assign waiting tickets (oldest first) to free matching sims, booting when
-   * the ticket allows it. Runs after every release/sweep so freed capacity is
+   * the ticket allows it; real tickets resolve against one real-fleet snapshot
+   * (no boot/slim arm). Runs after every release/sweep so freed capacity is
    * handed to the queue automatically.
    */
   private async dispatchLocked(): Promise<DispatchAssignment[]> {
@@ -675,8 +795,35 @@ export class Orchestrator {
     const held = new Set(leases.map((l) => l.udid));
     const bootedUdids = new Set(devices.filter(isBooted).map((d) => d.udid));
     let bootedCount = bootedUdids.size;
+    let realSnapshot: PoolDevice[] | null = null;
+    const realList = async (): Promise<PoolDevice[]> => {
+      if (realSnapshot === null) {
+        realSnapshot = this.realFleet ? await this.realFleet.list().catch(() => []) : [];
+      }
+      return realSnapshot;
+    };
 
     for (const ticket of waiting) {
+      if ((ticket.requirements.deviceKind ?? "sim") === "real") {
+        const target = (await realList())
+          .filter((d) => !held.has(d.udid) && matchesReal(d, ticket.requirements))
+          .sort((a, b) => a.udid.localeCompare(b.udid))[0];
+        if (!target) continue;
+        held.add(target.udid);
+        const leaseId = await this.createDispatchedLease(target.udid, ticket);
+        const assignment: DispatchAssignment = {
+          ticketId: ticket.ticketId,
+          sessionId: ticket.sessionId,
+          leaseId,
+          udid: target.udid,
+        };
+        await this.captureBaseline(leaseId, target.udid, "real");
+        if (ticket.stream === true) {
+          assignment.streamError = "real leases never auto-stream (screen streaming is P3)";
+        }
+        assigned.push(assignment);
+        continue;
+      }
       const free = devices
         .filter((d) => bootedUdids.has(d.udid) && !held.has(d.udid) && matches(d, ticket.requirements))
         .sort((a, b) => a.udid.localeCompare(b.udid));
@@ -702,29 +849,7 @@ export class Orchestrator {
 
       if (!target) continue;
       held.add(target.udid);
-      const leaseId = await this.store.mutate((s) => {
-        s.seq += 1;
-        const lease: Lease = {
-          leaseId: nextId("lease", s.seq),
-          udid: target.udid,
-          sessionId: ticket.sessionId,
-          client: ticket.client,
-          task: ticket.task,
-          createdAt: Date.now(),
-          lastHeartbeat: Date.now(),
-          ttlMs: this.defaultTtlMs,
-          deviceKind: ticket.requirements.deviceKind ?? "sim",
-          ...(ticket.requirements.transport !== undefined ? { transport: ticket.requirements.transport } : {}),
-        };
-        s.leases.push(lease);
-        const rec = s.tickets.find((t) => t.ticketId === ticket.ticketId);
-        if (rec) {
-          rec.status = "assigned";
-          rec.assignedLeaseId = lease.leaseId;
-          rec.assignedUdid = target.udid;
-        }
-        return { value: lease.leaseId, dirty: true };
-      });
+      const leaseId = await this.createDispatchedLease(target.udid, ticket);
       const assignment: DispatchAssignment = {
         ticketId: ticket.ticketId,
         sessionId: ticket.sessionId,
@@ -736,6 +861,33 @@ export class Orchestrator {
       assigned.push(assignment);
     }
     return assigned;
+  }
+
+  /** Lease + ticket-assignment bookkeeping shared by the sim and real dispatch arms. */
+  private async createDispatchedLease(udid: string, ticket: Ticket): Promise<string> {
+    return this.store.mutate((s) => {
+      s.seq += 1;
+      const lease: Lease = {
+        leaseId: nextId("lease", s.seq),
+        udid,
+        sessionId: ticket.sessionId,
+        client: ticket.client,
+        task: ticket.task,
+        createdAt: Date.now(),
+        lastHeartbeat: Date.now(),
+        ttlMs: this.defaultTtlMs,
+        deviceKind: ticket.requirements.deviceKind ?? "sim",
+        ...(ticket.requirements.transport !== undefined ? { transport: ticket.requirements.transport } : {}),
+      };
+      s.leases.push(lease);
+      const rec = s.tickets.find((t) => t.ticketId === ticket.ticketId);
+      if (rec) {
+        rec.status = "assigned";
+        rec.assignedLeaseId = lease.leaseId;
+        rec.assignedUdid = udid;
+      }
+      return { value: lease.leaseId, dirty: true };
+    });
   }
 
   private async createLease(udid: string, input: AcquireInput, client: string): Promise<Lease> {

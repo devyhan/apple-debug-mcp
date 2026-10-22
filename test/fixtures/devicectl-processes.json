@@ -1,0 +1,26 @@
+{
+ "info": {
+  "version": "scrubbed-fixture"
+ },
+ "result": {
+  "deviceIdentifier": "FIXTURE-COREDEVICE-ID",
+  "runningProcesses": [
+   {
+    "executable": "file:///sbin/launchd",
+    "processIdentifier": 1
+   },
+   {
+    "executable": "file:///private/var/containers/Bundle/Application/AAAAAAAA-1111-2222-3333-444444444444/FixtureApp.app/FixtureApp",
+    "processIdentifier": 103
+   },
+   {
+    "executable": "file:///System/Library/PrivateFrameworks/Example.framework/exampled",
+    "processIdentifier": 42
+   },
+   {
+    "executable": "file:///private/var/containers/Bundle/Application/DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF/Stale.app/Stale",
+    "processIdentifier": 104
+   }
+  ]
+ }
+}

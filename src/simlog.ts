@@ -1,4 +1,5 @@
 import { BoundedOptions, BoundedResult, DEFAULT_BOUND_MAX_CHARS, runBounded } from "./exec.js";
+import type { LogOps } from "./logops.js";
 
 /** Injectable bounded runner so unit tests can stub `xcrun` (defaults to runBounded). */
 export type BoundedRunner = (bin: string, args: string[], opts: BoundedOptions) => Promise<BoundedResult>;
@@ -134,7 +135,7 @@ function buildPredicate(predicate?: string, process?: string): string | undefine
  * in-sim, so both go through runBounded: show resolves on natural exit, stream
  * resolves with timedOut=true and whatever was captured in the window.
  */
-export class SimLog {
+export class SimLog implements LogOps {
   private readonly run: BoundedRunner;
   private readonly defaultMaxChars: number;
   private readonly showTimeoutMs: number;

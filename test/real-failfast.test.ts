@@ -27,9 +27,9 @@ function tmpState(): string {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "sim-mcp-realfail-")), "state.json");
 }
 
-function makeOrch(devices: SimDevice[], env?: NodeJS.ProcessEnv) {
+function makeOrch(devices: SimDevice[]) {
   const store = Store.load(tmpState());
-  const orch = new Orchestrator(new FakeFleet(devices), store, { defaultTtlMs: 60_000, ...(env ? { env } : {}) });
+  const orch = new Orchestrator(new FakeFleet(devices), store, { defaultTtlMs: 60_000 });
   return { store, orch };
 }
 
@@ -49,8 +49,8 @@ function realLease(): Lease {
   };
 }
 
-describe("resolveLease kind short-circuit", () => {
-  it("returns a store-built real lease without fleet contact", async () => {
+describe("resolveLease kind handling", () => {
+  it("returns a store-built real lease without fleet contact when no real fleet is injected", async () => {
     const { store, orch } = makeOrch([]); // empty fleet: any sim lookup would evict
     await pushLease(store, realLease());
     const resolved = await orch.resolveLease("lease_test_real");
@@ -68,45 +68,28 @@ describe("resolveLease kind short-circuit", () => {
   });
 });
 
-describe("acquire with deviceKind real", () => {
-  it("fail-fasts with P1 text when the hatch is off", async () => {
-    const { orch } = makeOrch([sim("UDID-1")], {});
+describe("acquire with deviceKind real and no real fleet", () => {
+  it("fails with a missing-transport error (never a hatch lease)", async () => {
+    const { orch } = makeOrch([sim("UDID-1")]);
     const res = await orch.acquire({ sessionId: "s1", requirements: { deviceKind: "real" } });
     expect(res.ok).toBe(false);
     if (res.ok) throw new Error("expected failure");
-    expect(res.reason).toContain("P1");
-    expect(res.reason).toContain("device_kind");
+    expect(res.reason).toContain("devicectl");
   });
 
-  it("creates a real lease directly with the hatch on + explicit udid", async () => {
-    const { orch } = makeOrch([], { SIM_MCP_REAL_LEASE: "1" });
-    const res = await orch.acquire({
-      sessionId: "s1", requirements: { deviceKind: "real", udid: "REAL-UDID-9", transport: "wifi" },
-    });
-    expect(res.ok).toBe(true);
-    if (!res.ok || res.queued) throw new Error("expected lease");
-    expect(res.lease.deviceKind).toBe("real");
-    expect(res.lease.udid).toBe("REAL-UDID-9");
-    expect(res.lease.transport).toBe("wifi");
-  });
-
-  it("turns stream:true into a warning (never auto-streams) under the hatch", async () => {
-    const { orch } = makeOrch([], { SIM_MCP_REAL_LEASE: "1" });
-    const res = await orch.acquire({
-      sessionId: "s1", stream: true, requirements: { deviceKind: "real", udid: "REAL-UDID-9" },
-    });
-    expect(res.ok).toBe(true);
-    if (!res.ok || res.queued) throw new Error("expected lease");
-    expect(res.lease.streamUrl).toBeUndefined();
-    expect(res.warnings?.join(" ")).toContain("never auto-stream");
-  });
-
-  it("fails without an explicit udid under the hatch", async () => {
-    const { orch } = makeOrch([sim("UDID-1")], { SIM_MCP_REAL_LEASE: "1" });
-    const res = await orch.acquire({ sessionId: "s1", requirements: { deviceKind: "real" } });
-    expect(res.ok).toBe(false);
-    if (res.ok) throw new Error("expected failure");
-    expect(res.reason).toContain("explicit udid");
+  it("fails even with an explicit udid: SIM_MCP_REAL_LEASE is dead (hatch deleted)", async () => {
+    process.env.SIM_MCP_REAL_LEASE = "1";
+    try {
+      const { orch } = makeOrch([]);
+      const res = await orch.acquire({
+        sessionId: "s1", requirements: { deviceKind: "real", udid: "REAL-UDID-9" },
+      });
+      expect(res.ok).toBe(false);
+      if (res.ok) throw new Error("expected failure");
+      expect(res.reason).toContain("devicectl");
+    } finally {
+      delete process.env.SIM_MCP_REAL_LEASE;
+    }
   });
 });
 

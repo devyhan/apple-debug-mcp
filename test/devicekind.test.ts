@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { allowRealLease, deviceKindOf, isRealLease, requireSimLease } from "../src/devicekind.js";
+import { deviceKindOf, isRealLease, requireSimLease } from "../src/devicekind.js";
 import type { RealDevicePhase } from "../src/devicekind.js";
 import type { Lease } from "../src/store.js";
 import { Store } from "../src/store.js";
@@ -38,16 +38,18 @@ describe("requireSimLease", () => {
     expect(() => requireSimLease(lease("sim"), { verb: "ui_tap", phase: "P2", detail: "x" })).not.toThrow();
   });
 
-  // One verb per §6 fail-fast group, asserting the phase mapping (substrings, not full text).
+  // One verb per still-gated fail-fast group (P1 promoted 7 verbs to GO —
+  // app_install/uninstall/launch/terminate, sim_log_stream/show, profile_trace;
+  // those are covered by dispatch tests, not this table).
   const cases: { verb: string; phase: RealDevicePhase; token: string }[] = [
     { verb: "ui_tap", phase: "P2", token: "P2" },
-    { verb: "app_install", phase: "P2", token: "P2" },
+    { verb: "app_open_url", phase: "P2", token: "P2" },
+    { verb: "app_cache_clear", phase: "P2", token: "P2" },
     { verb: "debug_attach", phase: "P3", token: "P3" },
     { verb: "stream_start", phase: "P3", token: "P3" },
-    { verb: "sim_log_show", phase: "P3", token: "P3" },
-    { verb: "profile_trace", phase: "P3", token: "P3" },
     { verb: "net_proxy_start", phase: "P4", token: "P4" },
     { verb: "sim_shutdown", phase: "sim-only", token: "sim-only" },
+    { verb: "camera_mirror", phase: "sim-only", token: "sim-only" },
   ];
   for (const { verb, phase, token } of cases) {
     it(`names verb, lease, udid and phase for ${verb}`, () => {
@@ -105,10 +107,3 @@ describe("Store.load migration", () => {
   });
 });
 
-describe("allowRealLease gate", () => {
-  it("is off unless SIM_MCP_REAL_LEASE=1", () => {
-    expect(allowRealLease({})).toBe(false);
-    expect(allowRealLease({ SIM_MCP_REAL_LEASE: "0" })).toBe(false);
-    expect(allowRealLease({ SIM_MCP_REAL_LEASE: "1" })).toBe(true);
-  });
-});

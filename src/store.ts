@@ -15,9 +15,9 @@ export interface Requirements {
   osVersion?: string;
   /** Exact match on platform, e.g. "iOS". */
   platform?: string;
-  /** Default when omitted: "sim". P0 rejects "real" (see §8); P1 matches the real fleet. */
+  /** Default when omitted: "sim". "real" matches the devicectl real fleet. */
   deviceKind?: DeviceKind;
-  /** Only meaningful with deviceKind "real" (P1). Accepted + persisted in P0, otherwise unused. */
+  /** Only meaningful with deviceKind "real" (best-effort usb/wifi match from devicectl tunnel state). */
   transport?: DeviceTransport;
 }
 

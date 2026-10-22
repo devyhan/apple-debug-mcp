@@ -1,0 +1,69 @@
+{
+ "info": {
+  "version": "scrubbed-fixture"
+ },
+ "result": {
+  "devices": [
+   {
+    "identifier": "3D75A26C-F170-58B0-97C6-EBF539B7F7A8",
+    "deviceProperties": {
+     "name": "B2C의 iPhone",
+     "osVersionNumber": "18.6.2",
+     "osBuildUpdate": "22G100",
+     "developerModeStatus": "enabled"
+    },
+    "hardwareProperties": {
+     "udid": "00008110-000529EE1406401E",
+     "marketingName": "iPhone 14",
+     "platform": "iOS",
+     "productType": "iPhone14,7"
+    },
+    "connectionProperties": {
+     "pairingState": "paired",
+     "tunnelState": "unavailable",
+     "authenticationType": "manualPairing"
+    }
+   },
+   {
+    "identifier": "000A1FED-73CC-57FF-9285-339181AB988E",
+    "deviceProperties": {
+     "name": "iPhone 16 Pro Max",
+     "osVersionNumber": "27.0.1",
+     "osBuildUpdate": "24A446",
+     "developerModeStatus": "enabled"
+    },
+    "hardwareProperties": {
+     "udid": "00008140-000555603453001C",
+     "marketingName": "iPhone 16 Pro Max",
+     "platform": "iOS",
+     "productType": "iPhone17,2"
+    },
+    "connectionProperties": {
+     "pairingState": "paired",
+     "tunnelState": "disconnected",
+     "authenticationType": "manualPairing"
+    }
+   },
+   {
+    "identifier": "51CB1D79-19B3-5E8B-B06E-83B9C49B1D5A",
+    "deviceProperties": {
+     "name": "조요한의 Apple Watch",
+     "osVersionNumber": "10.6.1",
+     "osBuildUpdate": "21U580",
+     "developerModeStatus": "disabled"
+    },
+    "hardwareProperties": {
+     "udid": "00008006-0000A8101AEB002E",
+     "marketingName": "Apple Watch Series 5",
+     "platform": "watchOS",
+     "productType": "Watch5,4"
+    },
+    "connectionProperties": {
+     "pairingState": "paired",
+     "tunnelState": "unavailable",
+     "authenticationType": "manualPairing"
+    }
+   }
+  ]
+ }
+}

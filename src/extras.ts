@@ -3,33 +3,37 @@ import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { DEFAULT_BOUND_MAX_CHARS, ExecError, tailTruncationMarker } from "./exec.js";
-import { requireSimLease } from "./devicekind.js";
+import { isRealLease, requireSimLease } from "./devicekind.js";
 import { Llmdb, MAX_CONTINUE_WAIT_SEC, STEP_MODES, hintForDebugError, isDebugTimeoutError } from "./llmdb.js";
 import { DebugStateTracker, alreadyStoppedResult, debugRobustnessEnabled, isAlreadyStoppedError, isAlreadyStoppedResponse, isWaitElapsedError, isWaitElapsedResponse, waitElapsedResult } from "./debug-robustness.js";
 import { MAX_ASSERT_FLOW_SEC, MAX_PROXY_RULES } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
 import type { AppOps } from "./appops.js";
+import type { LogOps } from "./logops.js";
+import { APP_REAL_NO_TRANSPORT_DETAIL } from "./realdevices.js";
 import { Lease } from "./store.js";
 import { Symbolicator } from "./symbolicate.js";
 import { CA_DEBUG_OPTIONS, CAMERA_MIRROR_MODES, CAMERA_SOURCES, ORIENTATIONS, ServeSim } from "./servesim.js";
-import { MAX_STREAM_SEC, SimLog } from "./simlog.js";
+import { MAX_STREAM_SEC } from "./simlog.js";
 import { MAX_TRACE_SEC, XCTrace } from "./xctrace.js";
 
 export interface ExtrasDeps {
   orchestrator: Orchestrator;
   serveSim: ServeSim;
-  simLog: SimLog;
+  simLog: LogOps;
   simApps: AppOps;
   xctrace: XCTrace;
   lldmdb: Llmdb;
   symbolicator?: Symbolicator;
+  /** Real-device app backend (go-ios). Absent ⇒ real app verbs fail with a missing-transport error. */
+  realApps?: AppOps;
+  /** Real-device log backend (syslog relay). Absent ⇒ real log verbs fail with a missing-transport error. */
+  realLog?: LogOps;
 }
 
-const APP_REAL_DETAIL = "AppOps real backend (devicectl)";
 const STREAM_REAL_DETAIL = "real-device screen streaming";
 const DEBUG_REAL_DETAIL = "remote debug sessions";
 const NET_REAL_DETAIL = "real-device network interception (manual CA-profile install replacing the keychain step)";
-const LOG_REAL_DETAIL = "device-log capture (devicectl/syslog replacement for simctl spawn log)";
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
@@ -208,6 +212,26 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   const { orchestrator: orch, serveSim, simLog, simApps, xctrace, lldmdb } = deps;
   const symbolicator = deps.symbolicator ?? new Symbolicator();
   const debugStates = new DebugStateTracker();
+
+  /** App backend for a resolved lease: simctl for sims, go-ios for real devices. */
+  function appsFor(lease: Lease, verb: string): AppOps {
+    if (!isRealLease(lease)) return simApps;
+    if (!deps.realApps) {
+      throw new Error(`${verb} on real-device lease ${lease.leaseId} needs the go-ios transport, which is unavailable in this embedding.`);
+    }
+    return deps.realApps;
+  }
+
+  /** Log backend for a udid holder: syslog relay for real leases, simctl log otherwise. */
+  function logFor(holder: Lease | null, verb: string): LogOps {
+    if (holder && isRealLease(holder)) {
+      if (!deps.realLog) {
+        throw new Error(`${verb} on real-device lease ${holder.leaseId} needs the syslog-relay transport, which is unavailable in this embedding.`);
+      }
+      return deps.realLog;
+    }
+    return simLog;
+  }
 
   /** Leases carry at most one llmdb session; every debug verb except attach/detach needs it. */
   function requireDebugSession(lease: Lease): string {
@@ -477,9 +501,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "sim_log_stream",
     {
-      description: "Capture live unified-log output from a simulator for a bounded window (xcrun simctl spawn log stream).",
+      description: "Capture live log output for a bounded window: unified log on a simulator (xcrun simctl spawn log stream), syslog relay on a real-device lease (go-ios; predicate/process are client-side substring/regex filters there, level is rejected).",
       inputSchema: {
-        udid: z.string().describe("Simulator UDID."),
+        udid: z.string().describe("Simulator or device UDID."),
         predicate: z.string().optional().describe("Log predicate filter, e.g. 'process == \"MyApp\"'."),
         process: z.string().optional().describe("Process-name shorthand, e.g. \"Preferences\". ANDed with predicate."),
         level: z.enum(["default", "info", "debug"]).optional().describe("Log level filter. Default default."),
@@ -490,11 +514,10 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ udid, predicate, process, level, timeout_sec, max_chars }) => {
       try {
         const holder = await orch.leaseForUdid(udid);
-        if (holder) requireSimLease(holder, { verb: "sim_log_stream", phase: "P3", detail: LOG_REAL_DETAIL });
-        const r = await simLog.stream(udid, {
+        const r = await logFor(holder, "sim_log_stream").stream(udid, {
           predicate,
           process,
-          level: level ?? "default",
+          level,
           timeoutSec: timeout_sec ?? 5,
           maxChars: max_chars,
         });
@@ -508,9 +531,9 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "sim_log_show",
     {
-      description: "Show recent historical unified-log output from a simulator (xcrun simctl spawn log show --last).",
+      description: "Show recent historical unified-log output from a simulator (xcrun simctl spawn log show --last). Real-device leases have no history (live-only relay): use sim_log_stream.",
       inputSchema: {
-        udid: z.string().describe("Simulator UDID."),
+        udid: z.string().describe("Simulator or device UDID."),
         last: z.string().optional().describe('Historical window, e.g. "30s", "5m", "2h". Default "5m".'),
         predicate: z.string().optional().describe("Log predicate filter, e.g. 'process == \"MyApp\"'."),
         process: z.string().optional().describe("Process-name shorthand, e.g. \"Preferences\". ANDed with predicate."),
@@ -523,8 +546,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ udid, last, predicate, process, info, debug, signpost, max_chars }) => {
       try {
         const holder = await orch.leaseForUdid(udid);
-        if (holder) requireSimLease(holder, { verb: "sim_log_show", phase: "P3", detail: LOG_REAL_DETAIL });
-        const r = await simLog.show(udid, {
+        const r = await logFor(holder, "sim_log_show").show(udid, {
           last: last ?? "5m",
           predicate,
           process,
@@ -595,7 +617,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, url }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "app_open_url", phase: "P2", detail: APP_REAL_DETAIL });
+        requireSimLease(lease, { verb: "app_open_url", phase: "P2", detail: APP_REAL_NO_TRANSPORT_DETAIL });
         await simApps.openUrl(lease.udid, url);
         await orch.logAction(lease_id, "app_open_url", `open ${url.slice(0, 120)}`);
         return ok({ lease_id, udid: lease.udid, url });
@@ -608,7 +630,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_install",
     {
-      description: "Install an .app bundle onto your leased simulator (xcrun simctl install).",
+      description: "Install an .app bundle onto your lease (xcrun simctl install on a simulator, go-ios install on a real-device lease).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         app_path: z.string().min(1).describe("Host path to the .app bundle to install."),
@@ -617,8 +639,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, app_path }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "app_install", phase: "P2", detail: APP_REAL_DETAIL });
-        await simApps.install(lease.udid, app_path);
+        await appsFor(lease, "app_install").install(lease.udid, app_path);
         await orch.logAction(lease_id, "app_install", `install ${path.basename(app_path).slice(0, 120)}`);
         return ok({ lease_id, udid: lease.udid, app_path });
       } catch (err) {
@@ -630,7 +651,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_uninstall",
     {
-      description: "Remove an app from your leased simulator (xcrun simctl uninstall).",
+      description: "Remove an app from your lease (xcrun simctl uninstall on a simulator, go-ios uninstall on a real-device lease).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id to remove, e.g. com.example.App."),
@@ -639,8 +660,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "app_uninstall", phase: "P2", detail: APP_REAL_DETAIL });
-        await simApps.uninstall(lease.udid, bundle_id);
+        await appsFor(lease, "app_uninstall").uninstall(lease.udid, bundle_id);
         await orch.logAction(lease_id, "app_uninstall", `uninstall ${bundle_id}`);
         return ok({ lease_id, udid: lease.udid, bundle_id });
       } catch (err) {
@@ -652,7 +672,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_launch",
     {
-      description: "Launch an app by bundle id on your leased simulator (xcrun simctl launch). Returns its pid.",
+      description: "Launch an app by bundle id on your lease (xcrun simctl launch on a simulator, go-ios launch on a real-device lease). Returns its pid.",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id to launch, e.g. com.apple.Preferences."),
@@ -662,8 +682,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id, args }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "app_launch", phase: "P2", detail: APP_REAL_DETAIL });
-        const { pid, output } = await simApps.launch(lease.udid, bundle_id, args ?? []);
+        const { pid, output } = await appsFor(lease, "app_launch").launch(lease.udid, bundle_id, args ?? []);
         orch.markAppLaunched(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_launch", `launch ${bundle_id} (pid ${pid})`);
         return ok({ lease_id, udid: lease.udid, bundle_id, pid, output });
@@ -676,7 +695,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
   server.registerTool(
     "app_terminate",
     {
-      description: "Terminate an app by bundle id on your leased simulator (xcrun simctl terminate).",
+      description: "Terminate an app by bundle id on your lease (xcrun simctl terminate on a simulator, go-ios kill on a real-device lease).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         bundle_id: z.string().min(1).describe("Bundle id to terminate, e.g. com.apple.Preferences."),
@@ -685,8 +704,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "app_terminate", phase: "P2", detail: APP_REAL_DETAIL });
-        await simApps.terminate(lease.udid, bundle_id);
+        await appsFor(lease, "app_terminate").terminate(lease.udid, bundle_id);
         orch.markAppTerminated(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_terminate", `terminate ${bundle_id}`);
         return ok({ lease_id, udid: lease.udid, bundle_id });
@@ -718,7 +736,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, bundle_id, plist_keys }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "app_cache_clear", phase: "P2", detail: APP_REAL_DETAIL });
+        requireSimLease(lease, { verb: "app_cache_clear", phase: "P2", detail: APP_REAL_NO_TRANSPORT_DETAIL });
         const r = await simApps.clearCache(lease.udid, bundle_id, { plistKeys: plist_keys });
         orch.markAppTerminated(lease_id, bundle_id);
         await orch.logAction(lease_id, "app_cache_clear", `cache-clear ${bundle_id} (${r.deletedCount} removed)`);
@@ -744,7 +762,7 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     "profile_trace",
     {
       description:
-        "Record a bounded xctrace profile (Time Profiler by default) on your leased simulator and save the .trace file.",
+        "Record a bounded xctrace profile (Time Profiler by default) on your leased simulator or real device and save the .trace file. Real devices must be paired/trusted with Developer Mode on; prefer attach there (--attach resolves on hardware, unlike sims).",
       inputSchema: {
         lease_id: z.string().describe("Your active lease id."),
         duration_sec: z.number().positive().max(MAX_TRACE_SEC).optional().describe("Recording length in seconds. Default 5, max 60."),
@@ -756,7 +774,6 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
     async ({ lease_id, duration_sec, template, attach, output_dir }) => {
       try {
         const lease = await orch.resolveLease(lease_id);
-        requireSimLease(lease, { verb: "profile_trace", phase: "P3", detail: "real-device tracing via xctrace (pairing/trust preconditions)" });
         const dir = output_dir ?? path.join(os.tmpdir(), "sim-mcp-traces");
         const output = path.join(dir, `${lease.udid}-${Date.now()}.trace`);
         const { template: used } = await xctrace.record(lease.udid, output, {

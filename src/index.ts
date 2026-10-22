@@ -10,6 +10,8 @@ import { migrateLegacyStateDir } from "./migrate.js";
 import { NetCapture } from "./netcapture.js";
 import { NetProxy } from "./netproxy.js";
 import { Orchestrator } from "./orchestrator.js";
+import { GO_IOS_INSTALL_HINT, RealDeviceApps, RealDevices } from "./realdevices.js";
+import { RealSyslog } from "./realsyslog.js";
 import { createMcpServer } from "./server.js";
 import { ServeSim } from "./servesim.js";
 import { SimApps } from "./simapps.js";
@@ -62,6 +64,9 @@ async function main(): Promise<void> {
     portBase: config.netProxyPortBase,
   });
   const netCapture = new NetCapture({ bin: config.tcpdumpBin });
+  const realDevices = new RealDevices({ execTimeoutMs: config.execTimeoutMs });
+  const realApps = new RealDeviceApps({ iosBin: config.iosBin, execTimeoutMs: config.execTimeoutMs });
+  const realLog = new RealSyslog({ iosBin: config.iosBin });
 
   for (const [name, check] of [
     ["simslim", () => simslim.checkAvailable()],
@@ -127,6 +132,31 @@ async function main(): Promise<void> {
     );
   }
 
+  // Optional dependency: the daemon starts without devicectl; real-device
+  // inventory/acquire/listRunning fail at call time with a pairing checklist.
+  try {
+    const version = await realDevices.checkAvailable();
+    console.log(`[sim-mcp] devicectl: ${version.split("\n")[0]}`);
+  } catch {
+    console.warn(
+      `[sim-mcp] WARNING: optional binary "xcrun devicectl" is not usable; ` +
+        `real-device inventory/acquire/listRunning will fail until Xcode is installed (xcode-select --install)`,
+    );
+  }
+
+  // Optional dependency: the daemon starts without go-ios; the real-lease
+  // app verbs and syslog relay fail at call time with an install hint.
+  try {
+    const version = await realApps.checkAvailable();
+    console.log(`[sim-mcp] ios: ${version.split("\n")[0]}`);
+  } catch {
+    console.warn(
+      `[sim-mcp] WARNING: optional binary "${config.iosBin}" is not usable; ` +
+        `app_install/app_uninstall/app_launch/app_terminate and sim_log_stream on real-device leases ` +
+        `will fail until it is installed (${GO_IOS_INSTALL_HINT}, or set IOS_BIN)`,
+    );
+  }
+
   const store = Store.load(config.stateFile);
   const orchestrator = new Orchestrator(simslim, store, {
     defaultTtlMs: config.leaseTtlMs,
@@ -137,11 +167,13 @@ async function main(): Promise<void> {
     proxy: netProxy,
     capture: netCapture,
     apps: simApps,
+    realFleet: realDevices,
+    realApps,
     contaminationCheck: config.contaminationCheck,
     contaminationCheckMinIntervalMs: config.contaminationCheckMinIntervalMs,
     traceDir: config.traceDir,
   });
-  const mcpDeps = { orchestrator, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir: config.screenshotDir };
+  const mcpDeps = { orchestrator, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir: config.screenshotDir, realApps, realLog };
 
   // One transport (= one MCP session) per client; the Orchestrator+Store behind
   // every session is shared, so pool/lease/queue state is truly global across

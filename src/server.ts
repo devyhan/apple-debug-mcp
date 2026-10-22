@@ -10,8 +10,8 @@ import { appendM4Audit, maybeM4Decide, noteM4Ui } from "./m4.js";
 import type { M4Result } from "./m4.js";
 import { Orchestrator } from "./orchestrator.js";
 import { ServeSim } from "./servesim.js";
-import { SimApps } from "./simapps.js";
-import { SimLog } from "./simlog.js";
+import type { AppOps } from "./appops.js";
+import type { LogOps } from "./logops.js";
 import { Simslim } from "./simslim.js";
 import { appendShadowLog, buildShadowExtra, noteShadowUi } from "./shadow.js";
 import { buildTapEchoExtra, buildTapFailureExtra, saveDescribeSnapshot, saveShotLink } from "./snapshot.js";
@@ -26,11 +26,13 @@ export interface ServerDeps {
   simslim: Simslim;
   axe: UiDriver;
   serveSim: ServeSim;
-  simLog: SimLog;
-  simApps: SimApps;
+  simLog: LogOps;
+  simApps: AppOps;
   xctrace: XCTrace;
   lldmdb: Llmdb;
   screenshotDir: string;
+  realApps?: AppOps;
+  realLog?: LogOps;
 }
 
 type ToolResult = {
@@ -57,8 +59,8 @@ const requirementsShape = {
   device: z.string().optional().describe('Case-insensitive substring of device name, e.g. "iPhone 17 Pro".'),
   osVersion: z.string().optional().describe('OS version prefix, e.g. "26" or "26.5".'),
   platform: z.string().optional().describe('Platform, e.g. "iOS".'),
-  device_kind: z.enum(["sim", "real"]).optional().describe('Device kind. Default "sim". P0 rejects "real" (lands in P1).'),
-  transport: z.enum(["usb", "wifi"]).optional().describe('Only meaningful with device_kind "real" (P1). Accepted + persisted in P0, otherwise unused.'),
+  device_kind: z.enum(["sim", "real"]).optional().describe('Device kind. Default "sim". "real" leases use the devicectl/go-ios transports (paired device with Developer Mode on).'),
+  transport: z.enum(["usb", "wifi"]).optional().describe('Only meaningful with device_kind "real": best-effort usb/wifi match from devicectl state. Omit to match either.'),
 };
 
 function truncate(text: string, maxChars: number): { text: string; truncated: boolean } {
@@ -76,7 +78,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     "pool_status",
     {
       description:
-        "Show every simulator (UDID, device, OS, boot/slim state) overlaid with its current lease holder (sessionId/client) and the wait-queue depth.",
+        "Show every simulator (UDID, device, OS, boot/slim state) overlaid with its current lease holder (sessionId/client) and the wait-queue depth. Also lists real devices (devicectl inventory) with availability and lease overlay.",
       inputSchema: {},
     },
     async () => {
@@ -191,7 +193,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     "lease_acquire",
     {
       description:
-        "Acquire a simulator lease for your session. Returns a lease immediately when a matching sim is free (booting one when autoBoot), otherwise a queue ticket — poll queue_status until it is assigned. Pass YOUR OWN sessionId (any client: Orca, Claude Code, TMA, script) plus a client label.",
+        "Acquire a simulator (or real-device, via device_kind) lease for your session. Returns a lease immediately when a matching device is free (booting a sim when autoBoot), otherwise a queue ticket — poll queue_status until it is assigned. Pass YOUR OWN sessionId (any client: Orca, Claude Code, TMA, script) plus a client label.",
       inputSchema: {
         session_id: sessionField("Your session id, in your own tool's format. Used for ownership and sessions_list."),
         client: z.string().optional().describe('Free-form client label, e.g. "orca", "claude-code", "tma". Default "unknown".'),
@@ -611,7 +613,16 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
   );
 
-  registerDeviceExtras(server, { orchestrator: orch, serveSim, simLog, simApps, xctrace, lldmdb });
+  registerDeviceExtras(server, {
+    orchestrator: orch,
+    serveSim,
+    simLog,
+    simApps,
+    xctrace,
+    lldmdb,
+    ...(deps.realApps !== undefined ? { realApps: deps.realApps } : {}),
+    ...(deps.realLog !== undefined ? { realLog: deps.realLog } : {}),
+  });
 
   return server;
 }

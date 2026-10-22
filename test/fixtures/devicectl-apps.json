@@ -1,0 +1,24 @@
+{
+ "info": {
+  "version": "scrubbed-fixture"
+ },
+ "result": {
+  "deviceIdentifier": "FIXTURE-COREDEVICE-ID",
+  "apps": [
+   {
+    "bundleIdentifier": "com.fixture.running-app",
+    "name": "FixtureApp",
+    "url": "file:///private/var/containers/Bundle/Application/AAAAAAAA-1111-2222-3333-444444444444/FixtureApp.app/"
+   },
+   {
+    "bundleIdentifier": "com.arcaddie.ranging-demo",
+    "name": "ARRangingDemo",
+    "url": "file:///private/var/containers/Bundle/Application/9019A1F7-F3DC-4180-8916-F58970951C58/ARRangingDemo.app/"
+   }
+  ],
+  "defaultAppsIncluded": true,
+  "hiddenAppsIncluded": false,
+  "internalAppsIncluded": false,
+  "removableAppsIncluded": true
+ }
+}
