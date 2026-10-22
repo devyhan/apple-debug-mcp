@@ -32,7 +32,7 @@ export interface ExtrasDeps {
 }
 
 const DEBUG_REAL_DETAIL = "remote debug sessions";
-const NET_REAL_DETAIL = "real-device network interception (manual CA-profile install replacing the keychain step)";
+const NET_REAL_DETAIL = "real-device network interception (see docs/real-device-p4.md §1): blocked on on-device manual steps with no programmatic API — (1) iPhone Wi-Fi proxy → host LAN IP:port (mitmdump binds 127.0.0.1, unreachable from the phone; `simctl keychain add-root-cert` src/netproxy.ts:1274 is sim-only), (2) manual CA-profile install + Settings > General > About > Certificate Trust Settings enablement; RVI alternative also blocked (`sudo -n true` FAILS, no rvi* in `ifconfig -l`, device Wi-Fi-only)";
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
