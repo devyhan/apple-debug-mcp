@@ -133,10 +133,16 @@ one") is deleted — it was false for open-url once measured.
   (`ios webinspector --help` alone errors `unknown help topic`).
 - ~~Reinstall data-loss semantics~~ — RESOLVED by contract (§6: wipe +
   logout, `logged_out: true`, named half-state). Uninstall
-  keychain-persistence (whether iOS preserves keychain items across an
-  uninstall) — still CARRIED, unverified live.
-- `devicectl copy to --remove-existing-content=true` pseudo-clear —
-  speculative, still dev-profile-gated.
+  keychain-persistence — CLOSED as untestable with current CLI
+  transports (no keychain/keybag verb in `ios --help` 1.3.2 or the
+  devicectl surface; would need a probe app holding the keychain
+  access group).
+- ~~`devicectl copy to --remove-existing-content=true` pseudo-clear~~ —
+  VERIFIED live 2026-10-22 as a second working transport on
+  dev-profile installs (empty-dir copy over `Library/Caches`: 173
+  tree lines → 0, exit ok). Not wired: `fsync rm` is already the
+  proven primary (per-entry errors, single CLI family); kept here as
+  a documented fallback.
 
 ## 6. `app_reinstall` — uninstall→install in one call (sim + real)
 
