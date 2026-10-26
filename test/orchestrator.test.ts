@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FleetOps, SimDevice, SlimStatus } from "../src/simslim.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { Store } from "../src/store.js";
@@ -179,14 +179,22 @@ describe("release / heartbeat / expiry", () => {
   });
 
   it("heartbeat renews the lease", async () => {
-    const { orch } = makeOrch([sim("UDID-1", "iPhone 17 Pro", "Booted")], { ttlMs: 60 });
-    const res = await orch.acquire({ sessionId: "a", autoBoot: false });
-    if (!res.ok || res.queued) throw new Error("expected lease");
-    await new Promise((r) => setTimeout(r, 40));
-    await orch.heartbeat(res.lease.leaseId, "a");
-    await new Promise((r) => setTimeout(r, 40));
-    const swept = await orch.sweepStale();
-    expect(swept.swept).toHaveLength(0);
+    // Deterministic: fake timers advance the Date.now clock the
+    // orchestrator's expiry check (isExpired/sweepStale) reads, so no
+    // wall-clock sleep can flake under CI jitter. Scoped + restored.
+    vi.useFakeTimers();
+    try {
+      const { orch } = makeOrch([sim("UDID-1", "iPhone 17 Pro", "Booted")], { ttlMs: 60 });
+      const res = await orch.acquire({ sessionId: "a", autoBoot: false });
+      if (!res.ok || res.queued) throw new Error("expected lease");
+      await vi.advanceTimersByTimeAsync(40);
+      await orch.heartbeat(res.lease.leaseId, "a");
+      await vi.advanceTimersByTimeAsync(40);
+      const swept = await orch.sweepStale();
+      expect(swept.swept).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -23,7 +23,7 @@ function fail(msg) {
   throw new Error(msg);
 }
 
-async function waitForHealth(timeoutMs = 45_000) {
+async function waitForHealth(timeoutMs = 90_000) {
   const start = Date.now();
   for (;;) {
     try {
