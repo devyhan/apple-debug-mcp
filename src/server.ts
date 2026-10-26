@@ -8,6 +8,7 @@ import { failureExtra, successExtra } from "./recovery.js";
 import { instrumentToolcalls } from "./toolcalls.js";
 import { registerDeviceExtras } from "./extras.js";
 import { Llmdb } from "./llmdb.js";
+import { QUICKSTART_INSTRUCTIONS, registerQuickstart } from "./quickstart.js";
 import { appendM4Audit, maybeM4Decide, noteM4Ui } from "./m4.js";
 import type { M4Result } from "./m4.js";
 import { Orchestrator } from "./orchestrator.js";
@@ -79,7 +80,7 @@ function truncate(text: string, maxChars: number): { text: string; truncated: bo
 
 export function createMcpServer(deps: ServerDeps): McpServer {
   const { orchestrator: orch, simslim, axe, serveSim, simLog, simApps, xctrace, lldmdb, screenshotDir } = deps;
-  const server = new McpServer({ name: "apple-debug-mcp", version: getVersion() });
+  const server = new McpServer({ name: "apple-debug-mcp", version: getVersion() }, { instructions: QUICKSTART_INSTRUCTIONS });
   instrumentToolcalls(server); // P1 single choke point: one {t, tool, ok} line per tools/call; never logs arg values.
 
   /** UI backend for a resolved lease: AXe for sims, go-ios for real devices. */
@@ -674,6 +675,8 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     ...(deps.realApps !== undefined ? { realApps: deps.realApps } : {}),
     ...(deps.realLog !== undefined ? { realLog: deps.realLog } : {}),
   });
+
+  registerQuickstart(server); // P3 additive-only: 1 resource + 3 prompts; tools/list stays 70.
 
   return server;
 }
