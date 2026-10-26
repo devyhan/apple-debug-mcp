@@ -16,12 +16,26 @@ synthesis; repo cites verified against file bodies.
 4. Proxy response-body rewrite verified byte-exact via curl through mitmdump.
 5. App fetched tampered version JSON but UI unchanged; forceupdate tamper never
    refetched (app-side throttle/cache).
-6. Flow log records `{ts,method,url}` only; deleted on proxy stop;
-   `net_assert_flow` matches stale flows across `set_rules` restarts.
+6. ~~Flow log records `{ts,method,url}` only; deleted on proxy stop~~
+   (CLOSED by P1, 2026-10-26 — enriched two-phase rows, per-run logs kept);
+   `net_assert_flow` matches stale flows across `set_rules` restarts (open → P2).
 7. Notices screen not found via AX; binary obfuscated; personalized endpoints
    need unknown version/session headers.
 
 ## P1. Proxy observability (`src/netproxy.ts`)
+
+STATUS (2026-10-26): IMPLEMENTED + live-verified. A grounding workflow found
+every P1a/P1b/DECISION item already present in `src/netproxy.ts` (two-phase
+rows by `flow.id`, response metadata, header allow/redact lists, 8KB body cap
+with PII scrub, `error()` hook rows, tolerant `parseFlowLog`, per-run
+`flow-{port}-{runId}.jsonl` + keep-5, 10MB addon-side gate; metadata ON by
+default, bodies OFF behind `SIM_MCP_PROXY_CAPTURE_BODIES`). Regression guard:
+`test/netproxy-observability.test.ts`. Live proof on scratch daemons: 124-row
+enriched log with req/resp/error correlation, gate OFF (0 body keys) vs ON
+(cap/sha/redaction), roll keep-5, chmod-444 never-throw with traffic intact.
+Carried (not P1-blocking): live `map_local` response-hook, 10MB flip under
+traffic, possible out-of-repo line-count consumers. Line cites below are stale
+(see STATUS); code is the source of truth.
 
 External API: mitmproxy `request(flow)` / `response(flow)` hooks receive
 HTTPFlow; `flow.request.{method,pretty_url,headers,content}`,
