@@ -10,15 +10,12 @@ An MCP debug daemon for Apple Simulators: multiple AI agent sessions share one M
 
 Published on npm as [`apple-debug-mcp`](https://www.npmjs.com/package/apple-debug-mcp).
 
-```
-Agent sessions (Orca / Claude Code / TMA / scripts)
-        │  Streamable HTTP (POST /mcp), one MCP connection per session
-        ▼
-apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
-        │  child processes
-        ├── simslim ── boot/shutdown/slim, pool state
-        ├── axe ────── sim UI, lease holders only
-        └── devicectl/go-ios ── real-device leases
+```mermaid
+flowchart TD
+    A[Agent sessions] -->|MCP over Streamable HTTP| B[apple-debug-mcp daemon<br/>shared pool state]
+    B -->|child processes| C[simulator lifecycle]
+    B --> D[simulator UI automation]
+    B --> E[real-device transports]
 ```
 
 ## Features
