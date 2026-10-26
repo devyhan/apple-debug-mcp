@@ -182,6 +182,29 @@ raw lldb attaches instantly). Line cites below are stale; code is truth.
 
 ## T1. `app_cache_clear` tool (no logout)
 
+STATUS (2026-10-26): IMPLEMENTED + live-verified (committed in 2053cc1,
+real-device follow-up db6faee; the "no `get_app_container` usage exists
+yet" note below is stale). All 11 requirements present:
+`SimApps.clearCache` + extras registration; terminate-first (cfprefsd);
+`get_app_container data` (unknown app throws before any deletion);
+`Library/Caches/*` top-level delete with per-entry fail-soft;
+`plist_keys` via `plutil -remove`; Documents/Keychain refusal (shape
+assert + `isPathWithin`, validated before any spawn); deleted/count
+report; relaunch left to caller; triple empty-bundle refusal
+(zod + assert + guard); lease-gated with udid from the lease.
+Covered by `test/appcache.test.ts` (8 tests, incl. terminate→container
+order and zero-spawn refusals). Live proof on scratch sims: Safari
+Caches 6 entries cleared (`deleted_count:6`), Documents sentinel
+sha256-identical, Keychains names/sizes/mtimes identical, relaunch pid
+confirmed; edges verified (empty/blank/unknown bundle, terminate-first
+via launchctl, idempotent re-clear, bogus lease refused). Disposition:
+cross-lease lease_id presentation succeeds by daemon-wide design —
+holder/session checks exist only on ownership ops (`release`,
+`cancelTicket`, `heartbeat`); every lease-gated tool resolves by bearer
+lease_id via `resolveLease`, so this is not a T1 deviation. Carried
+(not T1-blocking): plist confinement is lexical (a container-internal
+symlink to Documents would pass `isPathWithin`; low risk, note only).
+
 New tool in `SimApps` (simapps.ts — natural home; no `get_app_container`
 usage exists yet) + registration in extras.ts.
 
