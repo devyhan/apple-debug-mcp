@@ -18,7 +18,8 @@ synthesis; repo cites verified against file bodies.
    refetched (app-side throttle/cache).
 6. ~~Flow log records `{ts,method,url}` only; deleted on proxy stop~~
    (CLOSED by P1, 2026-10-26 — enriched two-phase rows, per-run logs kept);
-   `net_assert_flow` matches stale flows across `set_rules` restarts (open → P2).
+   ~~`net_assert_flow` matches stale flows across `set_rules` restarts~~
+   (CLOSED by P2, 2026-10-26 — `since` default `'call'` + generation watermark).
 7. Notices screen not found via AX; binary obfuscated; personalized endpoints
    need unknown version/session headers.
 
@@ -88,6 +89,23 @@ until next capture overwrites").
    rows).
 
 ## P2. `net_assert_flow` correctness (netproxy.ts:884-918, extras.ts:1519-1572)
+
+STATUS (2026-10-26): IMPLEMENTED + live-verified. A grounding workflow found
+all four items already present: P2.1 `since` default `'call'` + ts watermark
+(`spec.since ?? "call"`, `startTs=Date.now()`, `isNew`); P2.2 generation
+watermark (`ruleGeneration++` on `applyRules`, `GEN` embedded in the addon,
+row stamps, `gen==startGen` filter); P2.3 response-side assertions
+(`status`/`min_bytes`/`body_regex`/`rewritten`/`rule` in spec + zod +
+AND-filters over merged rows); P2.4 `new_since_call` counted and returned on
+both match and timeout paths. Covered by `test/netproxy-assertflow.test.ts`
+(11 tests, new-behavior assertions; pre-existing stale-row tests already use
+`since:run`). Live proof on scratch daemons: default-call excludes stale
+rows, `run` includes them, `set_rules` GEN 0→1 excludes pre-restart rows,
+each response filter matched exactly, timeout distinguishes stale
+(new=0) from fresh (new=1). Carried (not P2-blocking): literal `total=0`
+fresh-log via MCP unobservable on this host (ambient background flows;
+near-miss `total=1/new=0`). Line cites below are stale; code is the source
+of truth.
 
 1. ts watermark (no addon change, fixes stale-match immediately): capture
    `Date.now()` at assert start; match only rows with `ts*1000 >= startTs`
