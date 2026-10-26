@@ -7,8 +7,10 @@ import { AssertFlowResult, AssertFlowSpec, NetProxyRule, NetProxyStatus, ProxyOp
 import { DEFAULT_STREAM_PORT_BASE, StreamOps } from "./servesim.js";
 import type { PoolDevice, RealDevices } from "./realdevices.js";
 import { FleetOps, SimDevice } from "./simslim.js";
+import { appendAcquire, appendBoot } from "./boottelemetry.js";
+import type { BootEvent } from "./boottelemetry.js";
 import { Lease, Requirements, Store, Ticket, nextId } from "./store.js";
-import { traceHook } from "./trace.js";
+import { scrubText, scrubUdid, traceHook } from "./trace.js";
 
 export class LeaseError extends Error {
   constructor(message: string) {
@@ -88,6 +90,25 @@ export function findForeignApps(running: Set<string>, baseline: Set<string>, lau
   return [...running]
     .filter((b) => !b.startsWith("com.apple.") && !baseline.has(b) && !launched.has(b))
     .sort();
+}
+
+/** LW0 boot telemetry: classify a slim step outcome for the BOOT/ACQUIRE lines. */
+type SlimClass = BootEvent["slim"];
+
+function classifySlim(status: { slim: boolean; managedDisabled: number } | null): SlimClass {
+  if (!status) return "unknown";
+  if (status.slim) return "slim";
+  if (status.managedDisabled > 0) return "partial";
+  return "stock";
+}
+
+/** LW0: scrub a boot error for the BOOT line (UDIDs hashed, secrets redacted, 200-char cap). Total by construction: never throws, even on non-Error rejections. */
+function scrubBootErr(err: unknown): string {
+  try {
+    return scrubText(err instanceof Error ? err.message : String(err)).slice(0, 200);
+  } catch {
+    return "unknown boot error";
+  }
 }
 
 /** Per-lease contamination (lease-interference) tracking, in-memory only. */
@@ -377,6 +398,7 @@ export class Orchestrator {
   acquire(input: AcquireInput): Promise<AcquireResult> {
     return this.mutex.run(async () => {
       if (!input.sessionId) return { ok: false, reason: "sessionId is required" };
+      const t0 = Date.now(); // LW0 outer clock: acquire-entry -> outcome.
       const req = input.requirements ?? {};
       const queue = input.queue ?? true;
       const autoBoot = input.autoBoot ?? true;
@@ -434,13 +456,17 @@ export class Orchestrator {
         .sort((a, b) => a.udid.localeCompare(b.udid));
       if (free.length > 0) {
         const target = free[0]!;
+        let slimMs = -1;
         if (slim) {
-          const warn = await this.trySlim(target.udid, input.slimExcept);
-          if (warn) warnings.push(warn);
+          const res = await this.trySlim(target.udid, input.slimExcept);
+          if (res.warn) warnings.push(res.warn);
+          slimMs = res.slimMs;
         }
         const lease = await this.createLease(target.udid, input, client);
-        await this.captureBaseline(lease.leaseId, target.udid);
+        const baselineMs = await this.captureBaselineTimed(lease.leaseId, target.udid);
         await this.maybeStartStream(lease, input.stream === true, warnings);
+        const now = Date.now();
+        appendAcquire({ t: now, kind: "acquire", outcome: "HIT", leaseId: lease.leaseId, waitMs: now - t0, bootMs: -1, slimMs, baselineMs, via: "acquire" });
         return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
       }
 
@@ -455,21 +481,33 @@ export class Orchestrator {
             .sort((a, b) => a.udid.localeCompare(b.udid));
           if (bootable.length > 0) {
             const target = bootable[0]!;
+            const bootT0 = Date.now();
             try {
               await this.fleet.boot(target.udid);
             } catch (err) {
+              appendBoot({ t: Date.now(), kind: "boot", ok: false, udidHash: scrubUdid(target.udid), deviceName: target.name, osVersion: target.osVersion ?? "unknown", platform: target.platform ?? "unknown", coldWarm: "cold", slim: "unknown", slimMs: -1, bootMs: Date.now() - bootT0, readyMs: -1, err: scrubBootErr(err) });
               const reason = `Boot of ${target.udid} failed: ${(err as Error).message}`;
               if (!queue) return { ok: false, reason };
               const { ticket, position } = await this.createTicket(input, client, req, autoBoot, slim);
+              const queuedNow = Date.now();
+              appendAcquire({ t: queuedNow, kind: "acquire", outcome: "QUEUE", ticketId: ticket.ticketId, waitMs: queuedNow - t0, bootMs: -1, slimMs: -1, baselineMs: -1, via: "acquire" });
               return { ok: true, queued: true, ticket, position, note: reason };
             }
+            const bootMs = Date.now() - bootT0;
+            let slimMs = -1;
+            let slimClass: SlimClass = "unknown";
             if (slim) {
-              const warn = await this.trySlim(target.udid, input.slimExcept);
-              if (warn) warnings.push(warn);
+              const res = await this.trySlim(target.udid, input.slimExcept);
+              if (res.warn) warnings.push(res.warn);
+              slimMs = res.slimMs;
+              slimClass = res.slim;
             }
+            appendBoot({ t: Date.now(), kind: "boot", ok: true, udidHash: scrubUdid(target.udid), deviceName: target.name, osVersion: target.osVersion ?? "unknown", platform: target.platform ?? "unknown", coldWarm: "cold", slim: slimClass, slimMs, bootMs, readyMs: -1 });
             const lease = await this.createLease(target.udid, input, client);
-            await this.captureBaseline(lease.leaseId, target.udid);
+            const baselineMs = await this.captureBaselineTimed(lease.leaseId, target.udid);
             await this.maybeStartStream(lease, input.stream === true, warnings);
+            const now = Date.now();
+            appendAcquire({ t: now, kind: "acquire", outcome: "MISS", leaseId: lease.leaseId, waitMs: now - t0, bootMs, slimMs, baselineMs, via: "acquire" });
             return { ok: true, queued: false, lease, warnings: warnings.length ? warnings : undefined };
           }
         }
@@ -478,6 +516,8 @@ export class Orchestrator {
       // 3) Queue.
       if (!queue) return { ok: false, reason: "No matching simulator is free and queue=false" };
       const { ticket, position } = await this.createTicket(input, client, req, autoBoot, slim);
+      const queuedNow = Date.now();
+      appendAcquire({ t: queuedNow, kind: "acquire", outcome: "QUEUE", ticketId: ticket.ticketId, waitMs: queuedNow - t0, bootMs: -1, slimMs: -1, baselineMs: -1, via: "acquire" });
       return { ok: true, queued: true, ticket, position };
     });
   }
@@ -695,6 +735,13 @@ export class Orchestrator {
     return kind === "real" ? this.realApps : this.apps;
   }
 
+  /** captureBaseline plus its wall time, for the ACQUIRE baselineMs field. */
+  private async captureBaselineTimed(leaseId: string, udid: string, kind: DeviceKind = "sim"): Promise<number> {
+    const t0 = Date.now();
+    await this.captureBaseline(leaseId, udid, kind);
+    return Date.now() - t0;
+  }
+
   private async captureBaseline(leaseId: string, udid: string, kind: DeviceKind = "sim"): Promise<void> {
     const state = this.ensureContamination(leaseId);
     const apps = this.appsFor(kind);
@@ -829,6 +876,9 @@ export class Orchestrator {
         .filter((d) => bootedUdids.has(d.udid) && !held.has(d.udid) && matches(d, ticket.requirements))
         .sort((a, b) => a.udid.localeCompare(b.udid));
       let target = free[0];
+      let dispatchBooted = false;
+      let dispatchBootMs = -1;
+      let dispatchSlimMs = -1;
 
       if (!target && ticket.autoBoot && (this.maxSims === 0 || bootedCount < this.maxSims)) {
         const bootable = devices
@@ -836,14 +886,24 @@ export class Orchestrator {
           .sort((a, b) => a.udid.localeCompare(b.udid));
         const candidate = bootable[0];
         if (candidate) {
+          const bootT0 = Date.now();
           try {
             await this.fleet.boot(candidate.udid);
-          } catch {
+          } catch (err) {
+            appendBoot({ t: Date.now(), kind: "boot", ok: false, udidHash: scrubUdid(candidate.udid), deviceName: candidate.name, osVersion: candidate.osVersion ?? "unknown", platform: candidate.platform ?? "unknown", coldWarm: "cold", slim: "unknown", slimMs: -1, bootMs: Date.now() - bootT0, readyMs: -1, err: scrubBootErr(err) });
             break; // Likely systemic; leave the rest waiting for the next trigger.
           }
+          dispatchBootMs = Date.now() - bootT0;
           bootedUdids.add(candidate.udid);
           bootedCount += 1;
-          if (ticket.slim) await this.trySlim(candidate.udid);
+          let slimClass: SlimClass = "unknown";
+          if (ticket.slim) {
+            const res = await this.trySlim(candidate.udid);
+            dispatchSlimMs = res.slimMs;
+            slimClass = res.slim;
+          }
+          appendBoot({ t: Date.now(), kind: "boot", ok: true, udidHash: scrubUdid(candidate.udid), deviceName: candidate.name, osVersion: candidate.osVersion ?? "unknown", platform: candidate.platform ?? "unknown", coldWarm: "cold", slim: slimClass, slimMs: dispatchSlimMs, bootMs: dispatchBootMs, readyMs: -1 });
+          dispatchBooted = true;
           target = candidate;
         }
       }
@@ -857,7 +917,9 @@ export class Orchestrator {
         leaseId,
         udid: target.udid,
       };
-      await this.captureBaseline(leaseId, target.udid);
+      const baselineMs = await this.captureBaselineTimed(leaseId, target.udid);
+      const now = Date.now();
+      appendAcquire({ t: now, kind: "acquire", outcome: dispatchBooted ? "MISS" : "HIT", leaseId, waitMs: now - ticket.createdAt, bootMs: dispatchBootMs, slimMs: dispatchSlimMs, baselineMs, via: "dispatch" });
       if (ticket.stream === true) await this.startDispatchedStream(leaseId, target.udid, assignment, "sim");
       assigned.push(assignment);
     }
@@ -1295,18 +1357,28 @@ export class Orchestrator {
     }
   }
 
-  /** Best-effort slim; returns a warning string instead of throwing on failure. */
-  private async trySlim(udid: string, except?: string): Promise<string | null> {
+  /**
+   * Best-effort slim; failures become a warning string, never a throw.
+   * Returns the slim-step wall time plus the post-step slim class for LW0
+   * telemetry (slimMs is -1 when the step was skipped, never attempted).
+   */
+  private async trySlim(udid: string, except?: string): Promise<{ warn: string | null; slimMs: number; slim: SlimClass }> {
+    const t0 = Date.now();
     try {
       const status = await this.fleet.slimStatus(udid);
       // Only a stock sim (nothing disabled) is auto-slimmed. A partially
       // slimmed sim keeps its custom profile: re-slimming could disable
       // daemons its owner deliberately kept (e.g. --except store for push).
-      if (!status || status.managedDisabled > 0) return null;
+      if (!status || status.managedDisabled > 0) return { warn: null, slimMs: -1, slim: classifySlim(status) };
       await this.fleet.slimNoReboot(udid, except ? { except } : undefined);
-      return null;
+      return { warn: null, slimMs: Date.now() - t0, slim: "slim" };
     } catch (err) {
-      return `Slimming ${udid} failed, continuing stock: ${(err as Error).message}`;
+      return {
+        warn: `Slimming ${udid} failed, continuing stock: ${(err as Error).message}`,
+        slimMs: Date.now() - t0,
+        // The step may have partially disabled daemons; its outcome was not observed.
+        slim: "unknown",
+      };
     }
   }
 }
