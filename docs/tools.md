@@ -1,6 +1,6 @@
 # Tools
 
-71 tools across 10 groups. Tools marked \* require a `lease_id` and accept only
+71 tools across 11 groups. Tools marked \* require a `lease_id` and accept only
 the holding lease.
 
 | Group | Tools |

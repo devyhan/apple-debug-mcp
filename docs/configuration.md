@@ -68,6 +68,7 @@ different daemons and split the pool — one shared daemon is the premise.
 | `LLMDB_BIN` | `llmdb` | llmdb binary path (optional dependency) |
 | `MITMDUMP_BIN` | `mitmdump` | mitmdump binary path (optional dependency) |
 | `TCPDUMP_BIN` | `tcpdump` | tcpdump binary path (optional dependency, ships with macOS) |
+| `IOS_BIN` | `ios` | go-ios binary path (real-device transports; optional dependency) |
 | `SERVE_SIM_PORT_BASE` | `3220` | First port scanned for per-lease stream helpers |
 | `NETPROXY_PORT_BASE` | `3240` | First port scanned for the lease-held proxy listener |
 | `SIM_MCP_MAX_SIMS` | `0` (uncapped) | Cap on concurrently booted simulators; excess waits |
@@ -76,6 +77,11 @@ different daemons and split the pool — one shared daemon is the premise.
 | `SIM_MCP_EXEC_TIMEOUT_MS` | `60000` (60 s) | Helper child-process timeout |
 | `SIM_MCP_BOOT_TIMEOUT_MS` | `600000` (10 min) | Simulator boot timeout |
 | `SIM_MCP_SCREENSHOT_DIR` | `$TMPDIR/sim-mcp-shots` | Screenshot storage |
+| `SIM_MCP_TRACE` / `SIM_MCP_TRACE_FILE` / `SIM_MCP_TRACE_DIR` | off / _(unset)_ / `$TMPDIR/sim-mcp-traces` | JSONL action/exec trace (`=1` enables; explicit file wins) |
+| `SIM_MCP_SNAPSHOT` / `SIM_MCP_SNAPSHOT_DIR` | off / `$TMPDIR/sim-mcp-snapshots` | describe/tap/screenshot sidecars for offline replay (`=1` enables) |
+| `SIM_MCP_TOOLCALLS` / `SIM_MCP_TOOLCALLS_FILE` | on / `<stateDir>/toolcalls.jsonl` | per-tool call telemetry, names only (`=0` disables) |
+| `SIM_MCP_PROXY_CAPTURE_BODIES` | off | proxy flow-log body capture (`=1` enables; metadata rows always on) |
+| `SIM_MCP_DEBUG_ROBUSTNESS` | off | debug assume-stopped + wait-elapsed guards (`=1` enables) |
 | `SIM_MCP_CONTAMINATION_CHECK` | `true` | Lease-interference detection on/off (`false` disables) |
 | `SIM_MCP_CONTAMINATION_MIN_INTERVAL_MS` | `30000` (30 s) | Minimum gap between contamination spawns per lease |
 | `SIM_MCP_DAEMON_PATH` | _(unset)_ | Override the daemon entry the plist launches |
