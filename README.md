@@ -34,7 +34,7 @@ apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
 ## Prerequisites
 
 - macOS + Xcode (Simulator runtime)
-- Node.js 20 or later
+- Node.js 22 or later
 - `simslim` and `axe`:
 
 ```
@@ -351,7 +351,7 @@ It is also not a simulator runtime itself. Booting, slimming, and UI driving del
 
 ## Development
 
-Requires Node.js 20 or later, macOS + Xcode for anything past unit tests.
+Requires Node.js 22 or later, macOS + Xcode for anything past unit tests.
 
 ```
 npm install
@@ -368,7 +368,7 @@ npm run dev     # tsx hot run
 | `npm run build` | Compile to `dist/`. |
 | `npm run smoke` | Live E2E against real simulators. Needs macOS + Xcode + simslim/axe. |
 
-CI has three jobs: `check` (Linux, every PR/push: typecheck + unit tests + build across Node 20/22/24), `package` (pack-from-clean tarball install plus `--version`/`--help` and a health/stdio guard), and `smoke-macos` (main pushes, weekly Mondays, manual dispatch, and PRs labeled `run-smoke`: installs simslim/axe via brew and runs the live smoke to catch external CLI/Xcode drift early). Dependabot opens weekly npm and GitHub Actions update PRs.
+CI has three jobs: `check` (Linux, every PR/push: typecheck + unit tests + build across Node 22/24/26), `package` (pack-from-clean tarball install plus `--version`/`--help` and a health/stdio guard), and `smoke-macos` (main pushes, weekly Mondays, manual dispatch, and PRs labeled `run-smoke`: installs simslim/axe via brew and runs the live smoke to catch external CLI/Xcode drift early). Dependabot opens weekly npm and GitHub Actions update PRs.
 
 Layout (`src/`, 48 files) — server: `index.ts` (HTTP daemon/session map), `server.ts` (MCP tool definitions), `extras.ts`, `quickstart.ts`, `recovery.ts`; pool: `orchestrator.ts` (acquire/release/dispatch), `store.ts` (JSON persistence), `singleton.ts`, `migrate.ts`; sim UI: `axe.ts`, `ax-prune.ts`, `uidriver.ts`, `servesim.ts`; sim apps/logs: `simslim.ts`, `simapps.ts`, `appops.ts`, `appcache.ts`, `simlog.ts`, `logops.ts`; real devices: `realdevices.ts`, `realui.ts`, `realstream.ts`, `realsyslog.ts`, `devicekind.ts`; debug: `llmdb.ts`, `debug-robustness.ts`, `symbolicate.ts`; trace: `xctrace.ts`; network: `netproxy.ts`, `netcapture.ts`; observability: `trace.ts`, `snapshot.ts`, `toolcalls.ts`; eval: `eval-baseline.ts`, `eval-cli.ts`, `eval-dataset.ts`, `eval-harness.ts`; experiments (env-gated): `m4.ts`, `m4-allowlist.ts`, `shadow.ts`, `shadow-predictor.ts`; CLI/ops: `cli.ts`, `doctor.ts`, `install.ts`, `launchd.ts`, `config.ts`, `version.ts`, `exec.ts`; plus `test/`.
 

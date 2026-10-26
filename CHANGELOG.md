@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Requires Node.js >= 22 (`package.json` engines, CI matrix 22/24/26,
+  `@types/node` ^22). Node 20.x is EOL and unpatched for CVE-2026-111497.
+
 ## [0.5.0] - 2026-10-26
 
 ### Added
