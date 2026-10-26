@@ -7,12 +7,17 @@ synthesis; repo cites verified against file bodies.
 
 ## 0. Measured gaps (input)
 
-1. `debug_attach` succeeds but the session starts STOPPED; calling
-   `debug_interrupt` then times out and the guard auto-stops the session.
+1. ~~`debug_attach` succeeds but the session starts STOPPED; calling
+   `debug_interrupt` then times out and the guard auto-stops the session~~
+   (CLOSED behind `SIM_MCP_DEBUG_ROBUSTNESS=1`, 2026-10-26 —
+   `already_stopped` fast-path ok; default flip pending contract decision).
 2. `debug_break` is file+line only (llmdb 0.2.0); on a third-party binary it
-   stays `verified:false` — no symbol/address breakpoints.
-3. `debug_continue` with no further stop times out and auto-stops the session
-   (app keeps running).
+   stays `verified:false` — no symbol/address breakpoints. (OPEN, upstream;
+   D1.2 out of scope.)
+3. ~~`debug_continue` with no further stop times out and auto-stops the session
+   (app keeps running)~~ (CLOSED behind `SIM_MCP_DEBUG_ROBUSTNESS=1`,
+   2026-10-26 — `wait_elapsed:true`, session kept; wedge path still
+   auto-stops by design).
 4. Proxy response-body rewrite verified byte-exact via curl through mitmdump.
 5. App fetched tampered version JSON but UI unchanged; forceupdate tamper never
    refetched (app-side throttle/cache).
@@ -125,6 +130,35 @@ of truth.
    "nothing new".
 
 ## D1. Debug robustness (`src/extras.ts`, `src/llmdb.ts`)
+
+STATUS (2026-10-26): D1.1 IMPLEMENTED (gated) + live-verified; gate flip
+PENDING contract decision; D1.2 out of scope (upstream); D1.3 filter ids
+measured. `src/debug-robustness.ts` + `withDebugTimeoutGuard` were already
+present behind `SIM_MCP_DEBUG_ROBUSTNESS=1`: assume-stopped-after-attach
+(interrupt fast-path `already_stopped` ok, no llmdb wait),
+wait-elapsed-vs-wedged distinction (`wait_elapsed:true`, session kept vs
+auto-stop + re-attach hint). This slice adds the one missing piece:
+`debug_run_until` now mirrors `debug_continue` (wait-elapsed flag +
+`stopSummary` spread, gate-conditioned flag, fail-soft preserved;
+`test/debug-robustness.test.ts` regression with the measured DAP stderr).
+The gate flip to default ON was deliberately NOT done: it breaks two
+committed contract tests (`test/llmdb.test.ts:636` real-interrupt argv,
+`:693` interrupt isError), which must not be rewritten to fit — flip needs
+an explicit contract decision. Live verbatim (scratch): attach
+`{state:stopped, stopReason:{description:signal SIGSTOP,...}}`;
+interrupt-on-stopped and continue-no-stop both exit-1
+`Error: DAP waitForEvent failed: timed out after N.0s` (N echoes `--wait`);
+gate-ON interrupt `already_stopped:true` + `wait_elapsed:true`, sessions
+survive; exception filters
+`cpp/oc/swift catch+throw` served. Carried (not D1-blocking):
+`ALREADY_STOPPED_RE` has no live sample (live text never carries that
+phrasing — gate-ON skip is the fix); success-JSON wait-elapsed variant
+unobserved (llmdb 0.2.0 reports elapsed waits as exit-1); wedge path rests
+on the `ExecError` contract (forcing it is destructive); `stopSummary`
+drops object-form `stopReason` (string-only copy, all four tools);
+state tracker is per-MCP-connection (cross-session interrupt misses the
+fast path); Golfzon_QA attach exceeds llmdb's ~10s DAP wait (app-specific;
+raw lldb attaches instantly). Line cites below are stale; code is truth.
 
 1. interrupt-on-STOPPED and continue-with-no-stop both funnel into
    `withDebugTimeoutGuard` auto-stop (extras.ts:216-235). llmdb verb inventory

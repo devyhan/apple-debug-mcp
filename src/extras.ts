@@ -1524,13 +1524,17 @@ export function registerDeviceExtras(server: McpServer, deps: ExtrasDeps): void 
         const result = await withDebugTimeoutGuard(lease_id, sessionId, () =>
           lldmdb.runUntil(sessionId, file, line, wait_sec ?? 60, { cleanup: cleanup ?? false }),
         "run-until");
+        let waitElapsed = false;
         try {
-          if (debugRobustnessEnabled()) debugStates.updateFromResult(sessionId, result);
+          if (debugRobustnessEnabled()) {
+            debugStates.updateFromResult(sessionId, result);
+            waitElapsed = isWaitElapsedResponse(result);
+          }
         } catch {
           // tracking must never break the tool path.
         }
         await orch.logAction(lease_id, "debug_run_until", `run-until ${file}:${line}${cleanup === true ? " (cleanup)" : ""}`.slice(0, 160));
-        return ok({ lease_id, udid: lease.udid, session_id: sessionId, result }, "debug_run_until");
+        return ok({ lease_id, udid: lease.udid, session_id: sessionId, ...stopSummary(result), ...(waitElapsed ? { wait_elapsed: true } : {}), result }, "debug_run_until");
       } catch (err) {
         return fail(lldmdbError(err), "debug_run_until");
       }

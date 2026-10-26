@@ -183,6 +183,28 @@ describe("D1.1 debug robustness (gate ON)", () => {
     expect((await orch.resolveLease(leaseId)).debugSessionId).toBe("dbg-9");
   });
 
+  it("run-until wait-elapsed returns a structured ok with wait_elapsed (no auto-stop)", async () => {
+    process.env[GATE_ENV] = "1";
+    const run = (async (bin: string, args: string[], opts?: ExecOptions) => {
+      run.calls.push({ bin, args, opts });
+      if (args[0] === "attach") return { stdout: JSON.stringify({ sessionId: "dbg-10", state: "stopped" }), stderr: "" };
+      if (args[0] === "stop") return { stdout: JSON.stringify({ stopped: true }), stderr: "" };
+      if (args[0] === "run-until") {
+        throw new ExecError(bin, args, 1, "", "Error: DAP waitForEvent failed: timed out after 5.0s.");
+      }
+      return { stdout: JSON.stringify({ ok: true }), stderr: "" };
+    }) as Runner & { calls: Call[] };
+    run.calls = [];
+    const { client, orch, leaseId } = await makeClient(run);
+    await call(client, "debug_attach", { lease_id: leaseId, pid: 4242 });
+
+    const res = await call(client, "debug_run_until", { lease_id: leaseId, file: "a.swift", line: 12, wait_sec: 5 });
+    expect(res.isError).toBe(false);
+    expect(res.json).toMatchObject({ ok: true, session_id: "dbg-10", wait_elapsed: true });
+    expect(run.calls.map((c) => c.args[0])).not.toContain("stop");
+    expect((await orch.resolveLease(leaseId)).debugSessionId).toBe("dbg-10");
+  });
+
   it("wedged timeout on continue still auto-stops", async () => {
     process.env[GATE_ENV] = "1";
     const run = (async (bin: string, args: string[], opts?: ExecOptions) => {
