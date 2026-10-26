@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
+### Added
+
+- Real-device support across six slices: fail-fast seams (P0); apps,
+  inventory, syslog, xctrace (P1); open-url via Safari and measured
+  cache-clear (P2a); cache-clear via `ios fsync` (P2a2); `app_reinstall`
+  destructive verb (P2a3); WDA-less `ui_screenshot` via go-ios (P2b0);
+  `ui_describe`/`ui_tap` via DeviceKit (P2b2); type/swipe/button/batch
+  (P2b3). Lease with `device_kind: "real"` (devicectl inventory, go-ios
+  UI transport, paired device with Developer Mode on).
+- Real-device single-flight MJPEG streaming (`stream_*` wired through a
+  supervised streamer with orphan reaping).
+- Proxy observability (P1): enriched two-phase flow log by `flow.id`,
+  response metadata, header allow/redact lists, 8KB body cap with PII
+  scrub, `error()` rows, tolerant parsing, per-run logs with keep-5,
+  10MB addon-side gate. Metadata on by default; bodies behind
+  `SIM_MCP_PROXY_CAPTURE_BODIES`. Regression guard
+  `test/netproxy-observability.test.ts`.
+- Assert-flow correctness (P2): `since` (`call` default) + ts watermark,
+  generation watermark across `set_rules` restarts, response-side
+  assertions (`status`/`min_bytes`/`body_regex`/`rewritten`/`rule`),
+  `new_since_call` on match and timeout paths.
+- Debug robustness (D1) behind `SIM_MCP_DEBUG_ROBUSTNESS=1`:
+  assume-stopped-after-attach fast path, wait-elapsed vs wedged-timeout
+  distinction, `debug_run_until` parity with `debug_continue`.
+- `app_cache_clear` (T1, sim + real-device): terminate-first,
+  Caches-only + targeted plist keys, Documents/Keychain refusal,
+  deleted/count report, relaunch left to caller.
+- Adoption P1–P4 (71 tools): trigger-first descriptions, titles and
+  annotations, toolcall telemetry; `next[]` chaining hints and error
+  recovery paths (additive-only); in-protocol quickstart (server
+  instructions + resource + 3 prompts); `pool_status` router text,
+  optional `session_id` (explicit > transport > `anon-`), and the
+  `ui_triage` describe+screenshot composite.
+- Docs: T2 webview/hidden-screen procedures (`docs/webview-screens.md`,
+  live-proven); P5 adoption baseline from 256 measured toolcalls
+  (`docs/adoption.md`); README accuracy pass (11 groups, full env table,
+  real devices, 48-file layout).
+
+### Fixed
+
+- Streaming `:3333` orphan: kill-before-respawn plus a connect-based
+  port probe (bind probes lie when the port serves IPv6).
+- Live-measured real-device corrections from the P1 slice.
+
+### Docs
+
+- Grounding verdicts with measured blockers: P4 real-device network
+  (carried, gates stay), P2c0 debug transport (carried, upstream).
+- P2-B scoping notes, WDA/DeviceKit bring-up runbook, screenshot
+  round-trip proof; tool-count corrections 66 → 69 → 71.
+
 ## [0.4.0] - 2026-10-21
 
 ### Added

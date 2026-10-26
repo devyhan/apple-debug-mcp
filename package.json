@@ -1,6 +1,6 @@
 {
   "name": "apple-debug-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP debug daemon for Apple Simulators: pool state, tool-agnostic session leases, wait queue with auto-dispatch. Built on simslim (lifecycle) + AXe (UI automation).",
   "type": "module",
   "bin": {
