@@ -24,7 +24,7 @@ const ALL_TOOLS = new Set([
   "lease_acquire", "lease_release", "lease_heartbeat", "lease_list",
   "queue_status", "queue_cancel",
   "ui_describe", "ui_tap", "ui_type", "ui_swipe", "ui_gesture", "ui_button",
-  "ui_screenshot", "ui_batch",
+  "ui_screenshot", "ui_batch", "ui_triage",
   "sim_rotate", "sim_ca_debug", "sim_memory_warning",
   "camera_start", "camera_switch", "camera_mirror", "camera_status", "camera_stop",
   "sim_log_stream", "sim_log_show",
@@ -196,7 +196,7 @@ describe("P2 recovery on failure", () => {
     expect(String(body["recover_with_tool"])).toMatch(/lease_list|sessions_list|pool_status/);
   });
 
-  it("next[] map covers exactly the 70 tools with valid names", async () => {
+  it("next[] map covers exactly the 71 tools with valid names", async () => {
     const keys = Object.keys(NEXT_ACTIONS).sort();
     expect(keys).toEqual([...ALL_TOOLS].sort());
     // Golden path lease→drive→release must be next[]-followable with no detour.

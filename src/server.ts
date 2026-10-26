@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -64,6 +65,24 @@ function sessionField(desc: string) {
   return z.string().min(1).describe(desc);
 }
 
+/**
+ * P4 lease_acquire minimal path. Explicit session_id always wins verbatim;
+ * else the MCP transport session id (Streamable HTTP per-client session);
+ * else an anonymous id for transports without one (InMemory/stdio). The
+ * effective id is returned on the lease/ticket — use it for
+ * lease_release/lease_heartbeat/queue_cancel. Never throws.
+ */
+function resolveAcquireSessionId(explicit: string | undefined, extra: { sessionId?: string } | undefined): string {
+  try {
+    if (explicit !== undefined) return explicit;
+    const transport = extra?.sessionId;
+    if (typeof transport === "string" && transport.length > 0) return transport;
+    return `anon-${randomUUID()}`;
+  } catch {
+    return `anon-${Date.now()}`;
+  }
+}
+
 const requirementsShape = {
   udid: z.string().optional().describe("Exact simulator UDID to require."),
   device: z.string().optional().describe('Case-insensitive substring of device name, e.g. "iPhone 17 Pro".'),
@@ -100,7 +119,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
       title: "Pool status",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       description:
-        "WHEN you want to list, show, or check the status of simulators and devices, see who holds what lease, or check the wait-queue depth. There is no raw CLI for this orchestrator overlay (raw pieces: `simslim list --json` + `xcrun devicectl list devices`). Show every simulator (UDID, device, OS, boot/slim state) overlaid with its current lease holder (sessionId/client) and the wait-queue depth. Also lists real devices (devicectl inventory) with availability and lease overlay.",
+        "WHEN you want to list, show, or check the status of simulators and devices, see who holds what lease, or check the wait-queue depth. There is no raw CLI for this orchestrator overlay (raw pieces: `simslim list --json` + `xcrun devicectl list devices`). Show every simulator (UDID, device, OS, boot/slim state) overlaid with its current lease holder (sessionId/client) and the wait-queue depth. Also lists real devices (devicectl inventory) with availability and lease overlay. Route from here: lease_acquire to take a free device, queue_status to poll a wait ticket, sessions_list to see who runs where, lease_list for TTL and owner detail.",
       inputSchema: {},
     },
     async () => {
@@ -227,9 +246,11 @@ export function createMcpServer(deps: ServerDeps): McpServer {
       title: "Acquire lease",
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       description:
-        "WHEN you want to get, lease, checkout, or acquire a simulator or real device for your session. There is no raw CLI for orchestrator leases (lease + wait queue + autoboot have no CLI equivalent). Acquire a simulator (or real-device, via device_kind) lease for your session. Returns a lease immediately when a matching device is free (booting a sim when autoBoot), otherwise a queue ticket — poll queue_status until it is assigned. Pass YOUR OWN sessionId (any client: Orca, Claude Code, TMA, script) plus a client label.",
+        "WHEN you want to get, lease, checkout, or acquire a simulator or real device for your session. There is no raw CLI for orchestrator leases (lease + wait queue + autoboot have no CLI equivalent). Acquire a simulator (or real-device, via device_kind) lease for your session. Returns a lease immediately when a matching device is free (booting a sim when autoBoot), otherwise a queue ticket — poll queue_status until it is assigned. Pass YOUR OWN sessionId (any client: Orca, Claude Code, TMA, script) plus a client label; session_id is optional and defaults to the MCP transport session id (explicit session_id always wins). Without either — e.g. in-memory transports with no session — the server assigns an anonymous id (anon-<uuid>) returned on the lease/ticket; use it for lease_release, lease_heartbeat, and queue_cancel.",
       inputSchema: {
-        session_id: sessionField("Your session id, in your own tool's format. Used for ownership and sessions_list."),
+        session_id: sessionField(
+          "Your session id, in your own tool's format. Used for ownership and sessions_list. Optional: defaults to the MCP transport session id; explicit wins. Without either, the server assigns an anonymous id (anon-<uuid>) returned on the lease/ticket.",
+        ).optional(),
         client: z.string().optional().describe('Free-form client label, e.g. "orca", "claude-code", "tma". Default "unknown".'),
         task: z.string().optional().describe("Short human-readable description of what you will do."),
         ...requirementsShape,
@@ -241,10 +262,10 @@ export function createMcpServer(deps: ServerDeps): McpServer {
         stream: z.boolean().optional().describe("Start a live MJPEG stream for the lease (serve-sim helper on a scanned port). Default false."),
       },
     },
-    async (args) => {
+    async (args, extra) => {
       try {
         const result = await orch.acquire({
-          sessionId: args.session_id,
+          sessionId: resolveAcquireSessionId(args.session_id, extra),
           client: args.client,
           task: args.task,
           requirements: {
@@ -665,6 +686,76 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     },
   );
 
+  server.registerTool(
+    "ui_triage",
+    {
+      title: "Triage screen",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      description:
+        "WHEN you want to triage the screen, read the UI hierarchy and capture a screenshot together in one call. INSTEAD OF `axe describe-ui --udid UDID` + `axe screenshot --udid UDID --output PATH` on sims, or `ios ui source --udid=UDID` + `ios screenshot --udid=UDID --output=PATH` on real devices. Describe the accessibility UI hierarchy and capture a PNG screenshot from your leased simulator or real device in one call (describe-first, so the screenshot links to the fresh describe). Returns the describe payload plus the screenshot path and image.",
+      inputSchema: {
+        lease_id: z.string().describe("Your active lease id."),
+        x: z.number().optional().describe("With y: describe only the element at this point."),
+        y: z.number().optional().describe("With x: describe only the element at this point."),
+        format: z.enum(["full", "compact"]).optional().describe("Output shape: full raw AX JSON (default) or compact pruned nodes."),
+        max_depth: z.number().int().nonnegative().optional().describe("Max depth for format=compact (root is 0). Omit for unlimited."),
+        max_chars: z.number().int().positive().optional().describe("Truncate output. Default 20000."),
+      },
+    },
+    async ({ lease_id, x, y, format, max_depth, max_chars }) => {
+      try {
+        const lease = await orch.resolveLease(lease_id);
+        const driver = uiFor(lease, "ui_triage");
+        // Describe-first (mirrors ui_describe): the shot below links to this describe.
+        const out = await driver.describeUi(lease.udid, x !== undefined && y !== undefined ? { x, y } : undefined);
+        const shape = format ?? "full";
+        let payload = out;
+        let kept: number | undefined;
+        if (shape === "compact") {
+          try {
+            const pruned = compactAxText(out, { maxDepth: max_depth });
+            payload = pruned.text;
+            kept = pruned.kept;
+          } catch (err) {
+            return fail(`compact format failed: ${(err as Error).message}`, "ui_triage");
+          }
+        }
+        const { text, truncated } = truncate(payload, max_chars ?? 20000);
+        const snap = saveDescribeSnapshot({ leaseId: lease_id, ui: payload, format: shape, truncated });
+        noteShadowUi(lease_id, payload, snap?.id);
+        if (x === undefined && y === undefined) noteM4Ui(lease_id, payload, snap?.id);
+        // Screenshot second (mirrors ui_screenshot).
+        fs.mkdirSync(screenshotDir, { recursive: true });
+        const file = path.join(screenshotDir, `${lease.udid}-${Date.now()}.png`);
+        await driver.screenshot(lease.udid, file);
+        const data = fs.readFileSync(file).toString("base64");
+        const shot = saveShotLink({ leaseId: lease_id, shotPath: file });
+        await orch.logAction(lease_id, "ui_triage", `triage ${path.basename(file)}`, {
+          ...(x !== undefined && y !== undefined ? { x, y } : {}),
+          truncated,
+          format: shape,
+          ...(kept !== undefined ? { kept } : {}),
+          ...(snap ? { snapshot_id: snap.id } : {}),
+          ...(shot ?? {}),
+        });
+        return ok(
+          {
+            udid: lease.udid,
+            ui: text,
+            truncated,
+            format: shape,
+            ...(kept !== undefined ? { kept } : {}),
+            path: file,
+          },
+          [{ type: "image", data, mimeType: "image/png" }],
+          "ui_triage",
+        );
+      } catch (err) {
+        return fail((err as Error).message, "ui_triage");
+      }
+    },
+  );
+
   registerDeviceExtras(server, {
     orchestrator: orch,
     serveSim,
@@ -676,7 +767,7 @@ export function createMcpServer(deps: ServerDeps): McpServer {
     ...(deps.realLog !== undefined ? { realLog: deps.realLog } : {}),
   });
 
-  registerQuickstart(server); // P3 additive-only: 1 resource + 3 prompts; tools/list stays 70.
+  registerQuickstart(server); // P3 additive-only: 1 resource + 3 prompts; tools/list is 71 after P4 ui_triage.
 
   return server;
 }

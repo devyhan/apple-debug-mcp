@@ -3,7 +3,7 @@
  *
  * Additive-only by construction: this module registers resources/prompts only,
  * which live in separate SDK maps with separate list handlers, so tools/list
- * keeps exactly 70 tools. Call `registerQuickstart` once per server from
+ * keeps exactly 71 tools (70 before P4 ui_triage). Call `registerQuickstart` once per server from
  * `createMcpServer` (never from `registerDeviceExtras`: standalone bare-server
  * tests must not gain resources/prompts). All strings are grounded in
  * docs/agents.md (8 rules), README quickstart, docs/examples.md (3 chains),
@@ -31,7 +31,7 @@ export const QUICKSTART_INSTRUCTIONS =
   "Loop: lease_acquire(session_id=YOUR session id, client, task) -> drive via ui_*/app_*/debug_*/net_* " +
   "with the returned lease_id -> lease_heartbeat on long work -> lease_release. " +
   "lease_id comes from lease_acquire (or queue_status once a wait ticket shows assigned); " +
-  "session_id is your own tool's session id. " +
+  "session_id is your own tool's session id (optional: defaults to the MCP transport session; explicit wins; otherwise the server assigns an anonymous id). " +
   "NEVER start a per-session server: one shared daemon owns the pool/queue; if /health is unreachable " +
   "say so, never work around with direct `xcrun simctl`. " +
   "Only the holding lease may drive its sim; on holder-mismatch stop and report. " +
@@ -45,7 +45,7 @@ export const QUICKSTART_URI = "apple-debug-mcp://quickstart";
 export const QUICKSTART_BODY = [
   "# apple-debug-mcp quickstart",
   "Shared sim pool. Loop: lease -> drive -> release.",
-  "- session_id = YOUR tool's session id (+client label); lease_id = from lease_acquire, or queue_status once a ticket shows assigned.",
+  "- session_id = YOUR tool's session id (+client label), optional: transport-session default, explicit wins, else anon-<uuid> is assigned; lease_id = from lease_acquire, or queue_status once a ticket shows assigned.",
   "1. One shared daemon only. Never start a per-session server; if /health is down, say so (no direct `xcrun simctl`).",
   "2. Wait tickets are normal: poll queue_status; never boot out of band to skip the line.",
   "3. Only the holding lease drives its sim; on holder-mismatch stop and report, no force=true unless asked.",

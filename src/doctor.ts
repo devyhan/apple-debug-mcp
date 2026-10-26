@@ -106,7 +106,7 @@ export async function runDoctor(opts: DoctorOpts = {}): Promise<DoctorCheck[]> {
     ["mitmdump", () => netProxy.checkAvailable(), "brew install mitmproxy"],
     ["tcpdump", () => netCapture.checkAvailable(), "macOS ships tcpdump; check TCPDUMP_BIN"],
     ["devicectl", () => realDevices.checkAvailable(), "xcode-select --install  # then install Xcode (devicectl ships with Xcode)"],
-    ["ios", () => runner(config.iosBin, ["--version"], { timeoutMs: 30_000 }).then((r) => r.stdout), `${GO_IOS_INSTALL_HINT}  # go-ios for real-device app verbs + syslog + stream_start/stream_stop + ui_screenshot/ui_describe/ui_tap/ui_type/ui_swipe/ui_button/ui_batch (or set IOS_BIN)`],
+    ["ios", () => runner(config.iosBin, ["--version"], { timeoutMs: 30_000 }).then((r) => r.stdout), `${GO_IOS_INSTALL_HINT}  # go-ios for real-device app verbs + syslog + stream_start/stream_stop + ui_screenshot/ui_describe/ui_tap/ui_type/ui_swipe/ui_button/ui_batch/ui_triage (or set IOS_BIN)`],
   ] as const) {
     try {
       const version = await check();

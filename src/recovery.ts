@@ -22,28 +22,29 @@ export interface Recovery {
   recover_args_hint?: Record<string, unknown>;
 }
 
-/** Per-tool follow-ups. Every name must be one of the 70 registered tools. */
+/** Per-tool follow-ups. Every name must be one of the 71 registered tools. */
 export const NEXT_ACTIONS: Record<string, readonly string[]> = {
-  // server.ts (19)
+  // server.ts (20)
   pool_status: ["lease_acquire", "sessions_list", "lease_list", "queue_status"],
   sessions_list: ["lease_list", "pool_status", "queue_status", "lease_acquire"],
   sim_boot: ["lease_acquire", "pool_status", "sim_slim"],
   sim_shutdown: ["pool_status", "lease_acquire", "sim_boot"],
   sim_slim: ["lease_acquire", "pool_status", "sim_boot"],
-  lease_acquire: ["queue_status", "ui_describe", "app_install", "stream_start"],
+  lease_acquire: ["queue_status", "ui_describe", "app_install", "stream_start", "ui_triage"],
   lease_release: ["lease_acquire", "pool_status", "queue_status"],
   lease_heartbeat: ["lease_list", "lease_release", "ui_describe"],
   lease_list: ["lease_heartbeat", "lease_release", "sessions_list"],
   queue_status: ["queue_cancel", "lease_acquire", "pool_status", "ui_describe"],
   queue_cancel: ["lease_acquire", "queue_status", "pool_status"],
   ui_describe: ["ui_tap", "ui_screenshot", "ui_type", "ui_batch"],
-  ui_tap: ["ui_describe", "ui_screenshot", "ui_type"],
+  ui_tap: ["ui_describe", "ui_screenshot", "ui_type", "ui_triage"],
   ui_type: ["ui_describe", "ui_tap", "ui_screenshot"],
   ui_swipe: ["ui_describe", "ui_screenshot", "ui_gesture"],
   ui_gesture: ["ui_describe", "ui_screenshot", "ui_swipe"],
   ui_button: ["ui_describe", "ui_screenshot", "ui_tap"],
   ui_screenshot: ["ui_describe", "ui_tap", "lease_actions", "lease_release"],
   ui_batch: ["ui_describe", "ui_screenshot", "lease_actions", "lease_release"],
+  ui_triage: ["ui_tap", "ui_type", "ui_describe", "ui_screenshot"],
   // extras.ts (51)
   sim_rotate: ["ui_screenshot", "ui_describe", "lease_acquire"],
   sim_ca_debug: ["ui_screenshot", "profile_trace", "sim_rotate"],
@@ -61,7 +62,7 @@ export const NEXT_ACTIONS: Record<string, readonly string[]> = {
   app_install: ["app_launch", "app_uninstall", "ui_describe"],
   app_uninstall: ["app_install", "app_reinstall", "lease_actions"],
   app_reinstall: ["app_launch", "ui_describe", "app_install"],
-  app_launch: ["ui_describe", "debug_attach", "ui_screenshot"],
+  app_launch: ["ui_describe", "debug_attach", "ui_screenshot", "ui_triage"],
   app_terminate: ["app_launch", "app_uninstall", "ui_describe"],
   app_cache_clear: ["app_launch", "ui_describe", "app_reinstall"],
   profile_trace: ["symbolicate", "sim_log_show", "ui_describe"],

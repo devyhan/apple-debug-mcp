@@ -1,13 +1,13 @@
 # Tools
 
-70 tools across 10 groups. Tools marked \* require a `lease_id` and accept only
+71 tools across 10 groups. Tools marked \* require a `lease_id` and accept only
 the holding lease.
 
 | Group | Tools |
 | --- | --- |
 | Pool/state (5) | `pool_status`, `sessions_list`, `sim_boot`, `sim_shutdown`, `sim_slim` |
 | Lease/queue (7) | `lease_acquire`, `lease_release`, `lease_heartbeat`, `lease_list`, `queue_status`, `queue_cancel`, `lease_actions` |
-| UI automation (8) \* | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch` |
+| UI automation (9) \* | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch`, `ui_triage` |
 | Device extras (5) | `sim_rotate`, `sim_ca_debug`, `sim_memory_warning`, `sim_log_stream`, `sim_log_show` |
 | Synthetic camera (5) | `camera_start`, `camera_switch`, `camera_mirror`, `camera_status`, `camera_stop` |
 | App lifecycle (7) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_reinstall`, `app_launch`, `app_terminate`, `app_cache_clear` |
@@ -22,6 +22,10 @@ Key behaviors:
 - `lease_acquire`: matches conditions (`udid` / `device` substring / `osVersion`
   prefix / `platform`), auto-boots when needed, auto-slims stock simulators
   (`--no-reboot`, custom profiles untouched), else enqueues a ticket.
+  `session_id` is optional: it defaults to the MCP transport session id
+  (explicit wins); without either the server assigns an anonymous
+  `anon-<uuid>` returned on the lease/ticket — use it for `lease_release`,
+  `lease_heartbeat`, and `queue_cancel`.
 - `lease_release`, TTL expiry, and external-shutdown detection auto-dispatch the
   freed simulator to the first matching ticket (FIFO; `auto_boot` tickets may
   boot one). Release does not shut the simulator down — it hands over booted;
@@ -37,7 +41,9 @@ Key behaviors:
   the remaining `ui_*` verbs stay sim-only P2). `sim_rotate` takes
   `portrait|portrait_upside_down|landscape_left|landscape_right`;
   `sim_ca_debug` takes `option=blended|copies|misaligned|offscreen|slow-animations`
-  plus an `enabled` boolean.
+  plus an `enabled` boolean. `ui_triage` composes `ui_describe` +
+  `ui_screenshot` in one call (describe-first, same backends and response
+  keys plus `path` and the image block).
 - `sim_log_stream` collects live logs for a window (default 5s, max 60s),
   `sim_log_show` reads the past `--last` window (default `5m`); both are
   `xcrun simctl spawn`-based, so they need no serve-sim. Results are

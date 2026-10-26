@@ -16,7 +16,7 @@ import { Store } from "../src/store.js";
 import { XCTrace } from "../src/xctrace.js";
 import type { Runner } from "../src/exec.js";
 
-/** P3 contract: server instructions + ONE quickstart resource + exactly 3 prompts; tools/list still 70. */
+/** P3 contract: server instructions + ONE quickstart resource + exactly 3 prompts; tools/list is 71 after P4 ui_triage. */
 
 const QUICKSTART_URI = "apple-debug-mcp://quickstart";
 const PROMPT_NAMES = ["ios-debug-session", "proxy-tamper", "log-triage"] as const;
@@ -207,10 +207,10 @@ describe("P3 quickstart contract", () => {
     }
   });
 
-  it("keeps tools/list at exactly 70 (additive-only guard)", async () => {
+  it("keeps tools/list at exactly 71 (additive-only guard)", async () => {
     const { client } = await makeClient();
     const listed = await client.listTools();
-    expect(listed.tools).toHaveLength(70);
+    expect(listed.tools).toHaveLength(71);
   });
 
   it("P3 measurement seam: resource+prompt reads append kind-tagged lines; tool lines stay exactly {t,tool,ok}", async () => {

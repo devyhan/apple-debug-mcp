@@ -16,14 +16,14 @@ import { Store } from "../src/store.js";
 import { XCTrace } from "../src/xctrace.js";
 import type { Runner } from "../src/exec.js";
 
-/** P1 contract: trigger-first descriptions + titles/annotations on all 70 tools, plus the toolcall choke point. */
+/** P1 contract: trigger-first descriptions + titles/annotations on all 71 tools, plus the toolcall choke point. */
 
 const SERVER_TOOLS = [
   "pool_status", "sessions_list", "sim_boot", "sim_shutdown", "sim_slim",
   "lease_acquire", "lease_release", "lease_heartbeat", "lease_list",
   "queue_status", "queue_cancel",
   "ui_describe", "ui_tap", "ui_type", "ui_swipe", "ui_gesture", "ui_button",
-  "ui_screenshot", "ui_batch",
+  "ui_screenshot", "ui_batch", "ui_triage",
 ];
 
 const EXTRAS_TOOLS = [
@@ -83,6 +83,7 @@ const TRIGGER_KEYWORDS: Record<string, string[]> = {
   ui_button: ["button"],
   ui_screenshot: ["screenshot"],
   ui_batch: ["batch"],
+  ui_triage: ["triage"],
   sim_rotate: ["rotat"],
   sim_ca_debug: ["coreanimation"],
   sim_memory_warning: ["memory"],
@@ -187,11 +188,11 @@ afterEach(() => {
 });
 
 describe("P1 tool metadata contract", () => {
-  it("exposes exactly the 70 known tools via tools/list", async () => {
+  it("exposes exactly the 71 known tools via tools/list", async () => {
     const { client } = await makeClient();
     const listed = await client.listTools();
-    expect(ALL_TOOLS).toHaveLength(70);
-    expect(new Set(ALL_TOOLS).size).toBe(70);
+    expect(ALL_TOOLS).toHaveLength(71);
+    expect(new Set(ALL_TOOLS).size).toBe(71);
     const names = listed.tools.map((t) => t.name).sort();
     expect(names).toEqual([...ALL_TOOLS].sort());
   });

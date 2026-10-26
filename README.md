@@ -22,7 +22,7 @@ apple-debug-mcp daemon ── shared state: leases + wait queue + auto-dispatch
 
 ## Features
 
-- **70 tools across 10 groups** — pool/lease/queue, AXe UI automation, device extras, synthetic camera, app lifecycle, xctrace profiling, live streaming, llmdb debugging, crash symbolication, and an HTTPS intercept proxy
+- **71 tools across 10 groups** — pool/lease/queue, AXe UI automation, device extras, synthetic camera, app lifecycle, xctrace profiling, live streaming, llmdb debugging, crash symbolication, and an HTTPS intercept proxy
 - **One shared daemon** — leases, the wait queue, and auto-dispatch live in a single process; per-session stdio servers would split the pool
 - **Lease ownership gates** — each lease holds one simulator and only its holder may drive UI, apps, debugging, or the proxy through it
 - **Wait queue with auto-dispatch** — when no simulator matches, callers get a ticket; releases, TTL expiry, and external-shutdown detection hand the next match to the first fitting ticket (FIFO)
@@ -104,7 +104,7 @@ apple-debug-mcp launchd status
 { "session_id": "<your session id>", "client": "claude-code", "task": "log in and screenshot" }
 ```
 
-Call `lease_acquire` with that body. With spare capacity you get a lease immediately; otherwise you get a wait ticket (`ticket_id`, `position`) — poll `queue_status` until it shows `status: "assigned"` with a `lease_id`. Drive the simulator with the `ui_*` tools, renew long work with `lease_heartbeat`, and finish with `lease_release`, which instantly dispatches the freed simulator to the first matching ticket.
+Call `lease_acquire` with that body. With spare capacity you get a lease immediately; otherwise you get a wait ticket (`ticket_id`, `position`) — poll `queue_status` until it shows `status: "assigned"` with a `lease_id`. (`session_id` is optional: it defaults to the MCP transport session id and explicit wins; without either the server assigns an anonymous id returned on the lease.) Drive the simulator with the `ui_*` tools, renew long work with `lease_heartbeat`, and finish with `lease_release`, which instantly dispatches the freed simulator to the first matching ticket.
 
 ## Configuration
 
@@ -196,13 +196,13 @@ npm uninstall -g apple-debug-mcp               # when installed via npm-global
 
 Full reference: [Tools](docs/tools.md).
 
-70 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
+71 tools across 10 groups. Tools marked \* require a `lease_id` and accept only the holding lease.
 
 | Group | Tools |
 | --- | --- |
 | Pool/state (5) | `pool_status`, `sessions_list`, `sim_boot`, `sim_shutdown`, `sim_slim` |
 | Lease/queue (7) | `lease_acquire`, `lease_release`, `lease_heartbeat`, `lease_list`, `queue_status`, `queue_cancel`, `lease_actions` |
-| UI automation (8) \* | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch` |
+| UI automation (9) \* | `ui_describe`, `ui_tap`, `ui_type`, `ui_swipe`, `ui_gesture`, `ui_button`, `ui_screenshot`, `ui_batch`, `ui_triage` |
 | Device extras (5) | `sim_rotate`, `sim_ca_debug`, `sim_memory_warning`, `sim_log_stream`, `sim_log_show` |
 | Synthetic camera (5) | `camera_start`, `camera_switch`, `camera_mirror`, `camera_status`, `camera_stop` |
 | App lifecycle (7) \* | `app_open_url`, `app_install`, `app_uninstall`, `app_reinstall`, `app_launch`, `app_terminate`, `app_cache_clear` |
@@ -274,7 +274,7 @@ That is `net_proxy_start`, then `net_assert_flow` to prove the app hit the endpo
 Short form: [Instructions for AI agents](docs/agents.md).
 
 - There must be exactly one shared daemon. Never start a per-session stdio server — the pool and queue would not be shared. If `/health` is unreachable, say so instead of working around it with direct `simctl`.
-- Pass your tool's session ID as `session_id` with a `client` label so `sessions_list` shows who runs where. The server does not enforce the format.
+- Pass your tool's session ID as `session_id` with a `client` label so `sessions_list` shows who runs where. The server does not enforce the format. `session_id` is optional on `lease_acquire` (transport-session default, explicit wins, else an anonymous id is assigned and returned).
 - A wait ticket is normal. Poll `queue_status`; do not boot simulators out of band to skip the line.
 - Only the holding lease may call that lease's gated tools. On a holder-mismatch error, stop and report the holder — do not retry with `force=true` unless the user asked for preemption.
 - Renew long work with `lease_heartbeat` before the TTL (default 30 min) expires; expired leases are reclaimed and redispatched.
