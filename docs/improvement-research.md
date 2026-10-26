@@ -25,8 +25,11 @@ synthesis; repo cites verified against file bodies.
    (CLOSED by P1, 2026-10-26 — enriched two-phase rows, per-run logs kept);
    ~~`net_assert_flow` matches stale flows across `set_rules` restarts~~
    (CLOSED by P2, 2026-10-26 — `since` default `'call'` + generation watermark).
-7. Notices screen not found via AX; binary obfuscated; personalized endpoints
-   need unknown version/session headers.
+7. ~~Notices screen not found via AX~~ (CLOSED as procedure by T2,
+   2026-10-26 — AX search is the wrong tool; screenshot-first fallback in
+   `docs/webview-screens.md`, proven live); binary obfuscated; personalized
+   endpoints need unknown version/session headers (open; traffic-to-screen
+   mapping procedure covers the approach).
 
 ## P1. Proxy observability (`src/netproxy.ts`)
 
@@ -222,6 +225,20 @@ injection via existing response-headers rewrite (netproxy.ts:339) — one probe
 decides HTTP-cache vs in-memory/UserDefaults throttle.
 
 ## T2. Hidden/webview screens (procedures, no code)
+
+STATUS (2026-10-26): DONE as procedures in `docs/webview-screens.md`
+(linked from `docs/troubleshooting.md`), every claim code-audited
+(21 checks). Live proof on scratch: Safari + apple.com shows ONLY
+5 chrome nodes in AX with zero web content (stronger than "single
+element" — the viewport is entirely absent) while the screenshot
+renders the full page; coordinate tap/swipe + re-describe deltas
+verified end-to-end. WebInspector: sim socket PRESENT, host Safari
+Develop-menu defaults already on; Golfzon_QA runtime inspectability
+left as exact manual steps (Safari Develop > Simulator submenu;
+TCC rules forbid scripted menu reads). Traffic-to-screen mapping
+procedure routes header reads through the enriched flow log
+(`flow_log_path`). No code changes; suite behavior-identical
+(804/804).
 
 - WKWebView DOM is a single AX element unless the app marks it up
   (<https://fbidb.io/idb/fbsimulatorax/>). Notices screen needs

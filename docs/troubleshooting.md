@@ -55,3 +55,4 @@ external-shutdown detection all restore the snapshot automatically.
     `sudo pfctl -X <token>`)
   - `sudo pkill -f "tcpdump -i .* -w .*apple-debug-mcp-netcapture"` (match the
     state dir so unrelated captures survive)
+- Web content missing from AX output: see [Webview screens](webview-screens.md).
